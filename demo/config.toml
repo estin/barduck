@@ -1,0 +1,156 @@
+# Demo config for barduck.
+# All paths below (database_path, source/setup commands) resolve relative to
+# this file's directory — the app chdirs here at startup regardless of where
+# it was launched from. Build once from the repo root, then run from anywhere:
+#   cargo build --release
+#   (cd demo && python3 mock_server.py) &
+#   ./target/release/barduck --config demo/config.toml daemon
+
+database_path = "dashboard.duckdb"
+listen = "127.0.0.1:18420"
+
+# A source flips to "failing" after this many consecutive failures...
+failure_threshold = 2
+# ...and to "stale" when its last success is older than this (humantime, e.g. "30s", "5m", "1h").
+stale_after = "1m"
+
+[[sources]]
+name = "disk-root"
+title = "Root filesystem"
+type = "script"
+command = "df / --output=pcent | tail -1 | tr -d ' %'"
+unit = "%"
+interval = "5s"
+# green -> yellow -> red as the disk fills up
+thresholds = [
+    { bound = 60.0, level = "green" },
+    { bound = 85.0, level = "yellow" },
+    { bound = 100.0, level = "red" },
+]
+
+[[sources]]
+name = "disk-home"
+type = "script"
+command = "df /home --output=pcent | tail -1 | tr -d ' %'"
+unit = "%"
+interval = "5s"
+# green -> yellow -> red as the disk fills up
+thresholds = [
+    { bound = 60.0, level = "green" },
+    { bound = 85.0, level = "yellow" },
+    { bound = 100.0, level = "red" },
+]
+# Opts out of the history bar even though it's banded; contrast with
+# disk-root's bar in the same "Disks" group.
+show_history = false
+
+[[sources]]
+name = "domain-expiry"
+type = "script"
+# Days until a fixed date — stand-in for `whois` parsing.
+command = "echo $(( ($(date -d 2027-05-01 +%s) - $(date +%s)) / 86400 ))"
+unit = "days"
+interval = "30s"
+
+# Setup commands run once before the first fetch. This one always succeeds;
+# remove the file it checks for and restart to see a failing setup recover.
+[[sources]]
+name = "bank-balance"
+type = "http"
+setup = "test -f dashboard.duckdb"
+url = "http://127.0.0.1:8431/bank"
+selector = "balance"
+unit = "USD"
+interval = "5s"
+
+[[sources]]
+name = "bank-balance-thresholds"
+type = "http"
+url = "http://127.0.0.1:8431/bank"
+selector = "balance"
+unit = "USD"
+interval = "5s"
+# red -> yellow -> green the other way: more money is better
+thresholds = [
+    { bound = 1000.0, level = "red" },
+    { bound = 1480.0, level = "yellow" },
+    { bound = 100000.0, level = "green" },
+]
+
+[[sources]]
+name = "weekly-report"
+type = "http"
+url = "http://127.0.0.1:8431/report"
+selector = "report"
+format = "markdown"
+interval = "30s"
+
+[[sources]]
+name = "load-average"
+type = "script"
+# Relative to this config file's directory (demo/), not the launch directory.
+command = "sh scripts/load-average.sh"
+interval = "10s"
+
+[[sources]]
+name = "status-json"
+type = "script"
+command = "echo '{\"load\": 0.42, \"cores\": 8}'"
+format = "json"
+interval = "30s"
+
+[[sources]]
+name = "work-hours"
+type = "http"
+url = "http://127.0.0.1:8431/work"
+selector = "hours_this_week"
+unit = "h"
+interval = "10s"
+
+# Deliberately unreachable: demonstrates the failing health state.
+[[sources]]
+name = "dead-service"
+type = "http"
+url = "http://127.0.0.1:9/nope"
+interval = "5s"
+
+# Setup fails until you run:  touch /tmp/bd-tunnel-up
+# Demonstrates automatic recovery without restarting the daemon.
+[[sources]]
+name = "tunneled-service"
+type = "http"
+setup = "test -f /tmp/bd-tunnel-up"
+url = "http://127.0.0.1:8431/bank"
+selector = "balance"
+unit = "USD"
+interval = "5s"
+
+# Grid layouts: each row is a list of cells. A panel's title defaults to its
+# source's `title` (see `disk-root` above), or its raw name if it declares
+# none.
+#   "source"                        -> panel titled after the source
+#   { id = "src", title = "X" }     -> panel with custom title
+#   { kind = "space", colspan = N } -> empty spacer spanning N columns
+#   { title = "X", ids = [...] }    -> one pane with N labeled, independently
+#                                       colored values, its own border/history
+#                                       matching the worst member; an `ids`
+#                                       entry is a bare source name (label =
+#                                       that source's `title`, or its name) or
+#                                       { id = "src", label = "Label" }
+[[layouts]]
+title = "Overview"
+rows = [
+    [
+        { title = "Disks", ids = ["disk-root", { id = "disk-home", label = "home" }] },
+        "domain-expiry",
+        "bank-balance",
+    ],
+    [{ id = "bank-balance-thresholds", title = "Balance bands" }, { kind = "space" }, "work-hours"],
+]
+
+[[layouts]]
+title = "Reports & misc"
+rows = [
+    ["weekly-report"],
+    ["status-json", "load-average", "dead-service"],
+]

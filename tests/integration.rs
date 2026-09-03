@@ -1,0 +1,906 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::io::{Read, Write};
+
+use barduck::{AppState, build_router_with_bundle, collect_once, config, db::Db, health, query::Backend};
+use std::sync::{Arc, OnceLock};
+
+/// The asset bundle for page-rendering tests, built once per test-binary run.
+///
+/// `AssetBundle::load()` (used by `build_router`/production) looks next to
+/// the current executable — correct for the real `barduck` binary,
+/// but this test binary isn't it. `topcoat asset bundle` bundles the
+/// `barduck` bin target itself, writing to its own
+/// `target/debug/assets`; loading that explicitly via `load_dir` is what
+/// lets a test render `dashboard()`/`source_logs()` (both reference bundled
+/// assets: the Tailwind stylesheet, the Geist font) without panicking.
+fn test_asset_bundle() -> Option<topcoat::asset::AssetBundle> {
+    static BUNDLE: OnceLock<Option<topcoat::asset::AssetBundle>> = OnceLock::new();
+    BUNDLE
+        .get_or_init(|| {
+            let status = std::process::Command::new("topcoat")
+                .args(["asset", "bundle"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .status();
+            if !matches!(status, Ok(s) if s.success()) {
+                eprintln!("topcoat asset bundle failed ({status:?}); page-rendering tests will fail");
+            }
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/assets");
+            topcoat::asset::AssetBundle::load_dir(dir).ok()
+        })
+        .clone()
+}
+
+fn test_server() -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let body = r#"{"balance": 123.45}"#;
+            s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .ok();
+        }
+    });
+    (addr, handle)
+}
+
+/// Builds a config with: a script source (echo), an http source (test server),
+/// and a failing http source (closed port). `failure_threshold = 1` so one
+/// failure flips health to failing.
+fn test_config(db_path: &std::path::Path, http_addr: &str, marker: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 1
+stale_after = "30m"
+
+[[sources]]
+name = "echo"
+type = "script"
+command = "echo 42"
+unit = "x"
+
+[[sources]]
+name = "balance"
+type = "http"
+url = "http://{http}/"
+selector = "balance"
+
+[[sources]]
+name = "dead"
+type = "http"
+url = "http://127.0.0.1:9/nope"
+
+[[sources]]
+name = "gated"
+type = "script"
+setup = "test -f {marker}"
+command = "echo gated"
+
+[[layouts]]
+title = "Overview"
+rows = [
+  ["echo", {{ id = "balance", title = "Balance" }}],
+  [{{ kind = "space" }}, "dead"],
+]
+"#,
+        db = db_path.display(),
+        marker = marker.display(),
+        http = http_addr
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid demo config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn collection_writes_readings_logs_and_health_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.duckdb");
+    let (addr, _server) = test_server();
+
+    // Port 0 of the OS is closed for most purposes; pick a definitely-closed one.
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    // Readings from the two working sources.
+    let latest = db.latest_values().await.unwrap();
+    let echo = latest.iter().find(|r| r.source == "echo").expect("echo reading");
+    assert_eq!(echo.value, "42");
+    assert_eq!(echo.unit.as_deref(), Some("x"));
+    let bal = latest.iter().find(|r| r.source == "balance").expect("balance reading");
+    assert_eq!(bal.value, "123.45");
+
+    // Fetch logs exist for all three; `dead` failed with an error message.
+    let logs = db.logs(None, 100).await.unwrap();
+    assert_eq!(logs.len(), 3);
+    let dead = logs.iter().find(|l| l.source == "dead").unwrap();
+    assert!(!dead.ok);
+    assert!(dead.error.is_some());
+
+    // One failure with threshold 1 → failing.
+    let h = health::compute(&db, &cfg, "dead").unwrap();
+    assert_eq!(h.status, health::Health::Failing);
+    let h = health::compute(&db, &cfg, "echo").unwrap();
+    assert_eq!(h.status, health::Health::Healthy);
+
+    drop(db);
+
+    // Restart: reopen the same file, history survives (spec: data-storage).
+    let reopened = Db::open_rw(&db_path).unwrap();
+    let hist = reopened.history("echo", None, None).await.unwrap();
+    assert_eq!(hist.len(), 1);
+    assert_eq!(hist[0].value, "42");
+
+}
+
+async fn start_daemon(cfg: &config::Config, db: &Db) -> String {
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = barduck::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn daemon_api_parity_with_direct_mode_and_error_handling() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    let base = start_daemon(&cfg, &db).await;
+
+    let direct = Backend::new(&cfg, false).unwrap();
+    let daemon = Backend::Daemon {
+        base,
+        client: reqwest::Client::new(),
+    };
+
+    // Parity: both backends return the same data.
+    let d1 = direct.latest().await.unwrap();
+    let d2 = daemon.latest().await.unwrap();
+    assert_eq!(d1.len(), d2.len());
+    assert_eq!(
+        d1.iter().map(|r| (&r.source, &r.value)).collect::<Vec<_>>(),
+        d2.iter().map(|r| (&r.source, &r.value)).collect::<Vec<_>>()
+    );
+
+    let h1 = direct.health(&cfg).await.unwrap();
+    let h2 = daemon.health(&cfg).await.unwrap();
+    assert_eq!(h1.len(), h2.len());
+    assert_eq!(h1[0].status, h2[0].status);
+
+    let l1 = direct.history("echo", None, None).await.unwrap();
+    let l2 = daemon.history("echo", None, None).await.unwrap();
+    assert_eq!(l1.len(), l2.len());
+
+    // Unknown source → JSON error, not 500 (spec: http-api).
+    let resp = reqwest::get(format!("{}/api/sources/doesnotexist/history", daemon_base(&daemon)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("doesnotexist"));
+
+}
+
+fn daemon_base(b: &Backend) -> String {
+    match b {
+        Backend::Daemon { base, .. } => base.clone(),
+        Backend::Direct(_) => panic!("expected daemon backend"),
+    }
+}
+
+#[tokio::test]
+async fn web_ui_renders_layout_panels_with_status_styles() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(html.contains("echo"));
+    assert!(html.contains("42"));
+    assert!(
+        html.contains(r#"rel="stylesheet" href="/_topcoat/assets/"#),
+        "bundled tailwind stylesheet expected"
+    );
+    // `dead` (failing, unbanded) gets a red accent from its health status
+    // (inline style, not a class: see `Panel::status_style`), alongside a
+    // plain uncolored label. `echo` (healthy, unbanded) gets no accent color
+    // at all — not even green — since it has nothing to accent.
+    assert!(html.contains("border-color:#ef4444"));
+    assert!(html.contains("<span>failing</span>"), "plain failing label expected for the unbanded dead source");
+    assert!(!html.contains("border-color:#10b981"), "a healthy unbanded source should get no accent color");
+    // Live updates: shard scope markers + vendored runtime script tag.
+    assert!(html.contains("::topcoat::scope::"), "shard reactive scope expected");
+    assert!(
+        html.contains("/assets/bd-runtime.js"),
+        "runtime script tag expected"
+    );
+    let js = reqwest::get(format!("{url}assets/bd-runtime.js")).await.unwrap();
+    assert_eq!(js.status(), 200);
+    assert!(!js.text().await.unwrap().trim().is_empty());
+    // Grid arrangement: two rows, two columns; second row starts with a spacer.
+    let base = url.trim_end_matches('/');
+    let page = reqwest::get(base).await.unwrap().text().await.unwrap();
+    assert!(
+        page.contains("grid-template-columns: repeat(2"),
+        "2-column grid expected"
+    );
+    assert_eq!(page.matches("grid-template-columns").count(), 1);
+    assert!(page.contains(">Balance</h3>"), "custom pane title expected");
+    // Log link on the time-ago text.
+    assert!(page.contains(r#"href="/logs/balance" target="_blank""#), "per-source log link expected");
+
+}
+
+/// `days-left` (5, red band) and `balance` (90, green band) grouped into one
+/// "ihor" pane (spec: web-ui — group panes show multiple labeled,
+/// independently colored values).
+fn group_pane_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "days-left"
+type = "script"
+command = "echo 5"
+unit = "d"
+thresholds = [
+  {{ bound = 10, level = "red" }},
+  {{ bound = 30, level = "yellow" }},
+  {{ bound = 3650, level = "green" }},
+]
+
+[[sources]]
+name = "balance"
+type = "script"
+command = "echo 90"
+unit = "USD"
+thresholds = [
+  {{ bound = 10, level = "red" }},
+  {{ bound = 30, level = "yellow" }},
+  {{ bound = 3650, level = "green" }},
+]
+
+[[sources]]
+name = "note"
+type = "script"
+command = "echo hi"
+
+[[layouts]]
+title = "VDS"
+rows = [
+  [{{ title = "ihor", ids = [{{ id = "days-left", label = "days left" }}, {{ id = "balance", label = "balance" }}, {{ id = "note", label = "note" }}] }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid group pane config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = group_pane_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // One card titled with the group's title, not the member sources' names.
+    assert!(html.contains(">ihor</h3>"), "group pane title expected");
+    // Both labeled values present, each colored by its own threshold band.
+    assert!(html.contains("days left"));
+    assert!(html.contains("5 d"));
+    assert!(html.contains("balance"));
+    assert!(html.contains("90 USD"));
+    // Rows carry only text color (on the value, not the label), no
+    // border/background of their own.
+    assert!(html.contains(r#"style="color:#ef4444""#), "red text for days-left row expected");
+    assert!(html.contains(r#"style="color:#059669""#), "green text for balance row expected");
+    // The card's own border is the worst color among its rows (red, here).
+    // Chips use background-color, never border-color, so this is unambiguous.
+    assert!(html.contains("border-color:#ef4444"), "group card border should reflect the worst row");
+    // Neither the card nor its rows carry a background color — scoped past
+    // the summary-strip chips, which legitimately use background-color.
+    let id_idx = html.find("id=\"panel-days-left\"").expect("group card expected");
+    assert!(!html[id_idx..].contains("background-color"), "group card/rows should carry no background color");
+    // Each row's label (not the "updated ago" text) links to its own
+    // source's log view, and carries no color of its own.
+    assert!(
+        html.contains(r#"<a href="/logs/days-left" target="_blank" class="text-xs tracking-wide opacity-70 hover:opacity-100 hover:underline">days left</a>"#),
+        "days-left label should link to its log view, uncolored"
+    );
+    assert!(html.contains(r#"href="/logs/balance" target="_blank""#), "balance row log link expected");
+    assert!(html.contains(r#"href="/logs/note" target="_blank""#), "note row log link expected");
+    // These readings were all just collected, so no row is lagging — no
+    // "updated ago" text should appear anywhere in the group card.
+    assert!(!html[id_idx..].contains("updated"), "fresh group rows should show no 'updated ago' text");
+    // Only the two banded members (days-left, balance) render a history bar;
+    // the unbanded `note` member renders none.
+    assert_eq!(
+        html.matches("mt-1 flex gap-0.5 h-1.5").count(),
+        2,
+        "exactly the banded group members should render a history bar"
+    );
+}
+
+/// `cpu` has 3 thresholded readings and `history_points = 3` (no padding);
+/// `sparse` has `history_points = 5` but only 2 readings (left-padded);
+/// `plain` has no thresholds at all (no bar).
+/// (spec: web-ui — panel retrospective history bar; source-configuration —
+/// configurable history bar depth)
+fn history_bar_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "cpu"
+type = "script"
+command = "echo 0"
+history_points = 3
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[sources]]
+name = "sparse"
+type = "script"
+command = "echo 0"
+history_points = 5
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[sources]]
+name = "plain"
+type = "script"
+command = "echo 0"
+
+[[layouts]]
+title = "Overview"
+rows = [["cpu", "plain", "sparse"]]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid history-bar config: {e:#}");
+    }
+    cfg
+}
+
+/// Returns the HTML slice for one panel: from its title marker up to the
+/// next title marker (or end of page).
+fn panel_slice<'a>(page: &'a str, title: &str, next_title: Option<&str>) -> &'a str {
+    let start = page.find(&format!(">{title}</h3>")).expect("panel title");
+    match next_title {
+        Some(next) => &page[start..page.find(&format!(">{next}</h3>")).expect("next panel title")],
+        None => &page[start..],
+    }
+}
+
+#[tokio::test]
+async fn web_ui_history_bar_reflects_recent_readings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = history_bar_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    // cpu: exactly 3 readings for history_points = 3 -> green, yellow, red, no padding.
+    for v in ["40", "70", "95"] {
+        db.insert_reading("cpu", v, None).await.unwrap();
+    }
+    // sparse: only 2 of 5 history_points -> 3 neutral padding segments, then green, red.
+    for v in ["40", "95"] {
+        db.insert_reading("sparse", v, None).await.unwrap();
+    }
+    db.insert_reading("plain", "hello", None).await.unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+
+    // cpu: 3 segments, colored in reading order, no neutral padding.
+    let cpu = panel_slice(&page, "cpu", Some("plain"));
+    assert_eq!(cpu.matches("flex-1 rounded-sm").count(), 3, "cpu bar should have exactly 3 segments");
+    let (i_green, i_yellow, i_red) = (
+        cpu.find("bg-emerald-500").expect("green segment"),
+        cpu.find("bg-amber-400").expect("yellow segment"),
+        cpu.find("bg-red-500").expect("red segment"),
+    );
+    assert!(i_green < i_yellow && i_yellow < i_red, "segments should read green, yellow, red left to right");
+
+    // plain: no thresholds -> no history bar at all.
+    let plain = panel_slice(&page, "plain", Some("sparse"));
+    assert!(!plain.contains("flex-1 rounded-sm"), "unbanded panel should have no history bar");
+
+    // sparse: 5 segments, left-padded with 3 neutral placeholders, then green, red.
+    let sparse = panel_slice(&page, "sparse", None);
+    assert_eq!(sparse.matches("flex-1 rounded-sm").count(), 5, "sparse bar should be padded to 5 segments");
+    let neutral_count = sparse.matches("bg-slate-200").count();
+    assert_eq!(neutral_count, 3, "3 padding segments expected for 2 readings out of 5 history_points");
+    let i_slate3 = sparse.rfind("bg-slate-200").unwrap();
+    let i_green = sparse.find("bg-emerald-500").expect("green segment");
+    let i_red = sparse.find("bg-red-500").expect("red segment");
+    assert!(i_slate3 < i_green && i_green < i_red, "padding segments should precede the real readings");
+}
+
+/// (spec: web-ui — health visible at a glance)
+#[tokio::test]
+async fn web_ui_unbanded_failing_source_colors_red_with_plain_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // Neither `echo` (healthy) nor `dead` (failing) declares thresholds.
+    // `dead`'s failing health colors it red, with a plain uncolored label
+    // alongside that color, not instead of it. `echo` being healthy and
+    // unbanded gets no accent color at all — not even green.
+    assert!(html.contains("border-color:#ef4444"), "failing unbanded panel should render red");
+    assert!(html.contains("<span>failing</span>"), "plain uncolored failing label expected alongside the red style");
+    assert!(!html.contains("border-color:#10b981"), "a healthy unbanded source should get no accent color");
+}
+
+/// `shown` renders its history bar as usual; `hidden` declares the same
+/// bands but opts out with `show_history = false`.
+/// (spec: source-configuration — per-source history bar visibility)
+fn show_history_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "shown"
+type = "script"
+command = "echo 40"
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[sources]]
+name = "hidden"
+type = "script"
+command = "echo 40"
+show_history = false
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[layouts]]
+title = "Overview"
+rows = [["shown", "hidden"]]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid show_history config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn web_ui_show_history_false_hides_bar_for_banded_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = show_history_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    let shown = panel_slice(&page, "shown", Some("hidden"));
+    assert!(shown.contains("flex-1 rounded-sm"), "shown source should render its history bar");
+    let hidden = panel_slice(&page, "hidden", None);
+    assert!(!hidden.contains("flex-1 rounded-sm"), "show_history=false should hide the bar even though banded");
+}
+
+/// `days-left` is threshold-banded; `flaky` has no thresholds and fails.
+/// (spec: web-ui — group panes show multiple labeled, independently colored values)
+fn group_pane_with_unbanded_failing_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 1
+
+[[sources]]
+name = "days-left"
+type = "script"
+command = "echo 5"
+unit = "d"
+thresholds = [
+  {{ bound = 10, level = "red" }},
+  {{ bound = 30, level = "yellow" }},
+  {{ bound = 3650, level = "green" }},
+]
+
+[[sources]]
+name = "flaky"
+type = "http"
+url = "http://127.0.0.1:9/nope"
+
+[[layouts]]
+title = "VDS"
+rows = [
+  [{{ title = "ihor", ids = [{{ id = "days-left", label = "days left" }}, {{ id = "flaky", label = "flaky" }}] }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid group config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = group_pane_with_unbanded_failing_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // Card border flags the failing unbanded member (aggregate rule unchanged).
+    assert!(html.contains("border-color:#ef4444"), "card border should reflect the failing member");
+    // That member's own row now also renders red text (health-derived, since
+    // it has no bands), with the plain label alongside it, not instead of it.
+    // (Not the summary-strip chip link, which also renders the text "flaky" —
+    // scope to the row's own `/logs/<source>` link.)
+    let row_idx = html.find(r#"href="/logs/flaky""#).expect("flaky row label");
+    let row_slice = &html[row_idx..(row_idx + 300).min(html.len())];
+    assert!(row_slice.contains("color:#ef4444"), "unbanded failing row should render red text: {row_slice}");
+    assert!(row_slice.contains("failing"), "plain failing label expected alongside the red text: {row_slice}");
+}
+
+#[test]
+fn history_points_zero_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "cpu"
+type = "script"
+command = "echo 0"
+history_points = 0
+"#,
+        db = dir.path().join("t.duckdb").display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    let err = config::validate(&cfg).unwrap_err();
+    assert!(format!("{err:#}").contains("cpu"), "error should name the offending source");
+}
+
+/// (spec: http-api — ping/pong health endpoint)
+#[tokio::test]
+async fn ping_endpoint_returns_server_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    let base = start_daemon(&cfg, &db).await;
+
+    let resp = reqwest::get(format!("{base}/api/ping")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["server_time"].as_str().is_some(), "server_time field expected");
+}
+
+/// (spec: web-ui — global connection health indicator)
+#[tokio::test]
+async fn dashboard_includes_connection_indicator() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(page.contains(r#"id="bd-conn-dot""#), "connection dot expected");
+    assert!(page.contains(r#"id="bd-conn-label""#), "connection label expected");
+    assert!(page.contains("checking…"), "initial checking state expected");
+    assert!(page.contains("/api/ping"), "ping script should reference /api/ping");
+}
+
+/// (spec: web-ui — source summary strip)
+#[tokio::test]
+async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+
+    // Layout order: echo, Balance (source "balance"), then dead.
+    let i_echo = page.find("#panel-echo").expect("echo chip link");
+    let i_balance = page.find("#panel-balance").expect("balance chip link");
+    let i_dead = page.find("#panel-dead").expect("dead chip link");
+    assert!(i_echo < i_balance && i_balance < i_dead, "chips should follow layout order");
+
+    // "gated" isn't placed in any layout, so it must not get a chip.
+    assert!(!page.contains("panel-gated"), "unplaced source should not get a chip");
+
+    // No thresholds are configured in test_config; `background-color` here
+    // can only come from summary chips (panels use border+bg-50 style; both
+    // are inline style, not a class: see `Panel::chip_style`).
+    assert!(page.contains("background-color:#10b981"), "healthy chip color expected");
+    assert!(page.contains("background-color:#ef4444"), "failing chip color expected");
+}
+
+/// (spec: web-ui — source summary strip)
+#[tokio::test]
+async fn web_ui_summary_chip_href_matches_panel_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(page.contains(r##"href="#panel-balance""##), "chip href should target the panel's id");
+    assert!(page.contains(r#"id="panel-balance""#), "panel should carry the matching id");
+}
+
+#[tokio::test]
+async fn setup_command_gates_fetch_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    // Marker does not exist yet: setup must fail.
+    let marker = dir.path().join("tunnel.up");
+    let cfg = test_config(&db_path, &addr, &marker);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    // Failed setup logged with prefix, no reading fetched, health failing.
+    let logs = db.logs(Some("gated"), 10).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert!(!logs[0].ok);
+    let err = logs[0].error.as_deref().unwrap();
+    assert!(err.starts_with("setup:"), "unexpected error: {err}");
+    assert!(db.latest_values().await.unwrap().iter().all(|r| r.source != "gated"));
+    let h = health::compute(&db, &cfg, "gated").unwrap();
+    assert_eq!(h.status, health::Health::Failing);
+
+    // Dependency appears: next round's setup succeeds and fetching starts.
+    std::fs::write(&marker, b"up").unwrap();
+    collect_once(&db, &cfg).await;
+    let latest = db.latest_values().await.unwrap();
+    let gated = latest.iter().find(|r| r.source == "gated").expect("gated reading after recovery");
+    assert_eq!(gated.value, "gated");
+    let h = health::compute(&db, &cfg, "gated").unwrap();
+    assert_eq!(h.status, health::Health::Healthy);
+}
+
+/// Spawns the real binary (chdir behavior lives in `main()`, not the library)
+/// to prove `database_path` and a relative `script` command resolve against the
+/// config file's own directory, not wherever the process was launched from
+/// (spec: source-configuration — config-relative working directory).
+#[tokio::test]
+async fn daemon_resolves_relative_paths_against_config_directory() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let launch_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        config_dir.path().join("script.sh"),
+        "#!/bin/sh\necho hello-from-script\n",
+    )
+    .unwrap();
+
+    let config_path = config_dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+database_path = "sub/data.duckdb"
+listen = "127.0.0.1:0"
+
+[[sources]]
+name = "script-source"
+type = "script"
+command = "sh script.sh"
+interval = "1s"
+"#,
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_barduck"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("daemon")
+        .current_dir(launch_dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let db_path = config_dir.path().join("sub/data.duckdb");
+    assert!(db_path.exists(), "database_path should resolve against the config file's directory");
+    assert!(!launch_dir.path().join("sub/data.duckdb").exists());
+
+    let db = Db::open_rw(&db_path).unwrap();
+    let latest = db.latest_values().await.unwrap();
+    let reading = latest
+        .iter()
+        .find(|r| r.source == "script-source")
+        .expect("relative script command should resolve and run against the config directory");
+    assert_eq!(reading.value, "hello-from-script");
+}
+
+/// Proves a `cron`-scheduled source is actually driven by the collector's
+/// scheduling loop (not just accepted by config validation): a source ticking
+/// every second should accumulate several readings within a few seconds
+/// (spec: data-collection — per-source schedules, cron schedule respected).
+#[tokio::test]
+async fn cron_schedule_fetches_repeatedly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("cron.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "ticker"
+type = "script"
+command = "echo tick"
+cron = "* * * * * *"
+"#,
+        db = db_path.display()
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    barduck::collector::spawn_all(&db, &cfg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+    let hist = db.history("ticker", None, None).await.unwrap();
+    assert!(hist.len() >= 2, "expected multiple cron-triggered fetches, got {}", hist.len());
+}
+
+
+
+
