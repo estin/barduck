@@ -53,6 +53,34 @@ const CONNECTION_SCRIPT: &str = r"(function () {
     setInterval(ping, 5000);
 })();";
 
+/// Reflects the dashboard's worst current status (spec: web-ui — health
+/// visible at a glance) in the browser tab: a "crooked tile" mark, gray on
+/// gray until something needs attention, then red/yellow/green matching the
+/// summary strip's own colors. Polls the hidden status marker `panels_grid`
+/// renders on the same interval as the connection ping, rather than
+/// depending on exactly how the shard patches the DOM.
+const FAVICON_SCRIPT: &str = r##"(function () {
+    var link = document.getElementById('bd-favicon');
+    var colors = { red: '#ef4444', yellow: '#fbbf24', green: '#10b981' };
+    function svgFor(hex) {
+        return 'data:image/svg+xml,' + encodeURIComponent(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
+            '<rect x="3" y="3" width="12" height="12" rx="2.5" fill="#767d78"/>' +
+            '<rect x="17" y="3" width="12" height="12" rx="2.5" fill="#767d78"/>' +
+            '<rect x="3" y="17" width="12" height="12" rx="2.5" fill="#767d78"/>' +
+            '<rect x="16.5" y="16.5" width="13" height="13" rx="2.5" fill="' + hex + '" transform="rotate(24 23 23)"/>' +
+            '</svg>'
+        );
+    }
+    function refresh() {
+        var el = document.getElementById('bd-status');
+        var status = (el && el.dataset.status) || 'green';
+        link.href = svgFor(colors[status] || colors.green);
+    }
+    refresh();
+    setInterval(refresh, 5000);
+})();"##;
+
 struct Panel {
     /// Source id (used for log links); `name` is the display title.
     source: String,
@@ -352,7 +380,12 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
             }
         }
     }
+    // Worst color across every source currently on the dashboard (spec:
+    // web-ui — health visible at a glance); read by the browser-tab favicon
+    // script via this hidden marker's `data-status`, refreshed each tick.
+    let worst = config::worst_color(chips.iter().map(|(p, _)| p.level_color()));
     view! {
+        <span id="bd-status" data-status=(worst) style="display:none"></span>
         if !chips.is_empty() {
             <div class="flex flex-wrap gap-2 mb-6">
                 for (p, anchor) in &chips {
@@ -484,6 +517,7 @@ pub async fn dashboard(cx: &Cx) -> Result {
             <head>
                 <meta charset="utf-8" />
                 <title>"barduck"</title>
+                <link rel="icon" id="bd-favicon">
                 <script type="module" src="/assets/bd-runtime.js"></script>
                 topcoat::font::link(font: GEIST)
                 <link rel="stylesheet" href=(tailwind::stylesheet!())>
@@ -514,6 +548,7 @@ pub async fn dashboard(cx: &Cx) -> Result {
                     </footer>
                 </div>
                 <script>(Unescaped::new_unchecked(CONNECTION_SCRIPT.to_string()))</script>
+                <script>(Unescaped::new_unchecked(FAVICON_SCRIPT.to_string()))</script>
             </body>
         </html>
     }

@@ -13,3 +13,7 @@ run *ARGS:
     cargo build --release
     topcoat asset bundle --release
     ./target/release/barduck {{ARGS}}
+
+
+demo:
+    just run daemon --config demo/config.toml
