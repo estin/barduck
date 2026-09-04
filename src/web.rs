@@ -101,21 +101,25 @@ const FAVICON_SCRIPT: &str = r##"(function () {
     setInterval(refresh, 5000);
 })();"##;
 
-/// Wires the theme toggle button: flips `<html>`'s `dark` class immediately
-/// (instant feedback, no round trip needed to see it), then persists the
-/// choice via `POST /api/theme` so the next page load already carries the
-/// right class from the server (spec: web-ui — light/dark theme toggle).
+/// Wires the theme toggle button: persists the chosen theme via `POST
+/// /api/theme`, then reloads the page so the server renders it with the new
+/// `dark`/`light` class from the very first byte (spec: web-ui — light/dark
+/// theme toggle). Reloading rather than only flipping the class client-side
+/// means the toggle can't drift from what the server would render — nothing
+/// on the page needs its own separate "does this react live to a class
+/// change" story, including the parts of `panels_grid` a shard re-render
+/// might otherwise leave stale until its next tick.
 const THEME_TOGGLE_SCRIPT: &str = r"(function () {
     var btn = document.getElementById('bd-theme-toggle');
     if (!btn) return;
     btn.addEventListener('click', function () {
-        var root = document.documentElement;
-        var next = root.classList.contains('dark') ? 'light' : 'dark';
-        root.classList.toggle('dark', next === 'dark');
+        var next = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
         fetch('/api/theme', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ theme: next })
+        }).then(function () {
+            location.reload();
         }).catch(function () {});
     });
 })();";

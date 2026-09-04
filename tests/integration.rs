@@ -928,6 +928,10 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
         "viewport meta tag expected"
     );
     assert!(page.contains(r#"id="bd-theme-toggle""#), "theme toggle button expected");
+    // The toggle reloads the page after persisting the choice, rather than
+    // only flipping the class client-side, so the server-rendered page is
+    // always the single source of truth for what's currently shown.
+    assert!(page.contains("location.reload()"), "theme toggle should reload the page after persisting the choice");
     assert!(page.contains("bd-panel-grid"), "responsive grid class expected");
     assert!(page.contains("bd-panel-cell"), "responsive cell class expected");
     assert!(page.contains(r#"<html class="">"#), "no theme cookie yet: no explicit class rendered");
