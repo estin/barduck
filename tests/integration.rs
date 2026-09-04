@@ -305,7 +305,7 @@ command = "echo hi"
 [[layouts]]
 title = "VDS"
 rows = [
-  [{{ title = "ihor", ids = [{{ id = "days-left", label = "days left" }}, {{ id = "balance", label = "balance" }}, {{ id = "note", label = "note" }}] }}],
+  [{{ title = "ihor", table = [{{ id = "days-left", label = "days left" }}, {{ id = "balance", label = "balance" }}, {{ id = "note", label = "note" }}] }}],
 ]
 "#,
         db = db_path.display(),
@@ -611,7 +611,7 @@ url = "http://127.0.0.1:9/nope"
 [[layouts]]
 title = "VDS"
 rows = [
-  [{{ title = "ihor", ids = [{{ id = "days-left", label = "days left" }}, {{ id = "flaky", label = "flaky" }}] }}],
+  [{{ title = "ihor", table = [{{ id = "days-left", label = "days left" }}, {{ id = "flaky", label = "flaky" }}] }}],
 ]
 "#,
         db = db_path.display(),
@@ -652,6 +652,192 @@ async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
     let row_slice = &html[row_idx..(row_idx + 300).min(html.len())];
     assert!(row_slice.contains("color:#ef4444"), "unbanded failing row should render red text: {row_slice}");
     assert!(row_slice.contains("failing"), "plain failing label expected alongside the red text: {row_slice}");
+}
+
+/// A generalized pane cell declaring only `main` (no `secondary`/`table`)
+/// (spec: web-ui — group panes show multiple labeled, independently colored
+/// values — main section renders like a single-source panel).
+fn main_only_pane_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "cpu-load"
+type = "script"
+command = "echo 70"
+unit = "%"
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[layouts]]
+title = "L"
+rows = [
+  [{{ title = "CPU Pane", main = "cpu-load" }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid main-only pane config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn web_ui_main_only_pane_renders_like_single_source_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = main_only_pane_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState { db: db.clone(), cfg: Arc::new(cfg.clone()) };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // The cell's own title is used, not `main`'s source name.
+    assert!(html.contains(">CPU Pane</h3>"), "cell title expected");
+    assert!(html.contains("70"), "main value missing");
+    // Full single-panel styling — border AND background, unlike a table/
+    // secondary row which only ever carries a text color.
+    assert!(html.contains("border-color:#fbbf24;background-color:#fffbeb"), "full yellow panel style expected");
+    // `main`'s own history bar (thresholds + a reading) renders, using the
+    // same wrapper class a plain single-source panel uses.
+    assert!(html.contains("mt-2 flex gap-0.5 h-2"), "main's own history bar expected");
+}
+
+/// A generalized pane combining `main`, `secondary`, and `table`: `secondary`
+/// always shows its age and never a history bar (even when banded), and an
+/// unbanded failing `secondary` member still drives the card's own border
+/// color, not just `table` members (spec: web-ui — group panes show multiple
+/// labeled, independently colored values).
+fn combined_pane_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 1
+
+[[sources]]
+name = "cpu-load"
+type = "script"
+command = "echo 42"
+unit = "%"
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[sources]]
+name = "mem-warn"
+type = "script"
+command = "echo 70"
+unit = "%"
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[sources]]
+name = "flaky"
+type = "http"
+url = "http://127.0.0.1:9/nope"
+
+[[sources]]
+name = "days-left"
+type = "script"
+command = "echo 90"
+unit = "d"
+thresholds = [
+  {{ bound = 10, level = "red" }},
+  {{ bound = 30, level = "yellow" }},
+  {{ bound = 3650, level = "green" }},
+]
+
+[[layouts]]
+title = "L"
+rows = [
+  [{{
+      title = "Server",
+      main = "cpu-load",
+      secondary = [{{ id = "mem-warn", label = "mem" }}, {{ id = "flaky", label = "flaky" }}],
+      table = [{{ id = "days-left", label = "balance" }}],
+  }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid combined pane config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn web_ui_combined_pane_renders_all_three_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = combined_pane_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState { db: db.clone(), cfg: Arc::new(cfg.clone()) };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(html.contains(">Server</h3>"), "cell title expected");
+    assert!(html.contains("42"), "main value missing");
+    assert!(html.contains("70"), "secondary value missing");
+    assert!(html.contains("balance"), "table label missing");
+    assert!(html.contains("90"), "table value missing");
+
+    // Both `secondary` members render inside one shared row, as plain
+    // colored value+unit links to their own log view — no separate label.
+    let secondary_row_idx = html.find(r#"class="flex flex-wrap items-center gap-3 mb-2""#)
+        .expect("secondary row container expected");
+    let secondary_row = &html[secondary_row_idx..(secondary_row_idx + 600).min(html.len())];
+    assert!(
+        secondary_row.contains(r#"href="/logs/mem-warn""#),
+        "mem-warn secondary link expected in the shared row: {secondary_row}"
+    );
+    assert!(
+        secondary_row.contains(r#"href="/logs/flaky""#),
+        "flaky secondary link expected in the same shared row: {secondary_row}"
+    );
+
+    // The failing, unbanded `flaky` secondary member alone is enough to turn
+    // the whole card's border red — not just a table member — and its value
+    // is replaced with the plain word "FAILING", not a stale/missing value.
+    assert!(html.contains("border-color:#ef4444"), "card border should reflect the failing secondary member");
+    let flaky_idx = html.find(r#"href="/logs/flaky""#).expect("flaky link expected");
+    let flaky_slice = &html[flaky_idx..(flaky_idx + 200).min(html.len())];
+    assert!(flaky_slice.contains("FAILING"), "failing secondary member should show FAILING text: {flaky_slice}");
+    assert!(flaky_slice.contains("color:#ef4444"), "FAILING text should render red: {flaky_slice}");
+
+    // `main`'s own history bar (2-unit height) renders once; `table`'s single
+    // banded row (1.5-unit height) renders once too — but `mem-warn`, also
+    // banded, contributes no history bar at all as a `secondary` member.
+    assert_eq!(html.matches("mt-2 flex gap-0.5 h-2").count(), 1, "only main should render its own history bar");
+    assert_eq!(
+        html.matches("mt-1 flex gap-0.5 h-1.5").count(),
+        1,
+        "only the table row should render a history bar, not the banded secondary member"
+    );
 }
 
 #[test]

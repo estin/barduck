@@ -171,6 +171,16 @@ impl Panel {
         }
     }
 
+    /// Text shown for a `secondary` member: its value and unit, or the plain
+    /// word `"FAILING"` when the fetch is currently failing — a currently
+    /// failing fetch means any displayed value can't be trusted, and unlike
+    /// `main`/`table`, `secondary` carries no separate status label to show
+    /// alongside it (spec: web-ui — group panes combining main/secondary/
+    /// table sections).
+    fn secondary_text(&self) -> String {
+        if self.status == "failing" { "FAILING".to_string() } else { self.value_and_unit() }
+    }
+
     /// Human age of the latest reading, e.g. "12s ago" (spec: last update time).
     fn updated_ago(&self) -> String {
         let now = std::time::SystemTime::now()
@@ -194,33 +204,47 @@ impl Panel {
     }
 }
 
+/// One grid slot: a spacer (`main`/`secondary`/`table` all empty), a plain
+/// single-source panel (`main` only, `group_title` `None`), or a generalized
+/// pane combining up to three sections — `main` (regular-panel treatment),
+/// `secondary` (compact, always-shown age, never a history bar), and `table`
+/// (today's label/value rows, age only when stale) (spec: web-ui — group
+/// panes show multiple labeled, independently colored values).
 struct Slot {
     span: usize,
     /// 1-based column where this slot starts (grid rows are placed
     /// explicitly so a short row can't be auto-packed into the next).
     col_start: usize,
     /// Card header text for a grouped slot (the cell's `title`); `None` for
-    /// a single-source slot, whose header comes from that panel's own
+    /// a plain single-source slot, whose header comes from `main`'s own
     /// `name` instead, or a spacer.
     group_title: Option<String>,
-    /// Empty for a spacer, one entry for a single-source cell, N for a
-    /// group cell — one independently colored row per member.
-    panels: Vec<Panel>,
+    main: Option<Panel>,
+    secondary: Vec<Panel>,
+    table: Vec<Panel>,
 }
 
 impl Slot {
-    /// DOM id anchor for this slot's card: its one panel's source, or (for a
-    /// group) its first member's — shared by every member's chip so they all
-    /// scroll to and highlight the same card.
+    /// DOM id anchor for this slot's card: `main`'s source when present,
+    /// else the first `secondary` or `table` member's — shared by every
+    /// member's chip so they all scroll to and highlight the same card.
     fn anchor(&self) -> Option<&str> {
-        self.panels.first().map(|p| p.source.as_str())
+        self.main
+            .iter()
+            .chain(&self.secondary)
+            .chain(&self.table)
+            .next()
+            .map(|p| p.source.as_str())
     }
 
-    /// A group card's own border — no background — is the worst color among
-    /// its panels (spec: web-ui — group panes card border reflects the worst
-    /// row).
+    /// A generalized pane card's own border — no background — is the worst
+    /// color across every member in `main`, `secondary`, and `table`
+    /// combined (spec: web-ui — group panes card border reflects the worst
+    /// member across all sections).
     fn group_status_style(&self) -> &'static str {
-        border_style_for_color(config::worst_color(self.panels.iter().map(Panel::level_color)))
+        border_style_for_color(config::worst_color(
+            self.main.iter().chain(&self.secondary).chain(&self.table).map(Panel::level_color),
+        ))
     }
 }
 
@@ -330,21 +354,32 @@ fn collect_grids(st: &AppState) -> Vec<Grid> {
             let mut slots = Vec::new();
             let mut col = 1;
             for cell in cells {
-                let (panels, group_title) = match cell {
-                    config::Cell::Group { title, ids } => (
-                        ids.iter()
+                let (main, secondary, table_panels, group_title) = match cell {
+                    config::Cell::Group { title, main, secondary, table: cell_table } => (
+                        main.as_ref().map(|item| build_panel(st, &latest, item.id(), item.explicit_label())),
+                        secondary
+                            .iter()
                             .map(|item| build_panel(st, &latest, item.id(), item.explicit_label()))
                             .collect(),
-                        Some(title.clone()),
+                        cell_table
+                            .iter()
+                            .map(|item| build_panel(st, &latest, item.id(), item.explicit_label()))
+                            .collect(),
+                        title.clone(),
                     ),
-                    config::Cell::Source(name) => (vec![build_panel(st, &latest, name, None)], None),
-                    config::Cell::Pane { id, title } => {
-                        (vec![build_panel(st, &latest, id, title.as_deref())], None)
+                    config::Cell::Source(name) => {
+                        (Some(build_panel(st, &latest, name, None)), Vec::new(), Vec::new(), None)
                     }
-                    config::Cell::Space { .. } => (Vec::new(), None),
+                    config::Cell::Pane { id, title } => (
+                        Some(build_panel(st, &latest, id, title.as_deref())),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    ),
+                    config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None),
                 };
                 let span = cell.span();
-                slots.push(Slot { span, col_start: col, group_title, panels });
+                slots.push(Slot { span, col_start: col, group_title, main, secondary, table: table_panels });
                 col += span;
             }
             rows.push(slots);
@@ -373,7 +408,7 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
         for row in &grid.rows {
             for slot in row {
                 if let Some(anchor) = slot.anchor() {
-                    for p in &slot.panels {
+                    for p in slot.main.iter().chain(&slot.secondary).chain(&slot.table) {
                         chips.push((p, anchor));
                     }
                 }
@@ -405,49 +440,54 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
             >
                 for (ri, row) in grid.rows.iter().enumerate() {
                     for slot in row {
-                        if slot.panels.len() == 1 {
-                            card(
-                                attrs: attributes! {
-                                    id=(format!("panel-{}", slot.panels[0].source))
-                                    style=(format!(
-                                        "{}; grid-row: {}; grid-column: {} / span {};",
-                                        slot.panels[0].status_style(), ri + 1, slot.col_start, slot.span
+                        if slot.secondary.is_empty() && slot.table.is_empty() && slot.main.is_some() {
+                            if let Some(main) = &slot.main {
+                                card(
+                                    attrs: attributes! {
+                                        id=(format!("panel-{}", main.source))
+                                        style=(format!(
+                                            "{}; grid-row: {}; grid-column: {} / span {};",
+                                            main.status_style(), ri + 1, slot.col_start, slot.span
+                                        ))
+                                    },
+                                    card_header(card_title(
+                                        attrs: attributes! { class="text-sm font-medium opacity-70" },
+                                        (slot.group_title.clone().unwrap_or_else(|| main.name.clone()))
                                     ))
-                                },
-                                card_header(card_title(attrs: attributes! { class="text-sm font-medium opacity-70" }, (slot.panels[0].name.clone())))
-                                card_content(
-                                    if slot.panels[0].format == ValueFormat::Markdown {
-                                        <div class="prose prose-sm max-w-none">(slot.panels[0].markdown_html())</div>
-                                    } else if slot.panels[0].format == ValueFormat::Json {
-                                        <div class="text-3xl font-semibold">(slot.panels[0].value_and_unit())</div>
-                                        <pre class="mt-2 text-xs font-mono whitespace-pre-wrap break-all max-h-40 overflow-y-auto">(slot.panels[0].json_pretty())</pre>
-                                    } else {
-                                        <div class="text-3xl font-semibold">(slot.panels[0].value_and_unit())</div>
-                                    }
-                                    if !slot.panels[0].history.is_empty() {
-                                        <div class="mt-2 flex gap-0.5 h-2">
-                                            for seg in &slot.panels[0].history {
-                                                <div class=(format!("flex-1 rounded-sm {}", Panel::segment_class(seg.as_deref())))></div>
-                                            }
-                                        </div>
-                                    }
+                                    card_content(
+                                        if main.format == ValueFormat::Markdown {
+                                            <div class="prose prose-sm max-w-none">(main.markdown_html())</div>
+                                        } else if main.format == ValueFormat::Json {
+                                            <div class="text-3xl font-semibold">(main.value_and_unit())</div>
+                                            <pre class="mt-2 text-xs font-mono whitespace-pre-wrap break-all max-h-40 overflow-y-auto">(main.json_pretty())</pre>
+                                        } else {
+                                            <div class="text-3xl font-semibold">(main.value_and_unit())</div>
+                                        }
+                                        if !main.history.is_empty() {
+                                            <div class="mt-2 flex gap-0.5 h-2">
+                                                for seg in &main.history {
+                                                    <div class=(format!("flex-1 rounded-sm {}", Panel::segment_class(seg.as_deref())))></div>
+                                                }
+                                            </div>
+                                        }
+                                    )
+                                    card_footer(
+                                        attrs: attributes! { class="flex justify-between text-xs uppercase tracking-wide" },
+                                        <span>(main.status)</span>
+                                        <a
+                                            href=(format!("/logs/{}", main.source))
+                                            target="_blank"
+                                            class="normal-case opacity-60 hover:opacity-100 hover:underline"
+                                        >
+                                            (format!("updated {}", main.updated_ago()))
+                                        </a>
+                                    )
                                 )
-                                card_footer(
-                                    attrs: attributes! { class="flex justify-between text-xs uppercase tracking-wide" },
-                                    <span>(slot.panels[0].status)</span>
-                                    <a
-                                        href=(format!("/logs/{}", slot.panels[0].source))
-                                        target="_blank"
-                                        class="normal-case opacity-60 hover:opacity-100 hover:underline"
-                                    >
-                                        (format!("updated {}", slot.panels[0].updated_ago()))
-                                    </a>
-                                )
-                            )
-                        } else if !slot.panels.is_empty() {
+                            }
+                        } else if slot.main.is_some() || !slot.secondary.is_empty() || !slot.table.is_empty() {
                             card(
                                 attrs: attributes! {
-                                    id=(format!("panel-{}", slot.panels[0].source))
+                                    id=(format!("panel-{}", slot.anchor().unwrap_or_default()))
                                     style=(format!(
                                         "{}; grid-row: {}; grid-column: {} / span {};",
                                         slot.group_status_style(), ri + 1, slot.col_start, slot.span
@@ -455,7 +495,45 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                 },
                                 card_header(card_title(attrs: attributes! { class="text-sm font-medium opacity-70" }, (slot.group_title.clone().unwrap_or_default())))
                                 card_content(
-                                    for p in &slot.panels {
+                                    if let Some(main) = &slot.main {
+                                        <div class="mb-2">
+                                            <div class="text-2xl font-semibold" style=(main.group_row_style())>(main.value_and_unit())</div>
+                                            <div class="flex items-center gap-1.5 text-xs mt-0.5">
+                                                if let Some(label) = main.plain_label() {
+                                                    <span class="opacity-60">(label)</span>
+                                                }
+                                                <a
+                                                    href=(format!("/logs/{}", main.source))
+                                                    target="_blank"
+                                                    class="opacity-60 hover:opacity-100 hover:underline"
+                                                >
+                                                    (format!("updated {}", main.updated_ago()))
+                                                </a>
+                                            </div>
+                                            if !main.history.is_empty() {
+                                                <div class="mt-2 flex gap-0.5 h-2">
+                                                    for seg in &main.history {
+                                                        <div class=(format!("flex-1 rounded-sm {}", Panel::segment_class(seg.as_deref())))></div>
+                                                    }
+                                                </div>
+                                            }
+                                        </div>
+                                    }
+                                    if !slot.secondary.is_empty() {
+                                        <div class="flex flex-wrap items-center gap-3 mb-2">
+                                            for p in &slot.secondary {
+                                                <a
+                                                    href=(format!("/logs/{}", p.source))
+                                                    target="_blank"
+                                                    class="text-base font-semibold hover:underline"
+                                                    style=(p.group_row_style())
+                                                >
+                                                    (p.secondary_text())
+                                                </a>
+                                            }
+                                        </div>
+                                    }
+                                    for p in &slot.table {
                                         <div class="px-2 py-1 mb-1">
                                             <div class="flex justify-between items-center gap-2">
                                                 <a

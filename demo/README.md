@@ -63,20 +63,26 @@ Then:
   `bank-balance-thresholds` uses the opposite direction (more USD is greener).
 - **Grid layouts** — two layouts with multiple rows, a spacer, a colspan-2 gap
   and a custom pane title ("Balance bands"); see `config.toml`.
-- **Group panes** — "Disks" combines `disk-root` and `disk-home` into one
-  pane with two labeled rows ("Root filesystem", "home"), each row's value
-  independently colored by its own threshold bands; `disk-root` also shows
-  its history-bar preview, while `disk-home` opts out with `show_history =
-  false` and shows none. Each row's label links to that source's
-  `/logs/<source>` view; the "updated ago" text only appears once a row falls
-  stale (fresh rows stay compact). The pane's own border tracks whichever row
-  is currently worst (red > yellow > green) — its background stays neutral.
+- **Generalized panes** — "Server" combines three sections in one pane:
+  `disk-root` as `main` (large text, colored by its own status, its own
+  history-bar preview, always-shown "updated ago"), `domain-expiry` as
+  `secondary` (a plain colored value+unit, linked to its own `/logs/<source>`
+  view — multiple `secondary` members render side by side in one row), and
+  `disk-home` as a `table` row labeled "home" (independently colored value,
+  "updated ago" only once it falls stale). The pane's own border tracks the
+  worst member across all three sections (red > yellow > green) — its
+  background stays neutral. (A pane with only `main` set and nothing else
+  renders exactly like a plain single-source panel instead, with its own
+  colored border and background — see `bank-balance-thresholds` below.)
 - **Source titles** — `disk-root` declares `title = "Root filesystem"`; its
-  bare-id entry in the "Disks" group shows that title instead of the raw id
-  `disk-root`.
-- **History bar opt-out** — `disk-home` declares `show_history = false`;
-  compare its panel (no bar) against `disk-root`'s (bar visible), even though
-  both are threshold-banded the same way.
+  bare-id `main` entry in the "Server" pane shows that title instead of the
+  raw id `disk-root`.
+- **History bar opt-out** — `disk-home` (in the pane's `table` section) is
+  threshold-banded but declares `show_history = false`, so its table row
+  shows no bar; compare it against `disk-root` in `main`, which is banded the
+  same way and does show one. `domain-expiry` in `secondary` shows no bar
+  either, but for a different reason — `secondary` never renders one,
+  regardless of thresholds, since it only ever shows a plain colored value.
 - **Value formats** — `weekly-report` renders markdown (headings, bold, lists)
   and `status-json` pretty-prints its JSON payload.
 - **Failing source** — `dead-service` points at a closed port; after 2

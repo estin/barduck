@@ -203,9 +203,9 @@ impl SourceCfg {
     }
 }
 
-/// One member of a [`Cell::Group`]'s `ids` list. Untagged so a bare source-id
-/// string is accepted (label defaults to the id) alongside `{ id, label }`
-/// for an overridden label.
+/// One member of a [`Cell::Group`]'s `main`/`secondary`/`table` sections.
+/// Untagged so a bare source-id string is accepted (label defaults to the
+/// id) alongside `{ id, label }` for an overridden label.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum GroupItem {
@@ -234,24 +234,42 @@ impl GroupItem {
 
 /// One grid cell in a layout row. Untagged so the TOML stays terse:
 /// `"src"`, `{ id = "src", title = "Pane" }`, `{ kind = "space", colspan = 2 }`,
-/// `{ title = "Pane", ids = ["a", { id = "b", label = "Balance" }] }`.
+/// `{ title = "Pane", main = "a", secondary = ["b"], table = [{ id = "c", label = "C" }] }`.
+/// A `Group` cell needs at least one of `main`/`secondary`/`table`; `title`
+/// is itself optional too — a title-less pane falls back to `main`'s own
+/// label when `main` is set, else renders with no header text (spec:
+/// source-configuration — UI layouts are config-declared like sources).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Cell {
     Source(String),
     Pane { id: String, title: Option<String> },
     Space { kind: String, colspan: Option<usize> },
-    Group { title: String, ids: Vec<GroupItem> },
+    Group {
+        #[serde(default)]
+        title: Option<String>,
+        main: Option<GroupItem>,
+        #[serde(default)]
+        secondary: Vec<GroupItem>,
+        #[serde(default)]
+        table: Vec<GroupItem>,
+    },
 }
 
 impl Cell {
     /// Every source this cell references: one for `Source`/`Pane`, one per
-    /// member for `Group`, none for `Space`.
+    /// member for `Group` (across `main`, `secondary`, and `table`), none for
+    /// `Space`.
     #[must_use]
     pub fn source_names(&self) -> Vec<&str> {
         match self {
             Cell::Source(name) | Cell::Pane { id: name, .. } => vec![name],
-            Cell::Group { ids, .. } => ids.iter().map(GroupItem::id).collect(),
+            Cell::Group { main, secondary, table, .. } => main
+                .iter()
+                .chain(secondary)
+                .chain(table)
+                .map(GroupItem::id)
+                .collect(),
             Cell::Space { .. } => vec![],
         }
     }
@@ -267,8 +285,7 @@ impl Cell {
     #[must_use]
     pub fn pane_title(&self) -> Option<&str> {
         match self {
-            Cell::Pane { title, .. } => title.as_deref(),
-            Cell::Group { title, .. } => Some(title),
+            Cell::Pane { title, .. } | Cell::Group { title, .. } => title.as_deref(),
             _ => None,
         }
     }
@@ -346,10 +363,69 @@ impl Default for Config {
 pub fn load(path: &Path) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: Config =
+    let mut cfg: Config =
         toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
+    apply_env_overrides(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
+}
+
+/// Overrides top-level scalar settings from `BARDUCK_<FIELD>` environment
+/// variables, taking precedence over both the config file's value and the
+/// field's built-in default (spec: source-configuration — environment
+/// variables override top-level settings). Structural fields (`sources`,
+/// `layouts`) are not covered.
+fn apply_env_overrides(cfg: &mut Config) -> Result<()> {
+    apply_env_overrides_from(cfg, |name| std::env::var(name).ok())
+}
+
+/// Same as [`apply_env_overrides`], but reads variables through `lookup`
+/// instead of the real process environment — lets tests exercise the
+/// override logic without mutating global process state.
+fn apply_env_overrides_from(cfg: &mut Config, lookup: impl Fn(&str) -> Option<String>) -> Result<()> {
+    if let Some(v) = lookup("BARDUCK_DATABASE_PATH") {
+        cfg.database_path = PathBuf::from(v);
+    }
+    if let Some(v) = lookup("BARDUCK_LISTEN") {
+        cfg.listen = v;
+    }
+    if let Some(v) = lookup("BARDUCK_INTERVAL") {
+        cfg.interval = parse_env_duration("BARDUCK_INTERVAL", &v)?;
+    }
+    if let Some(v) = lookup("BARDUCK_FAILURE_THRESHOLD") {
+        cfg.failure_threshold = parse_env_u32("BARDUCK_FAILURE_THRESHOLD", &v)?;
+    }
+    if let Some(v) = lookup("BARDUCK_STALE_AFTER") {
+        cfg.stale_after = parse_env_duration("BARDUCK_STALE_AFTER", &v)?;
+    }
+    if let Some(v) = lookup("BARDUCK_HISTORY_POINTS") {
+        cfg.history_points = parse_env_u32("BARDUCK_HISTORY_POINTS", &v)?;
+    }
+    if let Some(v) = lookup("BARDUCK_TUI_WIDTH") {
+        cfg.tui_width = parse_env_tui_width(&v)?;
+    }
+    Ok(())
+}
+
+fn parse_env_duration(var: &str, v: &str) -> Result<Duration> {
+    humantime::parse_duration(v)
+        .with_context(|| format!("environment variable `{var}` value `{v}` is invalid"))
+}
+
+fn parse_env_u32(var: &str, v: &str) -> Result<u32> {
+    v.trim()
+        .parse()
+        .with_context(|| format!("environment variable `{var}` value `{v}` is invalid"))
+}
+
+fn parse_env_tui_width(v: &str) -> Result<TuiWidth> {
+    if v == "auto" {
+        return Ok(TuiWidth::Named("auto".into()));
+    }
+    v.trim()
+        .parse()
+        .map(TuiWidth::Fixed)
+        .with_context(|| format!("environment variable `BARDUCK_TUI_WIDTH` value `{v}` is invalid"))
 }
 
 pub fn validate(cfg: &Config) -> Result<()> {
@@ -463,20 +539,26 @@ fn validate_cell(cfg: &Config, layout_title: &str, row_idx: usize, cell: &Cell) 
             bail!("layout `{}` row {} has a space with colspan 0", layout_title, row_idx + 1);
         }
         Cell::Space { .. } => {}
-        Cell::Group { title, ids } => {
-            if title.is_empty() {
+        Cell::Group { title, main, secondary, table } => {
+            if title.as_deref() == Some("") {
                 bail!("layout `{}` row {} has a group with an empty title", layout_title, row_idx + 1);
             }
-            if ids.is_empty() {
-                bail!("layout `{}` row {} has group `{}` with no ids", layout_title, row_idx + 1, title);
+            let group_label = title.as_deref().unwrap_or("<untitled>");
+            if main.is_none() && secondary.is_empty() && table.is_empty() {
+                bail!(
+                    "layout `{}` row {} has group `{}` with none of main/secondary/table",
+                    layout_title,
+                    row_idx + 1,
+                    group_label
+                );
             }
-            for item in ids {
+            for item in main.iter().chain(secondary).chain(table) {
                 if !cfg.sources.iter().any(|s| s.name == item.id()) {
                     bail!(
                         "layout `{}` row {} group `{}` references unknown source `{}`",
                         layout_title,
                         row_idx + 1,
-                        title,
+                        group_label,
                         item.id()
                     );
                 }
@@ -579,8 +661,10 @@ mod tests {
     #[test]
     fn group_cell_span_and_title() {
         let cell = Cell::Group {
-            title: "ihor".into(),
-            ids: vec![GroupItem::Id("a".into())],
+            title: Some("ihor".into()),
+            main: None,
+            secondary: Vec::new(),
+            table: vec![GroupItem::Id("a".into())],
         };
         assert_eq!(cell.span(), 1);
         assert_eq!(cell.pane_title(), Some("ihor"));
@@ -624,13 +708,12 @@ mod tests {
     #[test]
     fn group_cell_source_names_lists_every_member() {
         let cell = Cell::Group {
-            title: "ihor".into(),
-            ids: vec![
-                GroupItem::Id("a".into()),
-                GroupItem::Labeled { id: "b".into(), label: "B".into() },
-            ],
+            title: Some("ihor".into()),
+            main: Some(GroupItem::Id("a".into())),
+            secondary: vec![GroupItem::Labeled { id: "b".into(), label: "B".into() }],
+            table: vec![GroupItem::Id("c".into())],
         };
-        assert_eq!(cell.source_names(), vec!["a", "b"]);
+        assert_eq!(cell.source_names(), vec!["a", "b", "c"]);
     }
 
     fn group_layout_toml(group_extra: &str) -> String {
@@ -642,29 +725,101 @@ mod tests {
 
     #[test]
     fn valid_group_cell_accepted() {
-        let cfg: Config = toml::from_str(&group_layout_toml("ids = [\"cpu\"]")).unwrap();
+        let cfg: Config = toml::from_str(&group_layout_toml("table = [\"cpu\"]")).unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn valid_group_cell_with_only_main_accepted() {
+        let cfg: Config = toml::from_str(&group_layout_toml("main = \"cpu\"")).unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn group_cell_combining_main_secondary_table_accepted() {
+        let cfg: Config = toml::from_str(&group_layout_toml(
+            "main = \"cpu\", secondary = [\"cpu\"], table = [\"cpu\"]",
+        ))
+        .unwrap();
         validate(&cfg).unwrap();
     }
 
     #[test]
     fn group_cell_empty_title_rejected() {
-        let toml = "[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"\", ids = [\"cpu\"] }]]\n";
+        let toml = "[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"\", table = [\"cpu\"] }]]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let err = validate(&cfg).unwrap_err();
         assert!(err.to_string().contains("empty title"), "error should mention empty title: {err}");
     }
 
     #[test]
-    fn group_cell_empty_ids_rejected() {
-        let cfg: Config = toml::from_str(&group_layout_toml("ids = []")).unwrap();
-        let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("no ids"), "error should mention the empty group: {err}");
+    fn group_cell_without_title_accepted() {
+        let toml = "[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ secondary = [\"cpu\"] }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        validate(&cfg).unwrap();
     }
 
     #[test]
-    fn group_cell_unknown_source_rejected() {
-        let cfg: Config = toml::from_str(&group_layout_toml("ids = [\"nope\"]")).unwrap();
+    fn group_cell_with_no_sections_rejected() {
+        let cfg: Config = toml::from_str(&group_layout_toml("table = []")).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("main/secondary/table"),
+            "error should mention the empty group: {err}"
+        );
+    }
+
+    #[test]
+    fn group_cell_unknown_source_in_main_rejected() {
+        let cfg: Config = toml::from_str(&group_layout_toml("main = \"nope\"")).unwrap();
         let err = validate(&cfg).unwrap_err();
         assert!(err.to_string().contains("nope"), "error should name the unknown source: {err}");
+    }
+
+    #[test]
+    fn group_cell_unknown_source_in_secondary_rejected() {
+        let cfg: Config = toml::from_str(&group_layout_toml("secondary = [\"nope\"]")).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("nope"), "error should name the unknown source: {err}");
+    }
+
+    #[test]
+    fn group_cell_unknown_source_in_table_rejected() {
+        let cfg: Config = toml::from_str(&group_layout_toml("table = [\"nope\"]")).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("nope"), "error should name the unknown source: {err}");
+    }
+
+    fn lookup_from(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_string())
+    }
+
+    #[test]
+    fn env_var_overrides_config_file_value() {
+        let mut cfg: Config = toml::from_str("listen = \"127.0.0.1:8420\"").unwrap();
+        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_LISTEN", "0.0.0.0:9000")])).unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn env_var_overrides_default() {
+        let mut cfg = Config::default();
+        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_HISTORY_POINTS", "100")])).unwrap();
+        assert_eq!(cfg.history_points, 100);
+    }
+
+    #[test]
+    fn no_env_var_leaves_config_value_unchanged() {
+        let mut cfg: Config = toml::from_str("failure_threshold = 5").unwrap();
+        apply_env_overrides_from(&mut cfg, lookup_from(&[])).unwrap();
+        assert_eq!(cfg.failure_threshold, 5);
+    }
+
+    #[test]
+    fn unparseable_env_override_rejected() {
+        let mut cfg = Config::default();
+        let err = apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_STALE_AFTER", "not-a-duration")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("BARDUCK_STALE_AFTER"), "error should name the variable: {err}");
     }
 }

@@ -131,18 +131,25 @@ interval = "5s"
 #   "source"                        -> panel titled after the source
 #   { id = "src", title = "X" }     -> panel with custom title
 #   { kind = "space", colspan = N } -> empty spacer spanning N columns
-#   { title = "X", ids = [...] }    -> one pane with N labeled, independently
-#                                       colored values, its own border/history
-#                                       matching the worst member; an `ids`
-#                                       entry is a bare source name (label =
-#                                       that source's `title`, or its name) or
-#                                       { id = "src", label = "Label" }
+#   { title = "X", main = ..., secondary = [...], table = [...] }
+#                                   -> one generalized pane combining up to
+#                                      three sections (at least one required):
+#                                      `main` (one value, rendered full-size
+#                                      like a regular panel, with its own
+#                                      history bar), `secondary` (compact
+#                                      values, no history bar), and `table`
+#                                      (N labeled, independently colored rows,
+#                                      as before). The pane's own border/
+#                                      history matches the worst member across
+#                                      all three. A `main`/`secondary`/`table`
+#                                      entry is a bare source name (label =
+#                                      that source's `title`, or its name) or
+#                                      { id = "src", label = "Label" }
 [[layouts]]
 title = "Overview"
 rows = [
     [
-        { title = "Disks", ids = ["disk-root", { id = "disk-home", label = "home" }] },
-        "domain-expiry",
+        { title = "Server", main = "disk-root", secondary = ["domain-expiry"], table = [{ id = "disk-home", label = "home" }] },
         "bank-balance",
     ],
     [{ id = "bank-balance-thresholds", title = "Balance bands" }, { kind = "space" }, "work-hours"],

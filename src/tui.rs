@@ -70,15 +70,20 @@ struct Panel {
     ts_epoch: f64,
 }
 
-/// One grid slot: a spacer (empty `panels`), a single-source panel (one
-/// entry), or a group panel (N entries, one per member, each independently
-/// colored) (spec: tui — group panes).
+/// One grid slot: a spacer (`main` and `secondary`/`table` all empty), a
+/// single-source panel (`main` only, `group_title` `None`), or a generalized
+/// pane combining up to three sections — `main` (regular-panel treatment),
+/// `secondary` (compact, always-shown age), and `table` (label/value rows,
+/// age only when stale) (spec: tui — group panes show multiple labeled,
+/// independently colored values).
 struct Slot {
     span: usize,
-    /// Card title for a group slot; unused for a single-source slot, whose
-    /// title lives on its one `Panel`'s `name` instead.
+    /// Card title for a group slot; unused for a plain single-source slot,
+    /// whose title lives on its `main` panel's `name` instead.
     group_title: Option<String>,
-    panels: Vec<Panel>,
+    main: Option<Panel>,
+    secondary: Vec<Panel>,
+    table: Vec<Panel>,
 }
 
 /// Builds one panel's value/status/threshold data for `name`, labeled
@@ -151,25 +156,37 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                 for row_cells in &layout.rows {
                     let mut slots = Vec::new();
                     for cell in row_cells {
-                        let (panels, group_title) = match cell {
-                            crate::config::Cell::Group { title, ids } => (
-                                ids.iter()
+                        let (main, secondary, table, group_title) = match cell {
+                            crate::config::Cell::Group { title, main, secondary, table } => (
+                                main.as_ref().map(|item| {
+                                    build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
+                                }),
+                                secondary
+                                    .iter()
                                     .map(|item| {
                                         build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
                                     })
                                     .collect(),
-                                Some(title.clone()),
+                                table
+                                    .iter()
+                                    .map(|item| {
+                                        build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
+                                    })
+                                    .collect(),
+                                title.clone(),
                             ),
                             crate::config::Cell::Source(name) => {
-                                (vec![build_panel(cfg, &latest, &healths, name, None)], None)
+                                (Some(build_panel(cfg, &latest, &healths, name, None)), Vec::new(), Vec::new(), None)
                             }
                             crate::config::Cell::Pane { id, title } => (
-                                vec![build_panel(cfg, &latest, &healths, id, title.as_deref())],
+                                Some(build_panel(cfg, &latest, &healths, id, title.as_deref())),
+                                Vec::new(),
+                                Vec::new(),
                                 None,
                             ),
-                            crate::config::Cell::Space { .. } => (Vec::new(), None),
+                            crate::config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None),
                         };
-                        slots.push(Slot { span: cell.span(), group_title, panels });
+                        slots.push(Slot { span: cell.span(), group_title, main, secondary, table });
                     }
                     rows.push(slots);
                 }
@@ -272,7 +289,7 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
             Layout::horizontal(row.iter().map(|c| Constraint::Fill(c.span as u16)).collect::<Vec<_>>())
                 .split(*rect);
         for (cell, crect) in row.iter().zip(col_areas.iter()) {
-            if !cell.panels.is_empty() {
+            if cell.main.is_some() || !cell.secondary.is_empty() || !cell.table.is_empty() {
                 f.render_widget(panel_widget(cell), *crect);
             }
         }
@@ -286,11 +303,21 @@ fn header_line(f: &mut ratatui::Frame, area: ratatui::layout::Rect, y: u16, text
     );
 }
 
-/// Renders a slot's panel(s): a single-source slot as one styled line (as
-/// before), a group slot as one line per member, each independently colored
-/// (spec: tui — group panes).
+/// Renders a slot's panel(s). When `main` is the slot's only content (a
+/// plain single-source cell, or a generalized pane with only `main` set), it
+/// renders exactly as a single-source panel always has: one styled line,
+/// value shown directly, age always shown. Otherwise it's a generalized
+/// pane combining up to three sections in one bordered panel — `main`
+/// (value shown directly, always-shown age, emphasized style), `secondary`
+/// (same treatment, non-emphasized style), and `table` (today's "label:
+/// value" lines, age only when stale) — with the panel's own border colored
+/// by the worst member across all three sections (spec: tui — group panes
+/// show multiple labeled, independently colored values).
 fn panel_widget(slot: &Slot) -> Paragraph<'_> {
-    if let [p] = slot.panels.as_slice() {
+    if slot.secondary.is_empty()
+        && slot.table.is_empty()
+        && let Some(p) = &slot.main
+    {
         let style = status_style(p.level.as_deref(), p.status);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -301,46 +328,49 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
             Span::raw(if p.unit.is_empty() { String::new() } else { format!(" {}", p.unit) }),
             Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
         ]);
+        let title = slot.group_title.as_deref().unwrap_or(&p.name);
         Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(style)
-                .title(Span::styled(format!(" {} [{}] ", p.name, p.status), style)),
+                .title(Span::styled(format!(" {title} [{}] ", p.status), style)),
         )
     } else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
         let colors: Vec<&str> = slot
-            .panels
+            .main
             .iter()
+            .chain(&slot.secondary)
+            .chain(&slot.table)
             .map(|p| crate::config::status_color(p.level.as_deref(), p.status))
             .collect();
         let border_style = color_style(crate::config::worst_color(colors));
-        let lines: Vec<Line> = slot
-            .panels
-            .iter()
-            .map(|p| {
-                let style = status_style(p.level.as_deref(), p.status);
-                // Only show the age when the value is lagging (stale) — a
-                // group line otherwise omits it to stay compact.
-                let updated = if p.status == "stale" {
-                    crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"))
-                } else {
-                    String::new()
-                };
-                Line::from(vec![
-                    Span::styled(format!("{}: ", p.name), Style::default().add_modifier(Modifier::DIM)),
-                    Span::styled(p.value.clone(), style.add_modifier(Modifier::BOLD)),
-                    Span::raw(if p.unit.is_empty() { String::new() } else { format!(" {}", p.unit) }),
-                    Span::styled(
-                        plain_label(p.status),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
-                ])
-            })
-            .collect();
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(p) = &slot.main {
+            lines.push(main_or_secondary_line(p, now, Modifier::BOLD));
+        }
+        for p in &slot.secondary {
+            lines.push(main_or_secondary_line(p, now, Modifier::empty()));
+        }
+        for p in &slot.table {
+            let style = status_style(p.level.as_deref(), p.status);
+            // Only show the age when the value is lagging (stale) — a
+            // table line otherwise omits it to stay compact.
+            let updated = if p.status == "stale" {
+                crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"))
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}: ", p.name), Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(p.value.clone(), style.add_modifier(Modifier::BOLD)),
+                Span::raw(if p.unit.is_empty() { String::new() } else { format!(" {}", p.unit) }),
+                Span::styled(plain_label(p.status), Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
+            ]));
+        }
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -348,6 +378,21 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
                 .title(format!(" {} ", slot.group_title.as_deref().unwrap_or(""))),
         )
     }
+}
+
+/// One `main`/`secondary` line within a generalized pane: value shown
+/// directly (no label), age always shown, `value_modifier` distinguishing
+/// `main` (bold) from `secondary` (plain) (spec: tui — group panes show
+/// multiple labeled, independently colored values).
+fn main_or_secondary_line(p: &Panel, now: f64, value_modifier: Modifier) -> Line<'_> {
+    let style = status_style(p.level.as_deref(), p.status);
+    let updated = crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"));
+    Line::from(vec![
+        Span::styled(p.value.clone(), style.add_modifier(value_modifier)),
+        Span::raw(if p.unit.is_empty() { String::new() } else { format!(" {}", p.unit) }),
+        Span::styled(plain_label(p.status), Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
+    ])
 }
 
 /// Style for a normalized `"red"`/`"yellow"`/`"green"` color, shared by a
@@ -397,41 +442,47 @@ mod tests {
                     Slot {
                         span: 1,
                         group_title: None,
-                        panels: vec![Panel {
+                        main: Some(Panel {
                             name: "echo".into(),
                             value: "42".into(),
                             unit: String::new(),
                             status: "healthy",
                             level: None,
                             ts_epoch: 0.0,
-                        }],
+                        }),
+                        secondary: Vec::new(),
+                        table: Vec::new(),
                     },
                     Slot {
                         span: 1,
                         group_title: None,
-                        panels: vec![Panel {
+                        main: Some(Panel {
                             name: "Balance".into(),
                             value: "7.25".into(),
                             unit: "USD".into(),
                             status: "healthy",
                             level: None,
                             ts_epoch: 0.0,
-                        }],
+                        }),
+                        secondary: Vec::new(),
+                        table: Vec::new(),
                     },
                 ],
                 vec![
-                    Slot { span: 2, group_title: None, panels: Vec::new() },
+                    Slot { span: 2, group_title: None, main: None, secondary: Vec::new(), table: Vec::new() },
                     Slot {
                         span: 1,
                         group_title: None,
-                        panels: vec![Panel {
+                        main: Some(Panel {
                             name: "dead-service".into(),
                             value: "\u{2014}".into(),
                             unit: String::new(),
                             status: "failing",
                             level: None,
                             ts_epoch: 0.0,
-                        }],
+                        }),
+                        secondary: Vec::new(),
+                        table: Vec::new(),
                     },
                 ],
             ],
@@ -472,7 +523,9 @@ mod tests {
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("ihor".into()),
-                panels: vec![
+                main: None,
+                secondary: Vec::new(),
+                table: vec![
                     Panel {
                         name: "days left".into(),
                         value: "5".into(),
@@ -561,7 +614,9 @@ mod tests {
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("grp".into()),
-                panels: vec![
+                main: None,
+                secondary: Vec::new(),
+                table: vec![
                     Panel {
                         name: "days left".into(),
                         value: "5".into(),
@@ -606,6 +661,110 @@ mod tests {
             .find(|&(x, y)| buf[(x, y)].symbol() == "─")
             .map(|(x, y)| buf[(x, y)].fg);
         assert_eq!(border_fg, Some(Color::Red), "border should still flag the failing unbanded member");
+    }
+
+    /// A generalized pane with only `main` set renders exactly like a
+    /// single-source panel, titled with the cell's own title rather than
+    /// `main`'s own label (spec: tui — group panes show multiple labeled,
+    /// independently colored values).
+    #[test]
+    fn group_panel_with_only_main_renders_like_single_source_panel() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: Some("CPU".into()),
+                main: Some(Panel {
+                    name: "cpu-load-ignored".into(),
+                    value: "42".into(),
+                    unit: "%".into(),
+                    status: "healthy",
+                    level: Some("yellow".into()),
+                    ts_epoch: 0.0,
+                }),
+                secondary: Vec::new(),
+                table: Vec::new(),
+            }]],
+            tick: 0,
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert!(text.contains("CPU"), "cell title should be used, not main's own label");
+        assert!(!text.contains("cpu-load-ignored"), "main's own label should not appear");
+        assert!(text.contains("42"), "main value missing");
+        let border_fg = (0..buf.area().height)
+            .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == "─")
+            .map(|(x, y)| buf[(x, y)].fg);
+        assert_eq!(border_fg, Some(Color::Yellow), "border should reflect main's own band color");
+    }
+
+    /// A generalized pane combining all three sections renders `main`,
+    /// `secondary`, and `table` members together in one bordered panel, with
+    /// the border reflecting the worst member across every section — even
+    /// an unbanded, failing `secondary` member (spec: tui — group panes show
+    /// multiple labeled, independently colored values).
+    #[test]
+    fn group_panel_combines_main_secondary_and_table_sections() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: Some("Server".into()),
+                main: Some(Panel {
+                    name: "cpu-load".into(),
+                    value: "42".into(),
+                    unit: "%".into(),
+                    status: "healthy",
+                    level: Some("green".into()),
+                    ts_epoch: 0.0,
+                }),
+                secondary: vec![Panel {
+                    name: "mem-used".into(),
+                    value: "80".into(),
+                    unit: "%".into(),
+                    status: "failing",
+                    level: None,
+                    ts_epoch: 0.0,
+                }],
+                table: vec![Panel {
+                    name: "days left".into(),
+                    value: "5".into(),
+                    unit: "d".into(),
+                    status: "healthy",
+                    level: Some("green".into()),
+                    ts_epoch: 0.0,
+                }],
+            }]],
+            tick: 0,
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert!(text.contains("Server"), "cell title missing");
+        assert!(text.contains("42"), "main value missing");
+        assert!(text.contains("80"), "secondary value missing");
+        assert!(text.contains("mem-used") || text.contains('%'), "secondary content missing");
+        assert!(text.contains("days left"), "table label missing");
+        assert!(text.contains('5'), "table value missing");
+        let border_fg = (0..buf.area().height)
+            .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == "─")
+            .map(|(x, y)| buf[(x, y)].fg);
+        assert_eq!(
+            border_fg,
+            Some(Color::Red),
+            "border should reflect the failing unbanded secondary member, not just main/table"
+        );
     }
 
     /// A banded value colors by its band when healthy (spec: tui —

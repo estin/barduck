@@ -2,3 +2,4 @@
 
 # demo run artifacts
 demo/*.duckdb
+demo/*.lock
