@@ -241,9 +241,9 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
     // (inline style, not a class: see `Panel::status_style`), alongside a
     // plain uncolored label. `echo` (healthy, unbanded) gets no accent color
     // at all — not even green — since it has nothing to accent.
-    assert!(html.contains("border-color:#ef4444"));
+    assert!(html.contains("border-color:var(--status-red-border)"));
     assert!(html.contains("<span>failing</span>"), "plain failing label expected for the unbanded dead source");
-    assert!(!html.contains("border-color:#10b981"), "a healthy unbanded source should get no accent color");
+    assert!(!html.contains("border-color:var(--status-green-border)"), "a healthy unbanded source should get no accent color");
     // Live updates: shard scope markers + vendored runtime script tag.
     assert!(html.contains("::topcoat::scope::"), "shard reactive scope expected");
     assert!(
@@ -260,8 +260,12 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
         page.contains("grid-template-columns: repeat(2"),
         "2-column grid expected"
     );
-    assert_eq!(page.matches("grid-template-columns").count(), 1);
-    assert!(page.contains(">Balance</h3>"), "custom pane title expected");
+    // Counts grids by their own per-grid inline-style marker, not the bare
+    // "grid-template-columns" text — the responsive `<style>` block (spec:
+    // web-ui — responsive layout for small viewports) also mentions that
+    // property once, statically, regardless of how many grids there are.
+    assert_eq!(page.matches("--bd-cols:").count(), 1);
+    assert!(page.contains(">Balance</span>"), "custom pane title expected");
     // Log link on the time-ago text.
     assert!(page.contains(r#"href="/logs/balance" target="_blank""#), "per-source log link expected");
 
@@ -337,7 +341,7 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     // One card titled with the group's title, not the member sources' names.
-    assert!(html.contains(">ihor</h3>"), "group pane title expected");
+    assert!(html.contains(">ihor</span>"), "group pane title expected");
     // Both labeled values present, each colored by its own threshold band.
     assert!(html.contains("days left"));
     assert!(html.contains("5 d"));
@@ -345,11 +349,11 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
     assert!(html.contains("90 USD"));
     // Rows carry only text color (on the value, not the label), no
     // border/background of their own.
-    assert!(html.contains(r#"style="color:#ef4444""#), "red text for days-left row expected");
-    assert!(html.contains(r#"style="color:#059669""#), "green text for balance row expected");
+    assert!(html.contains(r#"style="color:var(--status-red-text)""#), "red text for days-left row expected");
+    assert!(html.contains(r#"style="color:var(--status-green-text)""#), "green text for balance row expected");
     // The card's own border is the worst color among its rows (red, here).
     // Chips use background-color, never border-color, so this is unambiguous.
-    assert!(html.contains("border-color:#ef4444"), "group card border should reflect the worst row");
+    assert!(html.contains("border-color:var(--status-red-border)"), "group card border should reflect the worst row");
     // Neither the card nor its rows carry a background color — scoped past
     // the summary-strip chips, which legitimately use background-color.
     let id_idx = html.find("id=\"panel-days-left\"").expect("group card expected");
@@ -427,9 +431,9 @@ rows = [["cpu", "plain", "sparse"]]
 /// Returns the HTML slice for one panel: from its title marker up to the
 /// next title marker (or end of page).
 fn panel_slice<'a>(page: &'a str, title: &str, next_title: Option<&str>) -> &'a str {
-    let start = page.find(&format!(">{title}</h3>")).expect("panel title");
+    let start = page.find(&format!(">{title}</span>")).expect("panel title");
     match next_title {
-        Some(next) => &page[start..page.find(&format!(">{next}</h3>")).expect("next panel title")],
+        Some(next) => &page[start..page.find(&format!(">{next}</span>")).expect("next panel title")],
         None => &page[start..],
     }
 }
@@ -512,9 +516,9 @@ async fn web_ui_unbanded_failing_source_colors_red_with_plain_label() {
     // `dead`'s failing health colors it red, with a plain uncolored label
     // alongside that color, not instead of it. `echo` being healthy and
     // unbanded gets no accent color at all — not even green.
-    assert!(html.contains("border-color:#ef4444"), "failing unbanded panel should render red");
+    assert!(html.contains("border-color:var(--status-red-border)"), "failing unbanded panel should render red");
     assert!(html.contains("<span>failing</span>"), "plain uncolored failing label expected alongside the red style");
-    assert!(!html.contains("border-color:#10b981"), "a healthy unbanded source should get no accent color");
+    assert!(!html.contains("border-color:var(--status-green-border)"), "a healthy unbanded source should get no accent color");
 }
 
 /// `shown` renders its history bar as usual; `hidden` declares the same
@@ -643,14 +647,14 @@ async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     // Card border flags the failing unbanded member (aggregate rule unchanged).
-    assert!(html.contains("border-color:#ef4444"), "card border should reflect the failing member");
+    assert!(html.contains("border-color:var(--status-red-border)"), "card border should reflect the failing member");
     // That member's own row now also renders red text (health-derived, since
     // it has no bands), with the plain label alongside it, not instead of it.
     // (Not the summary-strip chip link, which also renders the text "flaky" —
     // scope to the row's own `/logs/<source>` link.)
     let row_idx = html.find(r#"href="/logs/flaky""#).expect("flaky row label");
     let row_slice = &html[row_idx..(row_idx + 300).min(html.len())];
-    assert!(row_slice.contains("color:#ef4444"), "unbanded failing row should render red text: {row_slice}");
+    assert!(row_slice.contains("color:var(--status-red-text)"), "unbanded failing row should render red text: {row_slice}");
     assert!(row_slice.contains("failing"), "plain failing label expected alongside the red text: {row_slice}");
 }
 
@@ -705,14 +709,14 @@ async fn web_ui_main_only_pane_renders_like_single_source_panel() {
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     // The cell's own title is used, not `main`'s source name.
-    assert!(html.contains(">CPU Pane</h3>"), "cell title expected");
+    assert!(html.contains(">CPU Pane</span>"), "cell title expected");
     assert!(html.contains("70"), "main value missing");
     // Full single-panel styling — border AND background, unlike a table/
     // secondary row which only ever carries a text color.
-    assert!(html.contains("border-color:#fbbf24;background-color:#fffbeb"), "full yellow panel style expected");
+    assert!(html.contains("border-color:var(--status-yellow-border);background-color:var(--status-yellow-bg)"), "full yellow panel style expected");
     // `main`'s own history bar (thresholds + a reading) renders, using the
     // same wrapper class a plain single-source panel uses.
-    assert!(html.contains("mt-2 flex gap-0.5 h-2"), "main's own history bar expected");
+    assert!(html.contains("mt-1.5 flex gap-0.5 h-2"), "main's own history bar expected");
 }
 
 /// A generalized pane combining `main`, `secondary`, and `table`: `secondary`
@@ -800,7 +804,7 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
     tokio::spawn(async move { topcoat::serve(listener, router).await });
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
-    assert!(html.contains(">Server</h3>"), "cell title expected");
+    assert!(html.contains(">Server</span>"), "cell title expected");
     assert!(html.contains("42"), "main value missing");
     assert!(html.contains("70"), "secondary value missing");
     assert!(html.contains("balance"), "table label missing");
@@ -808,7 +812,7 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
 
     // Both `secondary` members render inside one shared row, as plain
     // colored value+unit links to their own log view — no separate label.
-    let secondary_row_idx = html.find(r#"class="flex flex-wrap items-center gap-3 mb-2""#)
+    let secondary_row_idx = html.find(r#"class="flex flex-wrap items-center gap-2.5 mb-1.5""#)
         .expect("secondary row container expected");
     let secondary_row = &html[secondary_row_idx..(secondary_row_idx + 600).min(html.len())];
     assert!(
@@ -823,16 +827,16 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
     // The failing, unbanded `flaky` secondary member alone is enough to turn
     // the whole card's border red — not just a table member — and its value
     // is replaced with the plain word "FAILING", not a stale/missing value.
-    assert!(html.contains("border-color:#ef4444"), "card border should reflect the failing secondary member");
+    assert!(html.contains("border-color:var(--status-red-border)"), "card border should reflect the failing secondary member");
     let flaky_idx = html.find(r#"href="/logs/flaky""#).expect("flaky link expected");
     let flaky_slice = &html[flaky_idx..(flaky_idx + 200).min(html.len())];
     assert!(flaky_slice.contains("FAILING"), "failing secondary member should show FAILING text: {flaky_slice}");
-    assert!(flaky_slice.contains("color:#ef4444"), "FAILING text should render red: {flaky_slice}");
+    assert!(flaky_slice.contains("color:var(--status-red-text)"), "FAILING text should render red: {flaky_slice}");
 
     // `main`'s own history bar (2-unit height) renders once; `table`'s single
     // banded row (1.5-unit height) renders once too — but `mem-warn`, also
     // banded, contributes no history bar at all as a `secondary` member.
-    assert_eq!(html.matches("mt-2 flex gap-0.5 h-2").count(), 1, "only main should render its own history bar");
+    assert_eq!(html.matches("mt-1.5 flex gap-0.5 h-2").count(), 1, "only main should render its own history bar");
     assert_eq!(
         html.matches("mt-1 flex gap-0.5 h-1.5").count(),
         1,
@@ -902,6 +906,111 @@ async fn dashboard_includes_connection_indicator() {
     assert!(page.contains("/api/ping"), "ping script should reference /api/ping");
 }
 
+/// (spec: web-ui — light/dark theme toggle; responsive layout for small viewports)
+#[tokio::test]
+async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState { db: db.clone(), cfg: Arc::new(cfg.clone()) };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(
+        page.contains(r#"name="viewport" content="width=device-width, initial-scale=1""#),
+        "viewport meta tag expected"
+    );
+    assert!(page.contains(r#"id="bd-theme-toggle""#), "theme toggle button expected");
+    assert!(page.contains("bd-panel-grid"), "responsive grid class expected");
+    assert!(page.contains("bd-panel-cell"), "responsive cell class expected");
+    assert!(page.contains(r#"<html class="">"#), "no theme cookie yet: no explicit class rendered");
+
+    // Setting the theme cookie server-side changes what the server renders on
+    // the very next request, with no client-side bootstrap script involved —
+    // "the backend knows the user's theme" (spec: web-ui — light/dark theme
+    // toggle).
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}api/theme"))
+        .json(&serde_json::json!({ "theme": "dark" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+
+    let page2 = client
+        .get(&url)
+        .header("Cookie", cookie_pair)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page2.contains(r#"<html class="dark">"#), "server should render the dark class from the cookie");
+
+    // An invalid theme value is rejected, not silently accepted.
+    let bad = client
+        .post(format!("{url}api/theme"))
+        .json(&serde_json::json!({ "theme": "purple" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+}
+
+/// A generalized pane cell with no `title` and no `main` renders no title
+/// span at all (spec: web-ui — panel title rendered on the card border).
+#[tokio::test]
+async fn untitled_pane_without_main_renders_no_title_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "cpu"
+type = "script"
+command = "echo 0"
+
+[[layouts]]
+title = "L"
+rows = [
+  [{{ secondary = ["cpu"] }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState { db: db.clone(), cfg: Arc::new(cfg.clone()) };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(html.contains("cpu"), "secondary member's log link expected");
+    assert!(
+        !html.contains(r#"class="absolute top-0 -translate-y-1/2"#),
+        "an untitled, main-less pane should render no title span at all"
+    );
+}
+
 /// (spec: web-ui — source summary strip)
 #[tokio::test]
 async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors() {
@@ -936,8 +1045,8 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
     // No thresholds are configured in test_config; `background-color` here
     // can only come from summary chips (panels use border+bg-50 style; both
     // are inline style, not a class: see `Panel::chip_style`).
-    assert!(page.contains("background-color:#10b981"), "healthy chip color expected");
-    assert!(page.contains("background-color:#ef4444"), "failing chip color expected");
+    assert!(page.contains("background-color:var(--status-green-border)"), "healthy chip color expected");
+    assert!(page.contains("background-color:var(--status-red-border)"), "failing chip color expected");
 }
 
 /// (spec: web-ui — source summary strip)

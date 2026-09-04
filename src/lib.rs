@@ -17,6 +17,7 @@ use config::Config;
 use std::sync::Arc;
 use topcoat::{
     asset::{AssetBundle, RouterBuilderAssetExt},
+    cookie::RouterBuilderCookieExt,
     router::RouterBuilderDiscoverExt,
 };
 
@@ -59,7 +60,7 @@ pub fn build_router(state: AppState) -> topcoat::router::Router {
 /// apply to the test harness binary, which isn't `barduck`.
 #[must_use]
 pub fn build_router_with_bundle(state: AppState, bundle: Option<AssetBundle>) -> topcoat::router::Router {
-    let builder = topcoat::router::Router::builder().discover();
+    let builder = topcoat::router::Router::builder().discover().cookies();
     let builder = if let Some(b) = bundle {
         builder.assets(b)
     } else {

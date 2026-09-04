@@ -5,8 +5,8 @@ use crate::{
     config::ValueFormat,
     components::{
         badge::{BadgeVariant, badge},
-        button::{ButtonSize, ButtonVariant, button_variants},
-        card::{card, card_content, card_footer, card_header, card_title},
+        button::{ButtonSize, ButtonVariant, button},
+        card::{card, card_content, card_footer},
         table::{table, table_body, table_cell, table_head, table_header, table_row},
     },
     health,
@@ -14,6 +14,7 @@ use crate::{
 use topcoat::{
     Result,
     context::{Cx, app_context},
+    cookie::{Cookies, cookies},
     font::{Font, fontsource::fontsource_font},
     router::{page, path_param},
     runtime::shard,
@@ -26,6 +27,25 @@ use topcoat::{
 /// route, colliding on `.discover()` (`duplicate route registered for GET
 /// /_topcoat/fonts/...`).
 const GEIST: Font = fontsource_font!(GEIST);
+
+/// Name of the cookie persisting the browser's explicit light/dark choice
+/// (spec: web-ui — light/dark theme toggle). Set by `POST /api/theme`
+/// (`src/api.rs`); read here so every server-rendered page applies the same
+/// class the toggle last chose, with no client-side bootstrap step needed.
+pub(crate) const THEME_COOKIE: &str = "bd_theme";
+
+/// `"dark"`/`"light"` when the browser has made an explicit choice
+/// (`bd_theme` cookie), else empty — an empty class lets the CSS
+/// `prefers-color-scheme` media query (`assets/styles.css`) decide, so a
+/// first-time visitor still gets their OS preference (spec: web-ui —
+/// light/dark theme toggle).
+fn theme_class(cx: &Cx) -> &'static str {
+    match cookies(cx).get(THEME_COOKIE).as_ref().map(topcoat::cookie::Cookie::value) {
+        Some("dark") => "dark",
+        Some("light") => "light",
+        _ => "",
+    }
+}
 
 /// Frontend-initiated ping/pong: polls `/api/ping` and reflects reachability
 /// in the connection indicator, independent of the panel-refresh shard
@@ -80,6 +100,25 @@ const FAVICON_SCRIPT: &str = r##"(function () {
     refresh();
     setInterval(refresh, 5000);
 })();"##;
+
+/// Wires the theme toggle button: flips `<html>`'s `dark` class immediately
+/// (instant feedback, no round trip needed to see it), then persists the
+/// choice via `POST /api/theme` so the next page load already carries the
+/// right class from the server (spec: web-ui — light/dark theme toggle).
+const THEME_TOGGLE_SCRIPT: &str = r"(function () {
+    var btn = document.getElementById('bd-theme-toggle');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+        var root = document.documentElement;
+        var next = root.classList.contains('dark') ? 'light' : 'dark';
+        root.classList.toggle('dark', next === 'dark');
+        fetch('/api/theme', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ theme: next })
+        }).catch(function () {});
+    });
+})();";
 
 struct Panel {
     /// Source id (used for log links); `name` is the display title.
@@ -146,9 +185,9 @@ impl Panel {
     /// rationale as [`Panel::status_style`]).
     fn chip_style(&self) -> &'static str {
         match self.level_color() {
-            "red" => "background-color:#ef4444;color:#ffffff",
-            "yellow" => "background-color:#fbbf24;color:#451a03",
-            _ => "background-color:#10b981;color:#ffffff",
+            "red" => "background-color:var(--status-red-border);color:var(--status-red-chip-fg)",
+            "yellow" => "background-color:var(--status-yellow-border);color:var(--status-yellow-chip-fg)",
+            _ => "background-color:var(--status-green-border);color:var(--status-green-chip-fg)",
         }
     }
 
@@ -251,11 +290,19 @@ impl Slot {
 /// Inline CSS for a single-source panel's card: border, tinted background,
 /// and text color together. `None` renders as no override at all — the
 /// card falls back to its default neutral classes instead of a forced green.
+///
+/// References the `--status-*` custom properties from `assets/styles.css`
+/// (light values in `:root`, dark overrides in `.dark`/the OS-preference
+/// media query) rather than literal hex, so these colors adapt to the
+/// viewer's theme automatically — `var()` inside an inline `style` still
+/// resolves against the live cascade, so this keeps the inline-style
+/// approach (needed to reliably beat `card`'s own classes) while staying
+/// theme-aware (spec: web-ui — light/dark theme toggle).
 fn full_style_for_color(color: Option<&str>) -> &'static str {
     match color {
-        Some("red") => "border-color:#ef4444;background-color:#fef2f2;color:#7f1d1d",
-        Some("yellow") => "border-color:#fbbf24;background-color:#fffbeb;color:#78350f",
-        Some("green") => "border-color:#10b981;background-color:#ffffff;color:#0f172a",
+        Some("red") => "border-color:var(--status-red-border);background-color:var(--status-red-bg);color:var(--status-red-fg)",
+        Some("yellow") => "border-color:var(--status-yellow-border);background-color:var(--status-yellow-bg);color:var(--status-yellow-fg)",
+        Some("green") => "border-color:var(--status-green-border);background-color:var(--status-green-bg);color:var(--status-green-fg)",
         _ => "",
     }
 }
@@ -265,9 +312,9 @@ fn full_style_for_color(color: Option<&str>) -> &'static str {
 /// background.
 fn border_style_for_color(color: &str) -> &'static str {
     match color {
-        "red" => "border-color:#ef4444",
-        "yellow" => "border-color:#fbbf24",
-        _ => "border-color:#10b981",
+        "red" => "border-color:var(--status-red-border)",
+        "yellow" => "border-color:var(--status-yellow-border)",
+        _ => "border-color:var(--status-green-border)",
     }
 }
 
@@ -277,9 +324,9 @@ fn border_style_for_color(color: &str) -> &'static str {
 /// forced green.
 fn text_style_for_color(color: Option<&str>) -> &'static str {
     match color {
-        Some("red") => "color:#ef4444",
-        Some("yellow") => "color:#d97706",
-        Some("green") => "color:#059669",
+        Some("red") => "color:var(--status-red-text)",
+        Some("yellow") => "color:var(--status-yellow-text)",
+        Some("green") => "color:var(--status-green-text)",
         _ => "",
     }
 }
@@ -422,10 +469,10 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
     view! {
         <span id="bd-status" data-status=(worst) style="display:none"></span>
         if !chips.is_empty() {
-            <div class="flex flex-wrap gap-2 mb-6">
+            <div class="flex flex-wrap gap-1.5 mb-4">
                 for (p, anchor) in &chips {
                     <a href=(format!("#panel-{}", anchor))
-                        class=(button_variants(ButtonVariant::Outline, ButtonSize::Sm))
+                        class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium leading-none hover:opacity-90"
                         style=(p.chip_style())
                     >
                         (p.name.clone())
@@ -435,7 +482,7 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
         }
         for grid in &grids {
             <h2 class="text-lg font-semibold mb-3 text-foreground">(grid.title.clone())</h2>
-            <div class=(format!("grid gap-4 mb-8 grid-cols-{}", grid.columns.min(6)))
+            <div class=(format!("grid bd-panel-grid gap-3 mb-6 grid-cols-{}", grid.columns.min(6)))
                 style=(format!("--bd-cols: {}; grid-template-columns: repeat({}, minmax(0, 1fr));", grid.columns, grid.columns))
             >
                 for (ri, row) in grid.rows.iter().enumerate() {
@@ -445,26 +492,34 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                 card(
                                     attrs: attributes! {
                                         id=(format!("panel-{}", main.source))
+                                        class="relative bd-panel-cell"
                                         style=(format!(
                                             "{}; grid-row: {}; grid-column: {} / span {};",
                                             main.status_style(), ri + 1, slot.col_start, slot.span
                                         ))
                                     },
-                                    card_header(card_title(
-                                        attrs: attributes! { class="text-sm font-medium opacity-70" },
+                                    // Title on the card's own top border, top-left, padded — the
+                                    // TUI's bordered-panel title convention (spec: web-ui — panel
+                                    // title rendered on the card border). `top-0 -translate-y-1/2`
+                                    // centers the span on the border line itself regardless of
+                                    // font metrics, rather than a fixed `-top-*` offset that would
+                                    // only line up for one particular line-height. Reuses the
+                                    // card's own status style so the label's cutout background
+                                    // matches whatever the card is currently tinted (or neutral).
+                                    <span class="absolute top-0 -translate-y-1/2 left-4 px-1.5 text-xs font-medium leading-none bg-background" style=(main.status_style())>
                                         (slot.group_title.clone().unwrap_or_else(|| main.name.clone()))
-                                    ))
+                                    </span>
                                     card_content(
                                         if main.format == ValueFormat::Markdown {
                                             <div class="prose prose-sm max-w-none">(main.markdown_html())</div>
                                         } else if main.format == ValueFormat::Json {
-                                            <div class="text-3xl font-semibold">(main.value_and_unit())</div>
-                                            <pre class="mt-2 text-xs font-mono whitespace-pre-wrap break-all max-h-40 overflow-y-auto">(main.json_pretty())</pre>
+                                            <div class="text-2xl font-semibold">(main.value_and_unit())</div>
+                                            <pre class="mt-1.5 text-xs font-mono whitespace-pre-wrap break-all max-h-40 overflow-y-auto">(main.json_pretty())</pre>
                                         } else {
-                                            <div class="text-3xl font-semibold">(main.value_and_unit())</div>
+                                            <div class="text-2xl font-semibold">(main.value_and_unit())</div>
                                         }
                                         if !main.history.is_empty() {
-                                            <div class="mt-2 flex gap-0.5 h-2">
+                                            <div class="mt-1.5 flex gap-0.5 h-2">
                                                 for seg in &main.history {
                                                     <div class=(format!("flex-1 rounded-sm {}", Panel::segment_class(seg.as_deref())))></div>
                                                 }
@@ -488,16 +543,25 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                             card(
                                 attrs: attributes! {
                                     id=(format!("panel-{}", slot.anchor().unwrap_or_default()))
+                                    class="relative bd-panel-cell"
                                     style=(format!(
                                         "{}; grid-row: {}; grid-column: {} / span {};",
                                         slot.group_status_style(), ri + 1, slot.col_start, slot.span
                                     ))
                                 },
-                                card_header(card_title(attrs: attributes! { class="text-sm font-medium opacity-70" }, (slot.group_title.clone().unwrap_or_default())))
+                                // A combined card's own background is always neutral (spec:
+                                // web-ui — group panes card border reflects the worst member
+                                // across all sections), so the title label needs no per-status
+                                // override, just the same neutral background as the card.
+                                if let Some(title) = &slot.group_title {
+                                    <span class="absolute top-0 -translate-y-1/2 left-4 px-1.5 text-xs font-medium leading-none bg-background">
+                                        (title.clone())
+                                    </span>
+                                }
                                 card_content(
                                     if let Some(main) = &slot.main {
-                                        <div class="mb-2">
-                                            <div class="text-2xl font-semibold" style=(main.group_row_style())>(main.value_and_unit())</div>
+                                        <div class="mb-1.5">
+                                            <div class="text-xl font-semibold" style=(main.group_row_style())>(main.value_and_unit())</div>
                                             <div class="flex items-center gap-1.5 text-xs mt-0.5">
                                                 if let Some(label) = main.plain_label() {
                                                     <span class="opacity-60">(label)</span>
@@ -511,7 +575,7 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                                 </a>
                                             </div>
                                             if !main.history.is_empty() {
-                                                <div class="mt-2 flex gap-0.5 h-2">
+                                                <div class="mt-1.5 flex gap-0.5 h-2">
                                                     for seg in &main.history {
                                                         <div class=(format!("flex-1 rounded-sm {}", Panel::segment_class(seg.as_deref())))></div>
                                                     }
@@ -520,12 +584,12 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                         </div>
                                     }
                                     if !slot.secondary.is_empty() {
-                                        <div class="flex flex-wrap items-center gap-3 mb-2">
+                                        <div class="flex flex-wrap items-center gap-2.5 mb-1.5">
                                             for p in &slot.secondary {
                                                 <a
                                                     href=(format!("/logs/{}", p.source))
                                                     target="_blank"
-                                                    class="text-base font-semibold hover:underline"
+                                                    class="text-sm font-semibold hover:underline"
                                                     style=(p.group_row_style())
                                                 >
                                                     (p.secondary_text())
@@ -534,7 +598,7 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                         </div>
                                     }
                                     for p in &slot.table {
-                                        <div class="px-2 py-1 mb-1">
+                                        <div class="px-1.5 py-0.5 mb-0.5">
                                             <div class="flex justify-between items-center gap-2">
                                                 <a
                                                     href=(format!("/logs/{}", p.source))
@@ -567,7 +631,7 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                 )
                             )
                         } else {
-                            <div style=(format!("grid-row: {}; grid-column: {} / span {};", ri + 1, slot.col_start, slot.span))></div>
+                            <div class="bd-panel-cell" style=(format!("grid-row: {}; grid-column: {} / span {};", ri + 1, slot.col_start, slot.span))></div>
                         }
                     }
                 }
@@ -589,17 +653,35 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
 #[allow(clippy::no_effect_underscore_binding)] // `_t` is interpolated into the raw JS
 pub async fn dashboard(cx: &Cx) -> Result {
     let _st = app_context::<AppState>(cx);
+    let theme = theme_class(cx);
     view! {
         <!DOCTYPE html>
-        <html>
+        <html class=(theme)>
             <head>
                 <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <title>"barduck"</title>
                 <link rel="icon" id="bd-favicon">
                 <script type="module" src="/assets/bd-runtime.js"></script>
                 topcoat::font::link(font: GEIST)
                 <link rel="stylesheet" href=(tailwind::stylesheet!())>
-                <style>"[id^='panel-']:target { outline: 3px solid #6366f1; outline-offset: 2px; }"</style>
+                <style>
+                    "[id^='panel-']:target { outline: 3px solid #6366f1; outline-offset: 2px; }
+                    /* Below phone width, the grid's dynamic per-layout inline
+                       styles (a fixed column count and each cell's explicit
+                       grid-row/grid-column) can't vary by viewport on their
+                       own, and an inline `style` attribute otherwise always
+                       beats a stylesheet rule regardless of source order — so
+                       overriding them here for small screens needs
+                       `!important` (spec: web-ui — responsive layout for
+                       small viewports). Cells simply stack in DOM order once
+                       explicit placement is reset, which already matches the
+                       layout's own row-major declaration order. */
+                    @media (max-width: 640px) {
+                        .bd-panel-grid { grid-template-columns: 1fr !important; }
+                        .bd-panel-cell { grid-column: auto !important; grid-row: auto !important; }
+                    }"
+                </style>
             </head>
             <body>
                 signal tick = 0.0;
@@ -609,13 +691,25 @@ pub async fn dashboard(cx: &Cx) -> Result {
                     raw!("(globalThis.__bdTick ??= setInterval(() => ${_t}.increment(), 5000), 'tick')", "tick")
                 }) style="display:none"></span>
                 <div class="max-w-5xl mx-auto p-6">
-                    <h1 class="text-xl font-bold mb-4 text-foreground flex items-center gap-2">
+                    <h1 class="text-xl font-bold mb-4 text-foreground flex flex-wrap items-center gap-2">
                         <span>"barduck v"(config::VERSION)</span>
                         badge(
                             variant: BadgeVariant::Outline,
                             attrs: attributes! { class="gap-1.5 font-normal" },
                             <span id="bd-conn-dot" class="inline-block w-2 h-2 rounded-full" style="background-color:#94a3b8"></span>
                             <span id="bd-conn-label">"checking…"</span>
+                        )
+                        button(
+                            variant: ButtonVariant::Ghost,
+                            size: ButtonSize::Icon,
+                            attrs: attributes! { id="bd-theme-toggle" type="button" aria-label="Toggle light/dark theme" },
+                            <svg class="dark:hidden size-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                                <circle cx="12" cy="12" r="4"></circle>
+                                <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+                            </svg>
+                            <svg class="hidden dark:inline-block size-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"></path>
+                            </svg>
                         )
                     </h1>
                     <div>
@@ -627,6 +721,7 @@ pub async fn dashboard(cx: &Cx) -> Result {
                 </div>
                 <script>(Unescaped::new_unchecked(CONNECTION_SCRIPT.to_string()))</script>
                 <script>(Unescaped::new_unchecked(FAVICON_SCRIPT.to_string()))</script>
+                <script>(Unescaped::new_unchecked(THEME_TOGGLE_SCRIPT.to_string()))</script>
             </body>
         </html>
     }
@@ -655,11 +750,13 @@ pub async fn source_logs(cx: &Cx) -> Result {
         ))));
     };
     let rows = st.db.logs_sync(Some(&source), 50).unwrap_or_default();
+    let theme = theme_class(cx);
     view! {
         <!DOCTYPE html>
-        <html>
+        <html class=(theme)>
             <head>
                 <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <title>(format!("logs — {}", src.name))</title>
                 topcoat::font::link(font: GEIST)
                 <link rel="stylesheet" href=(tailwind::stylesheet!())>

@@ -2,8 +2,10 @@ use crate::{AppState, health};use serde::Deserialize;
 use topcoat::{
     Result,
     context::{Cx, app_context},
+    cookie::{Cookie, Cookies, cookie, cookies, time::Duration},
     router::{
         Body, StatusCode,
+        content::Json,
         error::bad_request,
         path_param, request::uri, response::Response, route,
     },
@@ -119,6 +121,35 @@ pub async fn health_all(cx: &Cx) -> Result<Response> {
 #[derive(Debug, Deserialize)]
 struct LogsQuery {
     limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemeBody {
+    theme: String,
+}
+
+/// Persists the browser's chosen theme in a cookie so the server can render
+/// the correct `dark`/`light` class on `<html>` for every subsequent page
+/// load — "the backend knows the user's theme" (spec: web-ui — light/dark
+/// theme toggle). The client sends the theme it just switched to (computed
+/// from its own current DOM state), not a request to "toggle" blindly:
+/// a stateless toggle-on-the-server can't tell a missing cookie (never
+/// chosen) apart from "was light", so a viewer whose page is currently dark
+/// via the OS-preference media query (spec: web-ui) could see their first
+/// click appear to do nothing.
+#[route(POST "/api/theme")]
+pub async fn set_theme(cx: &Cx, Json(body): Json<ThemeBody>) -> Result<Response> {
+    if body.theme != "dark" && body.theme != "light" {
+        return Ok(json_err(StatusCode::BAD_REQUEST, "theme must be \"dark\" or \"light\""));
+    }
+    let name = crate::web::THEME_COOKIE;
+    let c: Cookie = cookie! {
+        name = body.theme.clone();
+        Path = "/";
+        MaxAge = Duration::days(365)
+    };
+    cookies(cx).add(c);
+    Ok(json_ok(&serde_json::json!({ "theme": body.theme })))
 }
 
 #[route(GET "/api/logs")]

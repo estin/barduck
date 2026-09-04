@@ -20,6 +20,13 @@
    derive them by applying the fill or foreground color at reduced opacity,
    which adapts to both color schemes automatically.
 
+   `--status-{red,yellow,green}-{border,bg,fg,text,chip-fg}` are barduck's own
+   addition (not part of the vendored Topcoat theme): health/threshold status
+   colors for panels, rows, and summary-strip chips (see `src/web.rs`). They
+   live alongside the base tokens above so status coloring adapts to the
+   viewer's theme the same way everything else does, instead of the fixed
+   light-mode hex values this project used before.
+
    The Geist font is not bundled here; provide it with topcoat-font. */
 
 @import "tailwindcss";
@@ -34,7 +41,11 @@
 
 /* Expose the tokens as Tailwind utilities (`bg-background`, `text-primary`,
    `border-border`, ...). The indirection through plain variables on `:root`
-   and `.dark` is what lets the values swap when the color scheme changes. */
+   and `.dark` is what lets the values swap when the color scheme changes.
+   The `--status-*` tokens are deliberately not listed here: `src/web.rs`
+   reads them via `var(--status-*)` inside inline `style` attributes (needed
+   to reliably win over `card`'s own classes), not as Tailwind utility
+   classes, so they don't need a `@theme inline` entry. */
 @theme inline {
   --font-sans: "Geist", sans-serif;
   --color-background: var(--background);
@@ -64,8 +75,69 @@
   --shadow-sm:
     0 1px 2px oklch(0.24 0.02 260 / 10%),
     0 2px 8px -2px oklch(0.24 0.02 260 / 9%);
+
+  /* Status colors: hex, not oklch, to match the values this project already
+     shipped before theming existed (see design.md — "use the theme tokens"). */
+  --status-red-border: #ef4444;
+  --status-red-bg: #fef2f2;
+  --status-red-fg: #7f1d1d;
+  --status-red-text: #ef4444;
+  --status-red-chip-fg: #ffffff;
+  --status-yellow-border: #fbbf24;
+  --status-yellow-bg: #fffbeb;
+  --status-yellow-fg: #78350f;
+  --status-yellow-text: #d97706;
+  --status-yellow-chip-fg: #451a03;
+  --status-green-border: #10b981;
+  /* A healthy banded "green" panel/chip reuses the page's own neutral
+     surface/text rather than a separate tint, same as before this change —
+     aliasing keeps it correct in both themes with no override needed below. */
+  --status-green-bg: var(--background);
+  --status-green-fg: var(--foreground);
+  --status-green-text: #059669;
+  --status-green-chip-fg: #ffffff;
 }
 
+/* Three theme states, in increasing precedence:
+   1. `:root` above — the default, light.
+   2. OS preference, for a first-time viewer with no stored choice yet: when
+      the browser prefers dark AND the server hasn't rendered an explicit
+      `light` override (see 3below), apply the same values `.dark` does.
+   3. An explicit server-rendered `dark`/`light` class on `<html>`, driven by
+      the `bd_theme` cookie the theme toggle writes (`POST /api/theme` in
+      `src/api.rs`) — this is what "the backend knows the user's theme" means
+      here: every subsequent page load already carries the right class from
+      the server, so there's never a flash of the wrong theme and no
+      client-side bootstrap script is needed. `.light` needs no properties of
+      its own; its only job is to disable this block via `:not(.light)`. */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --background: oklch(0.17 0.012 260);
+    --foreground: oklch(0.93 0.006 260);
+    --muted-foreground: oklch(0.68 0.012 260);
+    --primary: oklch(0.92 0.008 260);
+    --primary-foreground: oklch(0.21 0.015 260);
+    --destructive: oklch(0.66 0.18 25);
+    --destructive-foreground: oklch(0.14 0.02 25);
+    --border: oklch(0.3 0.012 260);
+    --ring: oklch(0.6 0.05 260);
+    --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
+    --shadow-sm: 0 1px 2px oklch(0 0 0 / 35%), 0 2px 8px -2px oklch(0 0 0 / 30%);
+
+    --status-red-border: #f87171;
+    --status-red-bg: #3f1315;
+    --status-red-fg: #fecaca;
+    --status-red-text: #f87171;
+    --status-yellow-bg: #3a2a0d;
+    --status-yellow-fg: #fde68a;
+    --status-yellow-text: #fbbf24;
+    --status-green-border: #34d399;
+    --status-green-text: #34d399;
+  }
+}
+
+/* Explicit dark override — keep in sync with the media query above; see the
+   comment there for why the same values live in two places. */
 .dark {
   --background: oklch(0.17 0.012 260);
   --foreground: oklch(0.93 0.006 260);
@@ -79,6 +151,16 @@
   /* Light-mode shadows disappear on a dark background, so these are deeper. */
   --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
   --shadow-sm: 0 1px 2px oklch(0 0 0 / 35%), 0 2px 8px -2px oklch(0 0 0 / 30%);
+
+  --status-red-border: #f87171;
+  --status-red-bg: #3f1315;
+  --status-red-fg: #fecaca;
+  --status-red-text: #f87171;
+  --status-yellow-bg: #3a2a0d;
+  --status-yellow-fg: #fde68a;
+  --status-yellow-text: #fbbf24;
+  --status-green-border: #34d399;
+  --status-green-text: #34d399;
 }
 
 @layer base {

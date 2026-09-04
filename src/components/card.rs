@@ -11,7 +11,7 @@ use topcoat::{
 /// casts the theme's raised-surface shadow and sets its own background and
 /// text color, so it reads as a card on any ancestor.
 const CARD: StaticClass = class!(
-    "flex flex-col gap-5 rounded-xl border border-border bg-background py-6 \
+    "flex flex-col gap-3 rounded-xl border border-border bg-background py-4 \
      text-foreground shadow-sm",
 );
 
@@ -49,7 +49,7 @@ pub async fn card(#[default] mut attrs: Attributes, #[default] child: View) -> R
 pub async fn card_header(#[default] mut attrs: Attributes, #[default] child: View) -> Result {
     view! {
         <div
-            class=(class!("flex flex-col gap-1.5 px-6", attrs.remove("class")))
+            class=(class!("flex flex-col gap-1.5 px-4", attrs.remove("class")))
             (attrs)
         >
             (child)
@@ -83,7 +83,7 @@ pub async fn card_description(#[default] mut attrs: Attributes, #[default] child
 /// The main body of a [`card`].
 #[component]
 pub async fn card_content(#[default] mut attrs: Attributes, #[default] child: View) -> Result {
-    view! { <div class=(class!("px-6", attrs.remove("class"))) (attrs)>(child)</div> }
+    view! { <div class=(class!("px-4", attrs.remove("class"))) (attrs)>(child)</div> }
 }
 
 /// The closing section of a [`card`], a horizontal row for actions.
@@ -91,7 +91,7 @@ pub async fn card_content(#[default] mut attrs: Attributes, #[default] child: Vi
 pub async fn card_footer(#[default] mut attrs: Attributes, #[default] child: View) -> Result {
     view! {
         <div
-            class=(class!("flex items-center gap-2 px-6", attrs.remove("class")))
+            class=(class!("flex items-center gap-2 px-4", attrs.remove("class")))
             (attrs)
         >
             (child)
