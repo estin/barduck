@@ -86,6 +86,33 @@
               cache_dir="$CARGO_TARGET_DIR/topcoat/cache/tailwind"
               mkdir -p "$cache_dir"
               install -m755 ${tailwindBin} "$cache_dir/tailwindcss-${tailwindVersion}-${tw.asset}"
+
+              # `topcoat asset bundle` (postInstall, below) reruns `cargo
+              # build` itself to scan for assets, deliberately stripping
+              # every CARGO_*/RUSTC*/RUSTFLAGS env var first (so a `cargo
+              # run`-invoked topcoat-cli doesn't leak its own wrapper's env
+              # into the rebuild). That drops cargoBuildHook's explicit
+              # `--target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}`, so
+              # the rebuild lands in `target/release/` instead of
+              # `target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/`
+              # and skips the `[target."${pkgs.stdenv.hostPlatform.rust.rustcTarget}"]`
+              # rustflags cargoSetupPostUnpackHook wrote to .cargo/config.toml
+              # — a different fingerprint, so cargo fully recompiles, and
+              # `stylesheet!()`'s `asset!(concat!(env!("OUT_DIR"), ...))`
+              # (topcoat-tailwind/src/stylesheet.rs) bakes in a different
+              # OUT_DIR path each time, producing a different AssetId than
+              # the one actually installed at $out/bin/barduck: the daemon
+              # then fails at runtime with "failed to resolve asset ... in
+              # the asset catalog". `target` in .cargo/config.toml (unlike an
+              # env var) survives the stripping and isn't overridden by an
+              # explicit --target flag, so it pins both builds to the same
+              # layout and fingerprint — the second "build" becomes a cache
+              # hit that just rescans the exact binary already installed.
+              mkdir -p .cargo
+              cat >> .cargo/config.toml <<EOF
+              [build]
+              target = "${pkgs.stdenv.hostPlatform.rust.rustcTarget}"
+              EOF
             '';
 
             # Produces the `assets/` directory the web UI reads at runtime
@@ -94,6 +121,20 @@
             # but web UI pages render with no styling.
             postInstall = ''
               topcoat asset bundle --release --out "$out/bin/assets"
+
+              # `topcoat asset bundle` scans a binary it rebuilds itself
+              # (see the .cargo/config.toml note in preBuild above) rather
+              # than the one cargoInstallHook already copied to
+              # $out/bin/barduck moments earlier. Even with that fix keeping
+              # both builds on the same target layout and fingerprint, nothing
+              # guarantees the two invocations link a byte-identical
+              # executable (a build script can still rerun and relink,
+              # e.g. topcoat-tailwind's build.rs re-invoking the Tailwind
+              # CLI on every `cargo build`). Re-install the exact executable
+              # the bundler just scanned over $out/bin/barduck so the
+              # shipped binary and its asset catalog can never disagree,
+              # regardless of such drift.
+              install -m755 "$CARGO_TARGET_DIR/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/barduck" "$out/bin/barduck"
             '';
 
             doCheck = false;
