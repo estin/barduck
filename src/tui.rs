@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::time::Duration;
 
@@ -70,20 +70,25 @@ struct Panel {
     ts_epoch: f64,
 }
 
-/// One grid slot: a spacer (`main` and `secondary`/`table` all empty), a
-/// single-source panel (`main` only, `group_title` `None`), or a generalized
-/// pane combining up to three sections — `main` (regular-panel treatment),
-/// `secondary` (compact, always-shown age), and `table` (label/value rows,
-/// age only when stale) (spec: tui — group panes show multiple labeled,
-/// independently colored values).
+/// One grid slot: a spacer (`main`/`secondary`/`table`/`text` all empty), a
+/// single-source panel (`main` only, `group_title` `None`), a static-text
+/// panel (`text` only), or a generalized pane combining up to three sections
+/// — `main` (regular-panel treatment), `secondary` (compact, always-shown
+/// age), and `table` (label/value rows, age only when stale) (spec: tui —
+/// group panes show multiple labeled, independently colored values).
 struct Slot {
     span: usize,
-    /// Card title for a group slot; unused for a plain single-source slot,
-    /// whose title lives on its `main` panel's `name` instead.
+    /// Card title for a group or static-text slot; unused for a plain
+    /// single-source slot, whose title lives on its `main` panel's `name`
+    /// instead.
     group_title: Option<String>,
     main: Option<Panel>,
     secondary: Vec<Panel>,
     table: Vec<Panel>,
+    /// A static-text panel's literal content, shown as-is — the TUI never
+    /// interprets `markdown`/`json` formatting (spec: tui — static-text
+    /// panel rendering).
+    text: Option<String>,
 }
 
 /// Builds one panel's value/status/threshold data for `name`, labeled
@@ -156,37 +161,55 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                 for row_cells in &layout.rows {
                     let mut slots = Vec::new();
                     for cell in row_cells {
-                        let (main, secondary, table, group_title) = match cell {
+                        // A source hidden from this view (spec: source-configuration —
+                        // per-source view visibility) is simply omitted here, so the
+                        // cell falls through to the same empty-slot rendering as an
+                        // explicit `space` cell (spec: tui — hidden sources render as
+                        // space in the TUI).
+                        let (main, secondary, table, group_title, text) = match cell {
                             crate::config::Cell::Group { title, main, secondary, table } => (
-                                main.as_ref().map(|item| {
-                                    build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
-                                }),
-                                secondary
+                                main.as_ref()
+                                    .filter(|item| crate::config::source_visible_in(cfg, item.id(), "tui"))
+                                    .map(|item| {
+                                        build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
+                                    }),
+                                crate::config::visible_items(cfg, secondary, "tui")
                                     .iter()
                                     .map(|item| {
                                         build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
                                     })
                                     .collect(),
-                                table
+                                crate::config::visible_items(cfg, table, "tui")
                                     .iter()
                                     .map(|item| {
                                         build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
                                     })
                                     .collect(),
                                 title.clone(),
+                                None,
                             ),
-                            crate::config::Cell::Source(name) => {
-                                (Some(build_panel(cfg, &latest, &healths, name, None)), Vec::new(), Vec::new(), None)
-                            }
-                            crate::config::Cell::Pane { id, title } => (
-                                Some(build_panel(cfg, &latest, &healths, id, title.as_deref())),
+                            crate::config::Cell::Source(name) => (
+                                crate::config::source_visible_in(cfg, name, "tui")
+                                    .then(|| build_panel(cfg, &latest, &healths, name, None)),
                                 Vec::new(),
                                 Vec::new(),
                                 None,
+                                None,
                             ),
-                            crate::config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None),
+                            crate::config::Cell::Pane { id, title } => (
+                                crate::config::source_visible_in(cfg, id, "tui")
+                                    .then(|| build_panel(cfg, &latest, &healths, id, title.as_deref())),
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                None,
+                            ),
+                            crate::config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None),
+                            crate::config::Cell::Text { title, text, .. } => {
+                                (None, Vec::new(), Vec::new(), title.clone(), Some(text.clone()))
+                            }
                         };
-                        slots.push(Slot { span: cell.span(), group_title, main, secondary, table });
+                        slots.push(Slot { span: cell.span(), group_title, main, secondary, table, text });
                     }
                     rows.push(slots);
                 }
@@ -289,7 +312,7 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
             Layout::horizontal(row.iter().map(|c| Constraint::Fill(c.span as u16)).collect::<Vec<_>>())
                 .split(*rect);
         for (cell, crect) in row.iter().zip(col_areas.iter()) {
-            if cell.main.is_some() || !cell.secondary.is_empty() || !cell.table.is_empty() {
+            if cell.main.is_some() || !cell.secondary.is_empty() || !cell.table.is_empty() || cell.text.is_some() {
                 f.render_widget(panel_widget(cell), *crect);
             }
         }
@@ -314,7 +337,21 @@ fn header_line(f: &mut ratatui::Frame, area: ratatui::layout::Rect, y: u16, text
 /// by the worst member across all three sections (spec: tui — group panes
 /// show multiple labeled, independently colored values).
 fn panel_widget(slot: &Slot) -> Paragraph<'_> {
-    if slot.secondary.is_empty()
+    if let Some(text) = &slot.text {
+        // Shown as-is: the TUI never interprets `markdown`/`json` formatting
+        // (spec: tui — static-text panel rendering). No age suffix and no
+        // health/threshold color — there's no source behind this panel.
+        // `text`'s own newlines must become separate `Line`s — a single
+        // `Line` never breaks on embedded `\n`, it would just run everything
+        // together — and `Wrap` lets a long line (a link, a list item) wrap
+        // instead of being cut off at the panel's width.
+        let lines: Vec<Line> = text.lines().map(Line::from).collect();
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", slot.group_title.as_deref().unwrap_or(""))),
+        )
+    } else if slot.secondary.is_empty()
         && slot.table.is_empty()
         && let Some(p) = &slot.main
     {
@@ -323,13 +360,23 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(p.ts_epoch, |d| d.as_secs_f64());
         let updated = crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"));
-        let text = Line::from(vec![
-            Span::styled(p.value.clone(), style.add_modifier(Modifier::BOLD)),
-            Span::raw(if p.unit.is_empty() { String::new() } else { format!(" {}", p.unit) }),
-            Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
-        ]);
+        // A value can itself span multiple lines (e.g. a markdown-format
+        // source's fetched content) — each of its lines becomes its own
+        // `Line` so they stack instead of being joined into one, with the
+        // unit/age suffix trailing the last line.
+        let value_lines: Vec<&str> = { let l = p.value.lines().collect::<Vec<_>>(); if l.is_empty() { vec![""] } else { l } };
+        let mut lines: Vec<Line> = value_lines
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l.to_string(), style.add_modifier(Modifier::BOLD))))
+            .collect();
+        if let Some(last) = lines.last_mut() {
+            if !p.unit.is_empty() {
+                last.spans.push(Span::raw(format!(" {}", p.unit)));
+            }
+            last.spans.push(Span::styled(updated, Style::default().add_modifier(Modifier::DIM)));
+        }
         let title = slot.group_title.as_deref().unwrap_or(&p.name);
-        Paragraph::new(text).block(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(style)
@@ -452,6 +499,7 @@ mod tests {
                         }),
                         secondary: Vec::new(),
                         table: Vec::new(),
+                        text: None,
                     },
                     Slot {
                         span: 1,
@@ -466,10 +514,11 @@ mod tests {
                         }),
                         secondary: Vec::new(),
                         table: Vec::new(),
+                        text: None,
                     },
                 ],
                 vec![
-                    Slot { span: 2, group_title: None, main: None, secondary: Vec::new(), table: Vec::new() },
+                    Slot { span: 2, group_title: None, main: None, secondary: Vec::new(), table: Vec::new(), text: None },
                     Slot {
                         span: 1,
                         group_title: None,
@@ -483,6 +532,7 @@ mod tests {
                         }),
                         secondary: Vec::new(),
                         table: Vec::new(),
+                        text: None,
                     },
                 ],
             ],
@@ -543,6 +593,7 @@ mod tests {
                         ts_epoch: now,
                     },
                 ],
+                text: None,
             }]],
             tick: 0,
         };
@@ -634,6 +685,7 @@ mod tests {
                         ts_epoch: 0.0,
                     },
                 ],
+                text: None,
             }]],
             tick: 0,
         };
@@ -684,6 +736,7 @@ mod tests {
                 }),
                 secondary: Vec::new(),
                 table: Vec::new(),
+                text: None,
             }]],
             tick: 0,
         };
@@ -740,6 +793,7 @@ mod tests {
                     level: Some("green".into()),
                     ts_epoch: 0.0,
                 }],
+                text: None,
             }]],
             tick: 0,
         };
@@ -765,6 +819,170 @@ mod tests {
             Some(Color::Red),
             "border should reflect the failing unbanded secondary member, not just main/table"
         );
+    }
+
+    /// A static-text panel renders its raw content in a bordered panel,
+    /// titled with the cell's `title` (spec: tui — static-text panel
+    /// rendering).
+    #[test]
+    fn text_panel_renders_titled_content() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: Some("Links".into()),
+                main: None,
+                secondary: Vec::new(),
+                table: Vec::new(),
+                text: Some("github.com".into()),
+            }]],
+            tick: 0,
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert!(text.contains("Links"), "panel title missing");
+        assert!(text.contains("github.com"), "panel content missing");
+        let border_fg = (0..buf.area().height)
+            .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == "─")
+            .map(|(x, y)| buf[(x, y)].fg);
+        assert_eq!(
+            border_fg,
+            Some(Color::Reset),
+            "a text panel's border should be the terminal's default, unaccented style"
+        );
+    }
+
+    /// An untitled static-text panel renders no title (spec: tui —
+    /// static-text panel rendering).
+    #[test]
+    fn text_panel_without_title_renders_no_title() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: None,
+                main: None,
+                secondary: Vec::new(),
+                table: Vec::new(),
+                text: Some("Just a note.".into()),
+            }]],
+            tick: 0,
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert!(text.contains("Just a note."), "panel content missing");
+    }
+
+    /// A `markdown`-format static-text panel still shows the literal,
+    /// uninterpreted text — the TUI never parses `markdown`/`json` (spec:
+    /// tui — static-text panel rendering).
+    #[test]
+    fn text_panel_shows_markdown_as_is() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: Some("Note".into()),
+                main: None,
+                secondary: Vec::new(),
+                table: Vec::new(),
+                text: Some("# Heading".into()),
+            }]],
+            tick: 0,
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert!(text.contains("# Heading"), "literal markdown text should appear uninterpreted");
+    }
+
+    /// A static-text panel's embedded newlines become separate lines in the
+    /// rendered panel, not one run-together line (spec: tui — static-text
+    /// panel rendering).
+    #[test]
+    fn text_panel_splits_on_newlines() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: Some("Links".into()),
+                main: None,
+                secondary: Vec::new(),
+                table: Vec::new(),
+                text: Some("first line\nsecond line\nthird line".into()),
+            }]],
+            tick: 0,
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area().height)
+            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let y_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
+        let (y1, y2, y3) = (
+            y_of("first line").expect("first line missing"),
+            y_of("second line").expect("second line missing"),
+            y_of("third line").expect("third line missing"),
+        );
+        assert!(y1 < y2 && y2 < y3, "each line should render on its own row, in order: {y1}, {y2}, {y3}");
+    }
+
+    /// A single-source panel's value can itself be multi-line (e.g. a
+    /// markdown-format source's fetched content) — it must render as
+    /// stacked lines, not collapse onto one (spec: tui — Main section
+    /// renders like a single-source panel).
+    #[test]
+    fn single_source_panel_splits_value_on_newlines() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: None,
+                main: Some(Panel {
+                    name: "weekly-report".into(),
+                    value: "first line\nsecond line\nthird line".into(),
+                    unit: String::new(),
+                    status: "healthy",
+                    level: None,
+                    ts_epoch: 0.0,
+                }),
+                secondary: Vec::new(),
+                table: Vec::new(),
+                text: None,
+            }]],
+            tick: 0,
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area().height)
+            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let y_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
+        let (y1, y2, y3) = (
+            y_of("first line").expect("first line missing"),
+            y_of("second line").expect("second line missing"),
+            y_of("third line").expect("third line missing"),
+        );
+        assert!(y1 < y2 && y2 < y3, "each line should render on its own row, in order: {y1}, {y2}, {y3}");
     }
 
     /// A banded value colors by its band when healthy (spec: tui —
@@ -833,5 +1051,104 @@ mod tests {
         let area = ratatui::layout::Rect { x: 0, y: 0, width: 220, height: 40 };
         let rect = content_rect(area, &TuiWidth::Named("auto".into()), 0);
         assert_eq!(rect, area, "nothing to size around should leave the area unchanged");
+    }
+
+    fn cfg_from(toml: &str) -> Config {
+        let cfg: Config = toml::from_str(toml).unwrap();
+        crate::config::validate(&cfg).unwrap();
+        cfg
+    }
+
+    fn only_slot(cfg: &Config) -> Slot {
+        let mut state = UiState { error: None, rows: Vec::new(), tick: 0 };
+        apply_outcome(cfg, Outcome::Data(Vec::new(), Vec::new()), &mut state);
+        state.rows.remove(0).remove(0)
+    }
+
+    /// A layout cell for a source hidden from the TUI renders as an empty
+    /// space, not the source's panel (spec: tui — hidden sources render as
+    /// space in the TUI).
+    #[test]
+    fn hidden_source_cell_renders_as_space() {
+        let cfg = cfg_from(
+            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
+        );
+        let slot = only_slot(&cfg);
+        assert!(slot.main.is_none() && slot.secondary.is_empty() && slot.table.is_empty() && slot.text.is_none());
+    }
+
+    /// A layout cell for a source visible in the TUI (`show_in = "tui"` or
+    /// `"all"`, or unset) renders normally (spec: tui — hidden sources render
+    /// as space in the TUI).
+    #[test]
+    fn visible_source_cell_renders_normally() {
+        for show_in in ["tui", "all"] {
+            let cfg = cfg_from(&format!(
+                "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"{show_in}\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n"
+            ));
+            let slot = only_slot(&cfg);
+            assert!(slot.main.is_some(), "show_in = {show_in:?} should still render in the TUI");
+        }
+        let cfg = cfg_from(
+            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
+        );
+        assert!(only_slot(&cfg).main.is_some(), "no show_in should still render in the TUI");
+    }
+
+    /// A generalized pane's `secondary` member hidden from the TUI is
+    /// omitted; the remaining members still render (spec: tui — hidden
+    /// sources render as space in the TUI).
+    #[test]
+    fn hidden_pane_member_is_omitted() {
+        let cfg = cfg_from(
+            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[sources]]\nname = \"b\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"grp\", secondary = [\"a\", \"b\"] }]]\n",
+        );
+        let slot = only_slot(&cfg);
+        assert_eq!(slot.secondary.len(), 1, "the hidden member should be omitted, not just left empty");
+    }
+
+    /// A generalized pane cell whose every member is hidden from the TUI
+    /// renders as an empty space (spec: tui — hidden sources render as space
+    /// in the TUI).
+    #[test]
+    fn pane_with_every_member_hidden_renders_as_space() {
+        let cfg = cfg_from(
+            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"grp\", secondary = [\"a\"] }]]\n",
+        );
+        let slot = only_slot(&cfg);
+        assert!(slot.main.is_none() && slot.secondary.is_empty() && slot.table.is_empty() && slot.text.is_none());
+    }
+
+    /// Hiding a source from the TUI does not change the layout's column
+    /// count or row geometry — only its content (spec: tui — hidden sources
+    /// render as space in the TUI).
+    #[test]
+    fn hiding_a_source_does_not_change_grid_geometry() {
+        let visible = cfg_from(
+            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\", { kind = \"space\", colspan = 2 }]]\n",
+        );
+        let hidden = cfg_from(
+            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\", { kind = \"space\", colspan = 2 }]]\n",
+        );
+        let mut visible_state = UiState { error: None, rows: Vec::new(), tick: 0 };
+        apply_outcome(&visible, Outcome::Data(Vec::new(), Vec::new()), &mut visible_state);
+        let mut hidden_state = UiState { error: None, rows: Vec::new(), tick: 0 };
+        apply_outcome(&hidden, Outcome::Data(Vec::new(), Vec::new()), &mut hidden_state);
+        let visible_spans: Vec<usize> = visible_state.rows[0].iter().map(|s| s.span).collect();
+        let hidden_spans: Vec<usize> = hidden_state.rows[0].iter().map(|s| s.span).collect();
+        assert_eq!(visible_spans, hidden_spans, "column spans must not change when a source is hidden");
+    }
+
+    /// From the same shared layout, a source restricted to the web view
+    /// renders as space in the TUI (the mirror web-ui behavior is proven in
+    /// `tests/integration.rs`) (spec: tui — hidden sources render as space in
+    /// the TUI — same layout renders differently per view).
+    #[test]
+    fn same_layout_renders_differently_per_view() {
+        let cfg = cfg_from(
+            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
+        );
+        let slot = only_slot(&cfg);
+        assert!(slot.main.is_none(), "a web-only source should render as space in the TUI");
     }
 }

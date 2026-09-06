@@ -844,6 +844,132 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
     );
 }
 
+/// `tui-only` is restricted to the TUI (`show_in = "tui"`); `visible` has no
+/// restriction (spec: web-ui — hidden sources render as space in the web
+/// dashboard).
+fn show_in_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "visible"
+type = "script"
+command = "echo 1"
+
+[[sources]]
+name = "tui-only"
+type = "script"
+command = "echo 2"
+show_in = "tui"
+
+[[layouts]]
+title = "Overview"
+rows = [["visible", "tui-only"]]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid show_in config: {e:#}");
+    }
+    cfg
+}
+
+/// A source restricted to the TUI renders as an empty grid position on the
+/// web dashboard — no card markup, no chip in the summary strip — while a
+/// source with no restriction still renders normally, from the very same
+/// layout (spec: web-ui — hidden sources render as space in the web
+/// dashboard; source summary strip). This is the web half of "same layout
+/// renders differently per view" — the TUI half is proven in
+/// `src/tui.rs`'s own `same_layout_renders_differently_per_view` test, since
+/// the TUI's rendering internals aren't reachable from here.
+#[tokio::test]
+async fn web_ui_hides_a_tui_only_source_but_keeps_the_unrestricted_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = show_in_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState { db: db.clone(), cfg: Arc::new(cfg.clone()) };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // The unrestricted source renders its card and value as usual.
+    assert!(page.contains(r#"id="panel-visible""#), "unrestricted source's card expected");
+    assert!(page.contains(r##"href="#panel-visible""##), "unrestricted source's chip expected");
+    // The TUI-only source gets no card and no chip at all.
+    assert!(!page.contains("panel-tui-only"), "a TUI-only source should render no card or chip on the web dashboard");
+}
+
+/// A generalized pane's `secondary` member restricted to the TUI is omitted
+/// from the web pane, while its other members still render; a pane whose
+/// only member is TUI-only renders as an empty grid position (spec: web-ui —
+/// hidden sources render as space in the web dashboard).
+fn show_in_pane_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "cpu"
+type = "script"
+command = "echo 42"
+unit = "%"
+
+[[sources]]
+name = "tui-only"
+type = "script"
+command = "echo 2"
+show_in = "tui"
+
+[[layouts]]
+title = "Overview"
+rows = [
+  [{{ title = "grp", secondary = ["cpu", "tui-only"] }}],
+  [{{ title = "solo", secondary = ["tui-only"] }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid show_in pane config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn web_ui_omits_hidden_pane_member_and_collapses_all_hidden_pane() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = show_in_pane_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState { db: db.clone(), cfg: Arc::new(cfg.clone()) };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // "grp" pane: the visible member renders, the hidden one is omitted.
+    assert!(page.contains(">grp</span>"), "grp pane title expected");
+    assert!(page.contains(r#"href="/logs/cpu""#), "visible secondary member expected in grp");
+    assert!(!page.contains("/logs/tui-only"), "TUI-only member should not appear anywhere on the web dashboard");
+    // "solo" pane: its only member is hidden, so the whole cell renders empty
+    // (no title span, no card content) — the same treatment as an explicit
+    // `space` cell.
+    assert!(!page.contains(">solo</span>"), "a pane whose only member is hidden should render no title");
+}
+
 #[test]
 fn history_points_zero_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -1013,6 +1139,89 @@ rows = [
         !html.contains(r#"class="absolute top-0 -translate-y-1/2"#),
         "an untitled, main-less pane should render no title span at all"
     );
+}
+
+/// A titled static-text panel renders its markdown content as HTML, with a
+/// border-title span, no footer/log-link/history-bar, and no health/
+/// threshold color (spec: web-ui — static-text panel rendering).
+#[tokio::test]
+async fn web_ui_text_cell_renders_titled_markdown_with_no_source_extras() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[layouts]]
+title = "L"
+rows = [
+  [{{ title = "Links", format = "markdown", text = "- [GitHub](https://github.com)" }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    let state = AppState { db: db.clone(), cfg: Arc::new(cfg.clone()) };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // Border-title span, present and titled.
+    assert!(
+        html.contains(r#"class="absolute top-0 -translate-y-1/2"#),
+        "text panel should render a border-title span"
+    );
+    assert!(html.contains(">Links<"), "text panel title expected");
+    // Markdown rendered as HTML, not left as literal `- [GitHub]...` text.
+    assert!(html.contains(r#"<a href="https://github.com">GitHub</a>"#), "markdown should render as HTML");
+    // No footer, no log link, no history bar — there's no source behind it.
+    assert!(!html.contains("updated "), "a text panel has no age/footer text");
+    assert!(!html.contains("/logs/"), "a text panel has no per-source log link");
+    assert!(!html.contains("flex gap-0.5"), "a text panel has no history bar");
+    // Never colored: no status_style-style border/background override.
+    assert!(!html.contains("--status-"), "a text panel's card must never carry a health/threshold color");
+}
+
+/// An untitled static-text panel renders no title span, and defaults to
+/// plain text when no `format` is declared (spec: web-ui — static-text panel
+/// rendering).
+#[tokio::test]
+async fn web_ui_text_cell_without_title_or_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[layouts]]
+title = "L"
+rows = [
+  [{{ text = "Just a note." }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    let state = AppState { db: db.clone(), cfg: Arc::new(cfg.clone()) };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(
+        !html.contains(r#"class="absolute top-0 -translate-y-1/2"#),
+        "an untitled text panel should render no title span"
+    );
+    assert!(html.contains("Just a note."), "plain text content expected, rendered as-is");
 }
 
 /// (spec: web-ui — source summary strip)
@@ -1198,6 +1407,72 @@ cron = "* * * * * *"
 
     let hist = db.history("ticker", None, None).await.unwrap();
     assert!(hist.len() >= 2, "expected multiple cron-triggered fetches, got {}", hist.len());
+}
+
+/// `latest` sets markdown-format ("text") sources aside from the scalar
+/// table by default, and drops them entirely with `--no-text` (spec: cli —
+/// query commands accept repeatable `--source` filters; this exercises the
+/// analogous text/value separation).
+#[tokio::test]
+async fn cli_latest_separates_text_sources_from_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "cpu"
+type = "script"
+command = "echo 42"
+
+[[sources]]
+name = "notes"
+type = "script"
+command = "echo '# Heading'"
+format = "markdown"
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    drop(db); // release the file lock before the subprocess opens it
+
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, &toml).unwrap();
+
+    let default_output = std::process::Command::new(env!("CARGO_BIN_EXE_barduck"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("latest")
+        .output()
+        .unwrap();
+    let default_stdout = String::from_utf8_lossy(&default_output.stdout);
+    assert!(default_output.status.success(), "latest should succeed: {default_stdout}");
+    let cpu_idx = default_stdout.find("cpu").expect("cpu row expected in the table");
+    let marker_idx = default_stdout.find("TEXT SOURCES").expect("TEXT SOURCES section expected");
+    assert!(cpu_idx < marker_idx, "the scalar table should come before the TEXT SOURCES section");
+    assert!(default_stdout[marker_idx..].contains("notes"), "the markdown source should appear in the text section");
+    assert!(
+        !default_stdout[..marker_idx].contains("# Heading"),
+        "the markdown source's content should not appear inside the scalar table"
+    );
+
+    let filtered_output = std::process::Command::new(env!("CARGO_BIN_EXE_barduck"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("latest")
+        .arg("--no-text")
+        .output()
+        .unwrap();
+    let filtered_stdout = String::from_utf8_lossy(&filtered_output.stdout);
+    assert!(filtered_output.status.success());
+    assert!(filtered_stdout.contains("cpu"), "the scalar source should still be shown");
+    assert!(!filtered_stdout.contains("TEXT SOURCES"), "--no-text should drop the text section entirely");
+    assert!(!filtered_stdout.contains("notes"), "--no-text should exclude the markdown source entirely");
 }
 
 

@@ -89,9 +89,10 @@ The system SHALL let users declare TUI and web dashboard layouts in the same con
 - a string naming a source (shorthand), or
 - a table `{ id = "<source>", title = "<pane title>" }` overriding the default pane title (the source's declared `title`, or its name if it has none), or
 - a table `{ kind = "space", colspan = <columns> }` rendering an empty spacer, or
+- a table `{ title?, format?, text }` rendering a standalone static-text panel with no backing source: `text` is the literal content (required), `format` is optional (`text` default, `markdown`, or `json`, same values as a source's `format`), and `title` is an optional pane header (omitted renders no header text, since there's no source to fall back to a label from), or
 - a table `{ title?, main?, secondary?, table? }` rendering one generalized pane, where `title` is an optional pane header, `main` is an optional single member, and `secondary` and `table` are each an optional list of members. A "member" is either a bare source-id string (its label defaults to that source's declared `title`, or its id if it has none) or a table `{ id = "<source>", label = "<value label>" }` overriding the label. At least one of `main`, `secondary`, or `table` MUST be present; `title` MAY be omitted entirely — the rendered pane then falls back to `main`'s own label when `main` is set, else shows no header text.
 
-The layout's column count SHALL be the maximum number of columns spanned by any row; shorter rows are implicitly padded. Validation MUST reject rows referencing unknown sources (including any source id inside a generalized pane cell's `main`, `secondary`, or `table`), cells that are neither a valid source reference, space, nor generalized pane, `space` cells without `colspan`, colspans smaller than 1, generalized pane cells with an explicitly empty `title` (`title = ""`), and generalized pane cells with `main`, `secondary`, and `table` all absent. The legacy flat `sources = [...]` layout key is removed (**BREAKING**). The prior `{ title, ids = [...] }` shape is replaced by `table` (**BREAKING**): existing configs must rename `ids` to `table`.
+The layout's column count SHALL be the maximum number of columns spanned by any row; shorter rows are implicitly padded. Validation MUST reject rows referencing unknown sources (including any source id inside a generalized pane cell's `main`, `secondary`, or `table`), cells that are neither a valid source reference, space, static-text panel, nor generalized pane, `space` cells without `colspan`, colspans smaller than 1, static-text panel cells with an empty `text`, generalized pane cells with an explicitly empty `title` (`title = ""`), and generalized pane cells with `main`, `secondary`, and `table` all absent. The legacy flat `sources = [...]` layout key is removed (**BREAKING**). The prior `{ title, ids = [...] }` shape is replaced by `table` (**BREAKING**): existing configs must rename `ids` to `table`.
 
 #### Scenario: Layout references existing source
 - **WHEN** a layout row contains cell `"domain-expiry"`
@@ -144,6 +145,22 @@ The layout's column count SHALL be the maximum number of columns spanned by any 
 #### Scenario: Explicitly empty title rejected
 - **WHEN** a generalized pane cell is `{ title = "", main = "cpu-load" }`
 - **THEN** startup fails naming the layout and the empty title
+
+#### Scenario: Static-text panel renders standalone content
+- **WHEN** a cell is `{ title = "Links", format = "markdown", text = "- [GitHub](https://github.com)" }`
+- **THEN** both UIs render one panel titled "Links" containing that content, with no backing source
+
+#### Scenario: Static-text panel with no title renders no header text
+- **WHEN** a cell is `{ text = "Just a note." }` with no `title`
+- **THEN** both UIs render the panel with no header text, containing the note
+
+#### Scenario: Static-text panel defaults to plain text format
+- **WHEN** a cell is `{ text = "Plain note" }` with no `format`
+- **THEN** both UIs render the content as plain text, the same default as a source with no declared `format`
+
+#### Scenario: Empty static-text content rejected
+- **WHEN** a cell is `{ title = "Links", text = "" }`
+- **THEN** startup fails naming the layout and the empty text panel
 
 ### Requirement: Value formats
 A source MAY declare a `format` of `text` (default), `markdown`, or `json`; other values MUST be rejected at startup. UIs SHALL render markdown as HTML and pretty-print valid JSON.
@@ -218,6 +235,25 @@ A source MAY declare an optional `show_history` boolean field controlling whethe
 #### Scenario: No effect on an unbanded source
 - **WHEN** a source with no threshold bands declares `show_history = true`
 - **THEN** its panel still renders no history bar, since it has no bands to derive segments from
+
+### Requirement: Per-source view visibility
+A source MAY declare a `show_in` field controlling which UI(s) are allowed to display it: `"all"` (default, unchanged behavior), `"tui"` (visible only in the TUI), or `"web"` (visible only in the web dashboard). Any other value MUST be rejected at startup, naming the source and the invalid value. `show_in` SHALL have no effect on data collection: the source is fetched on its configured schedule regardless of its value.
+
+#### Scenario: Default is visible everywhere
+- **WHEN** a source declares no `show_in` field
+- **THEN** it is eligible to display in both the TUI and the web dashboard, as before this change
+
+#### Scenario: Restricting to one view hides it from the other
+- **WHEN** a source declares `show_in = "tui"` and is referenced by a layout cell
+- **THEN** the source's panel appears in the TUI but not on the web dashboard, even though both UIs share the same layout config
+
+#### Scenario: Invalid value rejected
+- **WHEN** a source declares `show_in = "cli"`
+- **THEN** startup fails naming the source and the invalid value
+
+#### Scenario: Collection unaffected by view restriction
+- **WHEN** a source declares `show_in = "web"`
+- **THEN** the source is still fetched on its configured schedule, even though it never displays in the TUI
 
 ### Requirement: Human-readable duration configuration
 Every duration-valued config field — a source's `interval` and `timeout`, the top-level default `interval`, and `stale_after` — SHALL be a humantime-formatted string (e.g. `"30s"`, `"5m"`, `"1h30m"`, `"2d"`), not a raw integer of seconds. A field that is not a valid humantime duration string (malformed text, or a nonzero bare number with no unit) MUST be rejected at startup with an error naming the offending source (or the top-level field) and the invalid value. An unrecognized field name on a source or at the top level (for example a pre-rename `interval_secs`) MUST also be rejected at startup rather than silently ignored, so a config left over from before this change fails loudly instead of quietly reverting to a default.

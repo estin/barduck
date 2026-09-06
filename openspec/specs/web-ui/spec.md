@@ -216,6 +216,48 @@ The card's own border — not its background — SHALL be colored by the worst c
 - **WHEN** a cell's main section is healthy (green) and a secondary member has no threshold bands but is currently `failing`
 - **THEN** the card's own border renders in the red style, matching the failing member
 
+### Requirement: Hidden sources render as space in the web dashboard
+When a layout cell (a bare source reference or `{ id, title }` cell) names a source whose `show_in` (spec: source-configuration — Per-source view visibility) excludes `"web"`, the web UI SHALL render that grid position as an empty cell of the same column span instead of the source's card, rather than failing startup. When a generalized pane cell's `main`, `secondary`, or `table` member names a source excluded from `"web"`, the web UI SHALL omit that member from the pane's rendering; if omitting excluded members leaves the cell with none of `main`, `secondary`, or `table` populated for the web UI, the whole cell SHALL render as an empty grid position. This does not change the layout's column count or row geometry, and the hidden source's chip MUST NOT appear in the source summary strip for this view.
+
+#### Scenario: Cell hidden from the web UI renders empty
+- **WHEN** a layout cell references a source declaring `show_in = "tui"`
+- **THEN** the web dashboard renders that grid position empty, occupying the same span the card would have used, and no chip for it appears in the summary strip
+
+#### Scenario: Cell visible in the web UI renders normally
+- **WHEN** a layout cell references a source declaring `show_in = "web"` (or `"all"`, or no `show_in`)
+- **THEN** the web dashboard renders that source's card as usual, including its chip in the summary strip
+
+#### Scenario: Hidden generalized pane member is omitted
+- **WHEN** a generalized pane cell's `secondary` list includes a member whose source declares `show_in = "tui"`, alongside other members visible in the web UI
+- **THEN** the web dashboard renders the pane without that member, showing the remaining members normally
+
+#### Scenario: Generalized pane cell with every member hidden renders empty
+- **WHEN** a generalized pane cell's only members (across `main`, `secondary`, `table`) all declare `show_in = "tui"`
+- **THEN** the web dashboard renders that cell as an empty grid position
+
+#### Scenario: Same layout renders differently per view
+- **WHEN** a layout cell references a source declaring `show_in = "tui"`
+- **THEN** the web dashboard shows that grid position empty while the TUI shows the source's panel, from the same layout config
+
+### Requirement: Static-text panel rendering
+A layout cell that is a static-text panel (`{ title?, format?, text }`, spec: source-configuration — UI layouts are config-declared like sources) SHALL render as its own card, titled on the card's own top border the same way any other panel is (spec: web-ui — panel title rendered on the card border), or with no title text when `title` is omitted. The card's content SHALL render `text` the same way a source's value renders for that `format` — markdown as HTML, `json` pretty-printed, otherwise as plain text (spec: web-ui — health visible at a glance covers the same format handling for a source's value). Since there is no backing source, the card MUST NOT show an "updated X ago" footer, a per-source log link, a history bar, or any health/threshold-derived color — its border and background stay neutral always.
+
+#### Scenario: Static-text panel renders titled content
+- **WHEN** a cell is `{ title = "Links", format = "markdown", text = "- [GitHub](https://github.com)" }`
+- **THEN** the web UI renders a card titled "Links" on its top border, containing that markdown rendered as HTML
+
+#### Scenario: Static-text panel with no title shows no header text
+- **WHEN** a cell is `{ text = "Just a note." }` with no `title`
+- **THEN** the web UI renders the card with no title on its border, containing the note as plain text
+
+#### Scenario: Static-text panel has no footer, log link, or history bar
+- **WHEN** a static-text panel cell is rendered
+- **THEN** its card shows no "updated X ago" text, no link to a log view, and no history bar
+
+#### Scenario: Static-text panel is never colored
+- **WHEN** a static-text panel cell is rendered
+- **THEN** its card's border and background render in the plain neutral style, never a health or threshold color
+
 ### Requirement: Source summary strip
 The web dashboard SHALL show a single summary strip directly under the page title, containing one chip per source that appears in a configured layout, ordered the same way panels are laid out — layouts in declaration order, then each layout's rows top-to-bottom and cells left-to-right. Each chip's color SHALL match the color its panel currently renders with (threshold band color when configured, else health-derived color). Clicking a chip SHALL navigate to and visually highlight that source's panel. The strip SHALL update on the same refresh cycle as the panel grid, so its colors never lag behind the panels'.
 

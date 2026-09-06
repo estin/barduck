@@ -40,7 +40,14 @@ enum Cmd {
         daemon: bool,
     },
     /// Latest value per source.
-    Latest(QueryArgs),
+    Latest {
+        #[command(flatten)]
+        flags: QueryArgs,
+        /// Exclude markdown-format ("text") sources entirely, instead of
+        /// showing them in a separate section after the table.
+        #[arg(long)]
+        no_text: bool,
+    },
     /// Reading history for one source.
     History {
         source: String,
@@ -103,7 +110,13 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Daemon => multi_rt()?.block_on(run_daemon(cfg)),
         Cmd::Tui { daemon } => tui::run(&Backend::new(&cfg, daemon)?, &cfg),
-        Cmd::Latest(a) => rt()?.block_on(cli_report::print_latest(&Backend::new(&cfg, a.daemon)?, &a.source, a.json)),
+        Cmd::Latest { flags, no_text } => rt()?.block_on(cli_report::print_latest(
+            &Backend::new(&cfg, flags.daemon)?,
+            &cfg,
+            &flags.source,
+            flags.json,
+            no_text,
+        )),
         Cmd::History { source, from, to, flags } => {
             let from = from.as_deref().map(cli_report::parse_time).transpose()?;
             let to = to.as_deref().map(cli_report::parse_time).transpose()?;

@@ -6,6 +6,7 @@ use std::time::Duration;
 pub const SOURCE_TYPES: &[&str] = &["http", "script"];
 pub const VALUE_FORMATS: &[&str] = &["text", "markdown", "json"];
 pub const LEVELS: &[&str] = &["green", "yellow", "red"];
+pub const VIEWS: &[&str] = &["all", "tui", "web"];
 
 /// App version shown in web UI, TUI, and CLI output.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -182,6 +183,11 @@ pub struct SourceCfg {
     /// never renders a bar regardless (spec: source-configuration — per-source
     /// history bar visibility).
     pub show_history: Option<bool>,
+    /// Which UI(s) may display this source: `"all"` (default), `"tui"`, or
+    /// `"web"`. Has no effect on data collection — the source is fetched on
+    /// its schedule regardless (spec: source-configuration — per-source view
+    /// visibility).
+    pub show_in: Option<String>,
     // http
     pub url: Option<String>,
     pub selector: Option<String>,
@@ -201,6 +207,37 @@ impl SourceCfg {
     pub fn effective_interval(&self) -> Duration {
         self.interval.unwrap_or_else(default_interval)
     }
+
+    /// Whether this source may display in `view` (`"tui"` or `"web"`), per
+    /// `show_in`: `None`/`"all"` (default) means both views, otherwise only
+    /// the named one (spec: source-configuration — per-source view
+    /// visibility).
+    #[must_use]
+    pub fn visible_in(&self, view: &str) -> bool {
+        match self.show_in.as_deref() {
+            None | Some("all") => true,
+            Some(v) => v == view,
+        }
+    }
+}
+
+/// Whether the source named `name` may display in `view`, or `true` when no
+/// such source exists (config validation already guarantees every layout
+/// reference resolves, so this only matters for callers not yet holding the
+/// `SourceCfg` itself). Shared by the TUI and web renderers (spec:
+/// source-configuration — per-source view visibility).
+#[must_use]
+pub fn source_visible_in(cfg: &Config, name: &str, view: &str) -> bool {
+    cfg.sources.iter().find(|s| s.name == name).is_none_or(|s| s.visible_in(view))
+}
+
+/// Filters a generalized pane's `secondary`/`table` members down to those
+/// visible in `view`, so a hidden member is simply omitted from that view's
+/// rendering rather than failing startup (spec: tui / web-ui — hidden
+/// sources render as space/empty).
+#[must_use]
+pub fn visible_items<'a>(cfg: &Config, items: &'a [GroupItem], view: &str) -> Vec<&'a GroupItem> {
+    items.iter().filter(|item| source_visible_in(cfg, item.id(), view)).collect()
 }
 
 /// One member of a [`Cell::Group`]'s `main`/`secondary`/`table` sections.
@@ -239,12 +276,29 @@ impl GroupItem {
 /// is itself optional too — a title-less pane falls back to `main`'s own
 /// label when `main` is set, else renders with no header text (spec:
 /// source-configuration — UI layouts are config-declared like sources).
+///
+/// Variant order matters for an untagged enum: serde tries each variant
+/// top-to-bottom and stops at the first structural match. `Group`'s fields
+/// are *all* optional, so it will happily match almost any table-shaped cell
+/// that isn't `Pane`/`Space` (unknown fields are simply ignored — no variant
+/// here uses `deny_unknown_fields`). Any variant added after `Group` needs a
+/// required field of its own and must be placed *before* `Group` in this
+/// enum, or a cell meant for that variant will silently become an empty,
+/// then-rejected `Group` instead. `Text` is placed here for exactly that
+/// reason: its `text` field is required, so a cell without one falls through
+/// to `Group` exactly as before.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Cell {
     Source(String),
     Pane { id: String, title: Option<String> },
     Space { kind: String, colspan: Option<usize> },
+    Text {
+        #[serde(default)]
+        title: Option<String>,
+        format: Option<String>,
+        text: String,
+    },
     Group {
         #[serde(default)]
         title: Option<String>,
@@ -259,7 +313,7 @@ pub enum Cell {
 impl Cell {
     /// Every source this cell references: one for `Source`/`Pane`, one per
     /// member for `Group` (across `main`, `secondary`, and `table`), none for
-    /// `Space`.
+    /// `Space` or `Text` (a `Text` cell has no backing source at all).
     #[must_use]
     pub fn source_names(&self) -> Vec<&str> {
         match self {
@@ -270,7 +324,7 @@ impl Cell {
                 .chain(table)
                 .map(GroupItem::id)
                 .collect(),
-            Cell::Space { .. } => vec![],
+            Cell::Space { .. } | Cell::Text { .. } => vec![],
         }
     }
 
@@ -285,7 +339,9 @@ impl Cell {
     #[must_use]
     pub fn pane_title(&self) -> Option<&str> {
         match self {
-            Cell::Pane { title, .. } | Cell::Group { title, .. } => title.as_deref(),
+            Cell::Pane { title, .. } | Cell::Group { title, .. } | Cell::Text { title, .. } => {
+                title.as_deref()
+            }
             _ => None,
         }
     }
@@ -518,6 +574,16 @@ fn validate_source(s: &SourceCfg) -> Result<()> {
     if s.history_points == Some(0) {
         bail!("source `{}` history_points must be > 0", s.name);
     }
+    if let Some(v) = &s.show_in
+        && !VIEWS.contains(&v.as_str())
+    {
+        bail!(
+            "source `{}` has invalid show_in `{}` (known values: {})",
+            s.name,
+            v,
+            VIEWS.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -539,6 +605,14 @@ fn validate_cell(cfg: &Config, layout_title: &str, row_idx: usize, cell: &Cell) 
             bail!("layout `{}` row {} has a space with colspan 0", layout_title, row_idx + 1);
         }
         Cell::Space { .. } => {}
+        Cell::Text { text, format, .. } => {
+            if text.is_empty() {
+                bail!("layout `{}` row {} has a text panel with empty text", layout_title, row_idx + 1);
+            }
+            if let Some(fmt) = format {
+                ValueFormat::parse(fmt)?;
+            }
+        }
         Cell::Group { title, main, secondary, table } => {
             if title.as_deref() == Some("") {
                 bail!("layout `{}` row {} has a group with an empty title", layout_title, row_idx + 1);
@@ -668,6 +742,59 @@ mod tests {
         };
         assert_eq!(cell.span(), 1);
         assert_eq!(cell.pane_title(), Some("ihor"));
+    }
+
+    #[test]
+    fn text_cell_span_title_and_source_names() {
+        let cell = Cell::Text {
+            title: Some("Links".into()),
+            format: Some("markdown".into()),
+            text: "- [GitHub](https://github.com)".into(),
+        };
+        assert_eq!(cell.span(), 1);
+        assert_eq!(cell.pane_title(), Some("Links"));
+        assert!(cell.source_names().is_empty(), "a text cell has no backing source");
+    }
+
+    #[test]
+    fn text_cell_without_title_has_no_pane_title() {
+        let cell = Cell::Text { title: None, format: None, text: "note".into() };
+        assert_eq!(cell.pane_title(), None);
+    }
+
+    #[test]
+    fn text_cell_toml_parses_before_group() {
+        // Proves a `{ text, format }` table deserializes as `Cell::Text`, not
+        // an empty `Cell::Group` — `Group`'s fields are all optional, so
+        // `Text` must be tried first (design.md — Cell variant ordering).
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"Links\", format = \"markdown\", text = \"hi\" }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let cell = &cfg.layouts[0].rows[0][0];
+        assert!(matches!(cell, Cell::Text { .. }), "expected Cell::Text, got a different variant: {cell:?}");
+        assert_eq!(cell.pane_title(), Some("Links"));
+    }
+
+    #[test]
+    fn valid_text_cell_accepted() {
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ text = \"hi\" }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn text_cell_empty_text_rejected() {
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"Links\", text = \"\" }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("empty text"), "error should mention the empty text panel: {err}");
+    }
+
+    #[test]
+    fn text_cell_invalid_format_rejected() {
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ text = \"hi\", format = \"yaml\" }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("yaml"), "error should name the invalid format: {err}");
     }
 
     #[test]
@@ -821,5 +948,61 @@ mod tests {
         let err = apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_STALE_AFTER", "not-a-duration")]))
             .unwrap_err();
         assert!(err.to_string().contains("BARDUCK_STALE_AFTER"), "error should name the variable: {err}");
+    }
+
+    #[test]
+    fn show_in_defaults_to_visible_everywhere() {
+        let cfg: Config = toml::from_str(&source_toml("")).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.sources[0].show_in, None);
+        assert!(cfg.sources[0].visible_in("tui"));
+        assert!(cfg.sources[0].visible_in("web"));
+    }
+
+    #[test]
+    fn show_in_restricts_to_one_view() {
+        let cfg: Config = toml::from_str(&source_toml("show_in = \"tui\"")).unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.sources[0].visible_in("tui"));
+        assert!(!cfg.sources[0].visible_in("web"));
+    }
+
+    #[test]
+    fn show_in_invalid_value_rejected() {
+        let cfg: Config = toml::from_str(&source_toml("show_in = \"cli\"")).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("cpu"), "error should name the source: {err}");
+        assert!(err.to_string().contains("cli"), "error should name the invalid value: {err}");
+    }
+
+    #[test]
+    fn source_visible_in_true_for_unknown_source() {
+        // Validation already guarantees layout references resolve; a caller
+        // without the SourceCfg in hand still gets a sensible default.
+        let cfg = Config::default();
+        assert!(source_visible_in(&cfg, "nope", "tui"));
+    }
+
+    #[test]
+    fn source_visible_in_matches_source_show_in() {
+        let cfg: Config = toml::from_str(&source_toml("show_in = \"web\"")).unwrap();
+        assert!(!source_visible_in(&cfg, "cpu", "tui"));
+        assert!(source_visible_in(&cfg, "cpu", "web"));
+    }
+
+    #[test]
+    fn visible_items_omits_hidden_members() {
+        let toml = "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[sources]]\nname = \"b\"\ntype = \"script\"\ncommand = \"echo 0\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let items = vec![GroupItem::Id("a".into()), GroupItem::Id("b".into())];
+        let visible = visible_items(&cfg, &items, "tui");
+        assert_eq!(visible.iter().map(|i| i.id()).collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    #[test]
+    fn visible_items_empty_when_all_members_hidden() {
+        let cfg: Config = toml::from_str(&source_toml("show_in = \"web\"")).unwrap();
+        let items = vec![GroupItem::Id("cpu".into())];
+        assert!(visible_items(&cfg, &items, "tui").is_empty());
     }
 }

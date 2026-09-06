@@ -85,10 +85,19 @@ Then:
   regardless of thresholds, since it only ever shows a plain colored value.
 - **Value formats** — `weekly-report` renders markdown (headings, bold, lists)
   and `status-json` pretty-prints its JSON payload.
+- **Static-text panels** — "Quick Links" (next to `weekly-report`) is a
+  standalone `{ text = "..." }` layout cell, not a source: no `[[sources]]`
+  entry, no schedule, no health, no log view, no summary-strip chip. Its
+  markdown renders as HTML in the web UI, same as any markdown-format
+  source's value; the TUI shows it as-is.
 - **Failing source** — `dead-service` points at a closed port; after 2
   consecutive failures its panel turns red and `health` reports `failing`,
   with a plain "failing" label alongside the color even though it declares no
   threshold bands. Other sources keep collecting on schedule.
+- **Per-view visibility** — `dead-service` also declares `show_in = "tui"`:
+  it shows up in the TUI (useful during troubleshooting) but not on the web
+  dashboard, from the very same layout. It's still fetched on schedule either
+  way — `show_in` only controls display placement.
 - **Setup commands** — `tunneled-service` has a setup command that fails until
   you run `touch /tmp/bd-tunnel-up`; watch it retry on its schedule, then turn
   healthy and start fetching without a daemon restart.

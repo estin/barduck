@@ -31,6 +31,14 @@
 
 @import "tailwindcss";
 
+/* Renders a source's or static-text panel's `markdown`-format content (the
+   `prose`/`prose-sm` classes in `src/web.rs`). The standalone Tailwind CLI
+   bundles first-party plugins like this one — no npm install needed. Its own
+   `--tw-prose-*` variables are overridden below to point at this project's
+   tokens instead of the plugin's default gray scale, so rendered markdown
+   reads like the rest of the themed page in both light and dark mode. */
+@plugin "@tailwindcss/typography";
+
 /* Scan the project's Rust sources for the Tailwind classes they use. This
    file lives in `assets/`, so `../src` is the crate's source. */
 @source "../src/**/*.rs";
@@ -96,6 +104,34 @@
   --status-green-fg: var(--foreground);
   --status-green-text: #059669;
   --status-green-chip-fg: #ffffff;
+}
+
+/* Typography-plugin variables, pointed at this project's own tokens instead
+   of the plugin's default gray scale (see the `@plugin` comment above).
+   Overridden on `.prose` itself, not `:root`: the plugin's own generated
+   `.prose{...}` rule sets these same custom properties directly on the
+   element carrying that class, and a value set directly on an element
+   always wins over one merely inherited from an ancestor like `:root`,
+   regardless of layers or source order — only a same-or-more-specific
+   selector on the element itself can actually override it. No
+   `.dark`/media-query duplicate is needed here, unlike the base tokens and
+   `--status-*` above: these all reference tokens that already swap between
+   themes, so the reference swaps with them for free. */
+.prose {
+  --tw-prose-body: var(--foreground);
+  --tw-prose-headings: var(--foreground);
+  --tw-prose-lead: var(--muted-foreground);
+  --tw-prose-links: var(--primary);
+  --tw-prose-bold: var(--foreground);
+  --tw-prose-counters: var(--muted-foreground);
+  --tw-prose-bullets: var(--border);
+  --tw-prose-hr: var(--border);
+  --tw-prose-quotes: var(--foreground);
+  --tw-prose-quote-borders: var(--border);
+  --tw-prose-captions: var(--muted-foreground);
+  --tw-prose-code: var(--foreground);
+  --tw-prose-th-borders: var(--border);
+  --tw-prose-td-borders: var(--border);
 }
 
 /* Three theme states, in increasing precedence:

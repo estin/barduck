@@ -108,11 +108,15 @@ unit = "h"
 interval = "10s"
 
 # Deliberately unreachable: demonstrates the failing health state.
+# `show_in = "tui"` keeps this noisy debug source out of the web dashboard
+# (shown to other people) while it's still visible in the TUI during
+# troubleshooting; it's still fetched on its schedule either way.
 [[sources]]
 name = "dead-service"
 type = "http"
 url = "http://127.0.0.1:9/nope"
 interval = "5s"
+show_in = "tui"
 
 # Setup fails until you run:  touch /tmp/bd-tunnel-up
 # Demonstrates automatic recovery without restarting the daemon.
@@ -145,6 +149,19 @@ interval = "5s"
 #                                      entry is a bare source name (label =
 #                                      that source's `title`, or its name) or
 #                                      { id = "src", label = "Label" }
+#   { title? = "X", format? = "markdown", text = "..." }
+#                                   -> a standalone static-text panel: `text`
+#                                      is authored directly in the layout, no
+#                                      `[[sources]]` entry at all — no
+#                                      schedule, health, log view, or
+#                                      summary-strip chip. Renders like any
+#                                      other source's `format` (markdown as
+#                                      HTML, json pretty-printed, else plain
+#                                      text); the TUI always shows it as-is.
+#
+# A source may also declare `show_in = "tui"` or `show_in = "web"` (default
+# "all") to restrict which UI displays it — see `dead-service` above. This
+# only affects display placement; the source is still collected on schedule.
 [[layouts]]
 title = "Overview"
 rows = [
@@ -158,6 +175,16 @@ rows = [
 [[layouts]]
 title = "Reports & misc"
 rows = [
-    ["weekly-report"],
+    [
+        "weekly-report",
+        # TOML multi-line basic strings (`"""..."""`) work fine inside an
+        # inline table; the newline right after the opening `"""` is
+        # trimmed, so the content starts cleanly on the next line.
+        { title = "Quick Links", format = "markdown", text = """
+- [Status page](https://status.example.com)
+- [Runbook](https://wiki.example.com/runbook)
+- [On-call](https://wiki.example.com/oncall)
+""" },
+    ],
     ["status-json", "load-average", "dead-service"],
 ]

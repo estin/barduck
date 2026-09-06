@@ -132,6 +132,48 @@ The panel's own border SHALL be colored by the worst color across every member i
 - **WHEN** a cell's main section is healthy (green) and a secondary member has no threshold bands but is currently `failing`
 - **THEN** the panel's own border renders in the red style, matching the failing member
 
+### Requirement: Hidden sources render as space in the TUI
+When a layout cell (a bare source reference or `{ id, title }` cell) names a source whose `show_in` (spec: source-configuration — Per-source view visibility) excludes `"tui"`, the TUI SHALL render that cell as an empty space of the same column span instead of the source's panel, rather than failing startup. When a generalized pane cell's `main`, `secondary`, or `table` member names a source excluded from `"tui"`, the TUI SHALL omit that member from the pane's rendering; if omitting excluded members leaves the cell with none of `main`, `secondary`, or `table` populated for the TUI, the whole cell SHALL render as space. This does not change the layout's column count or row geometry.
+
+#### Scenario: Cell hidden from the TUI renders as space
+- **WHEN** a layout cell references a source declaring `show_in = "web"`
+- **THEN** the TUI renders that grid position as an empty space, occupying the same span the panel would have used
+
+#### Scenario: Cell visible in the TUI renders normally
+- **WHEN** a layout cell references a source declaring `show_in = "tui"` (or `"all"`, or no `show_in`)
+- **THEN** the TUI renders that source's panel as usual
+
+#### Scenario: Hidden generalized pane member is omitted
+- **WHEN** a generalized pane cell's `secondary` list includes a member whose source declares `show_in = "web"`, alongside other members visible in the TUI
+- **THEN** the TUI renders the pane without that member, showing the remaining members normally
+
+#### Scenario: Generalized pane cell with every member hidden renders as space
+- **WHEN** a generalized pane cell's only members (across `main`, `secondary`, `table`) all declare `show_in = "web"`
+- **THEN** the TUI renders that cell as an empty space
+
+#### Scenario: Same layout renders differently per view
+- **WHEN** a layout cell references a source declaring `show_in = "web"`
+- **THEN** the TUI shows an empty space for that cell while the web dashboard shows the source's panel, from the same layout config
+
+### Requirement: Static-text panel rendering
+A layout cell that is a static-text panel (`{ title?, format?, text }`, spec: source-configuration — UI layouts are config-declared like sources) SHALL render as its own bordered panel, titled with the cell's configured `title`, or with no title when omitted. The panel's content SHALL show `text` as-is (the TUI does not interpret `markdown`/`json` formatting — a `format` of `markdown` or `json` renders the same raw text a `text`-format value would). Since there is no backing source, the panel MUST NOT show an age suffix, and its border MUST always render in the terminal's default (unaccented) style, never a health or threshold color.
+
+#### Scenario: Static-text panel renders titled content
+- **WHEN** a cell is `{ title = "Links", text = "github.com" }`
+- **THEN** the TUI renders a bordered panel titled "Links" containing "github.com" as plain text
+
+#### Scenario: Static-text panel with no title shows no title
+- **WHEN** a cell is `{ text = "Just a note." }` with no `title`
+- **THEN** the TUI renders the panel with no title, containing the note
+
+#### Scenario: Static-text panel content shown as-is regardless of format
+- **WHEN** a cell is `{ text = "# Heading", format = "markdown" }`
+- **THEN** the TUI shows the literal text `"# Heading"`, not an interpreted heading
+
+#### Scenario: Static-text panel has no age suffix or accent color
+- **WHEN** a static-text panel cell is rendered
+- **THEN** its panel shows no age suffix and its border renders in the terminal's default style, never a health or threshold color
+
 ### Requirement: Configurable TUI content width
 The system SHALL support a `tui_width` config setting controlling how wide the TUI's content area (header, error banner, and panel grid) is, instead of always stretching to the full terminal width. `tui_width` MUST be either the string `"auto"` (the default) or a positive integer number of terminal columns; any other value MUST be rejected at startup. In `"auto"` mode, the content width SHALL scale with the widest row's column count at a fixed comfortable width per column. A fixed integer SHALL cap the content width at that many columns. In both modes, the content width MUST NOT exceed the terminal's actual width, and the content area SHALL be horizontally centered when narrower than the terminal.
 

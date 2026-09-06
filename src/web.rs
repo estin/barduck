@@ -19,7 +19,7 @@ use topcoat::{
     router::{page, path_param},
     runtime::shard,
     tailwind,
-    view::{Unescaped, attributes, view},
+    view::{Unescaped, attributes, component, view},
 };
 
 /// Declared once and reused by every page: two independent
@@ -232,39 +232,74 @@ impl Panel {
         crate::age::ago(now, self.ts_epoch).unwrap_or_else(|| "never".into())
     }
 
-    /// Pretty JSON when parseable; raw text otherwise.
-    fn json_pretty(&self) -> String {
-        serde_json::from_str::<serde_json::Value>(&self.value)
-            .and_then(|v| serde_json::to_string_pretty(&v))
-            .unwrap_or_else(|_| self.value.clone())
-    }
+}
 
-    /// Markdown rendered to HTML (trusted: comes from user-owned config).
-    fn markdown_html(&self) -> Unescaped<String> {
-        let mut html = String::new();
-        pulldown_cmark::html::push_html(&mut html, pulldown_cmark::Parser::new(&self.value));
-        Unescaped::new_unchecked(html)
+/// Pretty JSON when parseable; raw text otherwise. Shared by any
+/// format-aware content — a source's own value and a static-text cell's
+/// literal text (spec: web-ui — static-text panel rendering).
+fn json_pretty(value: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(value)
+        .and_then(|v| serde_json::to_string_pretty(&v))
+        .unwrap_or_else(|_| value.to_string())
+}
+
+/// Markdown rendered to HTML (trusted: config-authored content, either a
+/// source's fetched value or a static-text cell's literal text).
+fn markdown_to_html(value: &str) -> Unescaped<String> {
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, pulldown_cmark::Parser::new(value));
+    Unescaped::new_unchecked(html)
+}
+
+/// Renders `value` (with `unit` appended when non-empty, except for
+/// markdown, which never gets a unit suffix) according to `format`: markdown
+/// as HTML, JSON pretty-printed below the raw value, otherwise plain text.
+/// Shared by the single-source panel's content and the static-text cell's
+/// content, so the three-way format branch isn't copy-pasted a third time
+/// (design.md — factor format-rendering logic).
+#[component]
+async fn formatted_content(format: ValueFormat, value: String, unit: String) -> Result {
+    let value_and_unit = if unit.is_empty() { value.clone() } else { format!("{value} {unit}") };
+    view! {
+        if format == ValueFormat::Markdown {
+            <div class="prose prose-sm max-w-none">(markdown_to_html(&value))</div>
+        } else if format == ValueFormat::Json {
+            <div class="text-2xl font-semibold">(value_and_unit)</div>
+            <pre class="mt-1.5 text-xs font-mono whitespace-pre-wrap break-all max-h-40 overflow-y-auto">(json_pretty(&value))</pre>
+        } else {
+            <div class="text-2xl font-semibold">(value_and_unit)</div>
+        }
     }
 }
 
-/// One grid slot: a spacer (`main`/`secondary`/`table` all empty), a plain
-/// single-source panel (`main` only, `group_title` `None`), or a generalized
-/// pane combining up to three sections — `main` (regular-panel treatment),
-/// `secondary` (compact, always-shown age, never a history bar), and `table`
-/// (today's label/value rows, age only when stale) (spec: web-ui — group
-/// panes show multiple labeled, independently colored values).
+/// A standalone static-text panel's content: no source, no health, no
+/// history — just config-authored text rendered per `format` (spec: web-ui
+/// — static-text panel rendering).
+struct TextPanel {
+    format: ValueFormat,
+    text: String,
+}
+
+/// One grid slot: a spacer (`main`/`secondary`/`table`/`text` all empty), a
+/// plain single-source panel (`main` only, `group_title` `None`), a
+/// static-text panel (`text` only), or a generalized pane combining up to
+/// three sections — `main` (regular-panel treatment), `secondary` (compact,
+/// always-shown age, never a history bar), and `table` (today's label/value
+/// rows, age only when stale) (spec: web-ui — group panes show multiple
+/// labeled, independently colored values).
 struct Slot {
     span: usize,
     /// 1-based column where this slot starts (grid rows are placed
     /// explicitly so a short row can't be auto-packed into the next).
     col_start: usize,
-    /// Card header text for a grouped slot (the cell's `title`); `None` for
-    /// a plain single-source slot, whose header comes from `main`'s own
-    /// `name` instead, or a spacer.
+    /// Card header text for a grouped or static-text slot (the cell's
+    /// `title`); `None` for a plain single-source slot, whose header comes
+    /// from `main`'s own `name` instead, or a spacer.
     group_title: Option<String>,
     main: Option<Panel>,
     secondary: Vec<Panel>,
     table: Vec<Panel>,
+    text: Option<TextPanel>,
 }
 
 impl Slot {
@@ -405,32 +440,68 @@ fn collect_grids(st: &AppState) -> Vec<Grid> {
             let mut slots = Vec::new();
             let mut col = 1;
             for cell in cells {
-                let (main, secondary, table_panels, group_title) = match cell {
+                // A source hidden from this view (spec: source-configuration —
+                // per-source view visibility) is simply omitted here, so the cell
+                // falls through to the same empty-grid-position rendering as an
+                // explicit `space` cell (spec: web-ui — hidden sources render as
+                // space in the web dashboard).
+                let (main, secondary, table_panels, group_title, text_panel) = match cell {
                     config::Cell::Group { title, main, secondary, table: cell_table } => (
-                        main.as_ref().map(|item| build_panel(st, &latest, item.id(), item.explicit_label())),
-                        secondary
+                        main.as_ref()
+                            .filter(|item| config::source_visible_in(&st.cfg, item.id(), "web"))
+                            .map(|item| build_panel(st, &latest, item.id(), item.explicit_label())),
+                        config::visible_items(&st.cfg, secondary, "web")
                             .iter()
                             .map(|item| build_panel(st, &latest, item.id(), item.explicit_label()))
                             .collect(),
-                        cell_table
+                        config::visible_items(&st.cfg, cell_table, "web")
                             .iter()
                             .map(|item| build_panel(st, &latest, item.id(), item.explicit_label()))
                             .collect(),
                         title.clone(),
+                        None,
                     ),
-                    config::Cell::Source(name) => {
-                        (Some(build_panel(st, &latest, name, None)), Vec::new(), Vec::new(), None)
-                    }
-                    config::Cell::Pane { id, title } => (
-                        Some(build_panel(st, &latest, id, title.as_deref())),
+                    config::Cell::Source(name) => (
+                        config::source_visible_in(&st.cfg, name, "web")
+                            .then(|| build_panel(st, &latest, name, None)),
                         Vec::new(),
                         Vec::new(),
                         None,
+                        None,
                     ),
-                    config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None),
+                    config::Cell::Pane { id, title } => (
+                        config::source_visible_in(&st.cfg, id, "web")
+                            .then(|| build_panel(st, &latest, id, title.as_deref())),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
+                    config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None),
+                    config::Cell::Text { title, format, text } => (
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        title.clone(),
+                        Some(TextPanel {
+                            format: format
+                                .as_deref()
+                                .and_then(|f| ValueFormat::parse(f).ok())
+                                .unwrap_or_default(),
+                            text: text.clone(),
+                        }),
+                    ),
                 };
                 let span = cell.span();
-                slots.push(Slot { span, col_start: col, group_title, main, secondary, table: table_panels });
+                slots.push(Slot {
+                    span,
+                    col_start: col,
+                    group_title,
+                    main,
+                    secondary,
+                    table: table_panels,
+                    text: text_panel,
+                });
                 col += span;
             }
             rows.push(slots);
@@ -491,7 +562,26 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
             >
                 for (ri, row) in grid.rows.iter().enumerate() {
                     for slot in row {
-                        if slot.secondary.is_empty() && slot.table.is_empty() && slot.main.is_some() {
+                        if let Some(text) = &slot.text {
+                            card(
+                                attrs: attributes! {
+                                    id=(format!("text-panel-{}-{}", ri, slot.col_start))
+                                    class="relative bd-panel-cell"
+                                    style=(format!("grid-row: {}; grid-column: {} / span {};", ri + 1, slot.col_start, slot.span))
+                                },
+                                // No health/threshold color and no footer/log-link/history-bar —
+                                // there's no source behind a static-text panel (spec: web-ui —
+                                // static-text panel rendering).
+                                if let Some(title) = &slot.group_title {
+                                    <span class="absolute top-0 -translate-y-1/2 left-4 px-1.5 text-xs font-medium leading-none bg-background">
+                                        (title.clone())
+                                    </span>
+                                }
+                                card_content(
+                                    formatted_content(format: text.format, value: text.text.clone(), unit: String::new())
+                                )
+                            )
+                        } else if slot.secondary.is_empty() && slot.table.is_empty() && slot.main.is_some() {
                             if let Some(main) = &slot.main {
                                 card(
                                     attrs: attributes! {
@@ -514,14 +604,7 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                         (slot.group_title.clone().unwrap_or_else(|| main.name.clone()))
                                     </span>
                                     card_content(
-                                        if main.format == ValueFormat::Markdown {
-                                            <div class="prose prose-sm max-w-none">(main.markdown_html())</div>
-                                        } else if main.format == ValueFormat::Json {
-                                            <div class="text-2xl font-semibold">(main.value_and_unit())</div>
-                                            <pre class="mt-1.5 text-xs font-mono whitespace-pre-wrap break-all max-h-40 overflow-y-auto">(main.json_pretty())</pre>
-                                        } else {
-                                            <div class="text-2xl font-semibold">(main.value_and_unit())</div>
-                                        }
+                                        formatted_content(format: main.format, value: main.value.clone(), unit: main.unit.clone())
                                         if !main.history.is_empty() {
                                             <div class="mt-1.5 flex gap-0.5 h-2">
                                                 for seg in &main.history {
