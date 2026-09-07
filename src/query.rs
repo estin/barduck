@@ -36,7 +36,7 @@ impl Backend {
 
     pub async fn history(&self, source: &str, from: Option<f64>, to: Option<f64>) -> Result<Vec<db::ReadingRow>> {
         match self {
-            Backend::Direct(db) => db.history(source, from, to).await,
+            Backend::Direct(db) => db.history(source, from, to, None).await,
             Backend::Daemon { base, client } => {
                 let mut url = format!("{base}/api/sources/{source}/history");
                 let mut q = Vec::new();
@@ -60,7 +60,7 @@ impl Backend {
             Backend::Direct(db) => {
                 let mut out = Vec::new();
                 for s in &cfg.sources {
-                    out.push(health::compute(db, cfg, &s.name)?);
+                    out.push(health::compute(db, cfg, &s.name).await?);
                 }
                 Ok(out)
             }

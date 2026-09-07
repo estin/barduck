@@ -1,6 +1,6 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use crate::{config::{Config, TuiWidth, VERSION}, query::Backend};
+use crate::{config::{Config, Level, TuiWidth, VERSION, View}, health::Health, query::Backend};
 use anyhow::Result;
 use ratatui::{
     Terminal,
@@ -63,10 +63,10 @@ struct Panel {
     name: String,
     value: String,
     unit: String,
-    status: &'static str,
+    status: Health,
     /// Threshold band level for the current value, when the source has
     /// thresholds configured (spec: tui — threshold band coloring).
-    level: Option<String>,
+    level: Option<Level>,
     ts_epoch: f64,
 }
 
@@ -114,7 +114,7 @@ fn build_panel(
         name: label.to_string(),
         value: row.map_or_else(|| "—".into(), |r| r.value.clone()),
         unit: row.and_then(|r| r.unit.clone()).unwrap_or_default(),
-        status: healths.iter().find(|h| h.source == name).map_or("stale", |h| h.status.as_str()),
+        status: healths.iter().find(|h| h.source == name).map_or(Health::Stale, |h| h.status),
         level,
         ts_epoch: row.map_or(0.0, |r| r.ts_epoch),
     }
@@ -169,17 +169,17 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                         let (main, secondary, table, group_title, text) = match cell {
                             crate::config::Cell::Group { title, main, secondary, table } => (
                                 main.as_ref()
-                                    .filter(|item| crate::config::source_visible_in(cfg, item.id(), "tui"))
+                                    .filter(|item| crate::config::source_visible_in(cfg, item.id(), View::Tui))
                                     .map(|item| {
                                         build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
                                     }),
-                                crate::config::visible_items(cfg, secondary, "tui")
+                                crate::config::visible_items(cfg, secondary, View::Tui)
                                     .iter()
                                     .map(|item| {
                                         build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
                                     })
                                     .collect(),
-                                crate::config::visible_items(cfg, table, "tui")
+                                crate::config::visible_items(cfg, table, View::Tui)
                                     .iter()
                                     .map(|item| {
                                         build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
@@ -189,7 +189,7 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                                 None,
                             ),
                             crate::config::Cell::Source(name) => (
-                                crate::config::source_visible_in(cfg, name, "tui")
+                                crate::config::source_visible_in(cfg, name, View::Tui)
                                     .then(|| build_panel(cfg, &latest, &healths, name, None)),
                                 Vec::new(),
                                 Vec::new(),
@@ -197,7 +197,7 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                                 None,
                             ),
                             crate::config::Cell::Pane { id, title } => (
-                                crate::config::source_visible_in(cfg, id, "tui")
+                                crate::config::source_visible_in(cfg, id, View::Tui)
                                     .then(|| build_panel(cfg, &latest, &healths, id, title.as_deref())),
                                 Vec::new(),
                                 Vec::new(),
@@ -224,7 +224,7 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
 /// unbanded — nothing meaningful to accent, so the panel renders with the
 /// terminal's default color instead of a forced green) (spec: tui —
 /// threshold band coloring).
-fn status_style(level: Option<&str>, status: &str) -> Style {
+fn status_style(level: Option<Level>, status: Health) -> Style {
     match crate::config::accent_color(level, status) {
         Some(color) => color_style(color),
         None => Style::default(),
@@ -234,11 +234,11 @@ fn status_style(level: Option<&str>, status: &str) -> Style {
 /// Plain `[failing]`/`[stale]` suffix for a currently unhealthy value —
 /// empty when healthy, shown alongside whatever color that status
 /// contributes (spec: tui — threshold band coloring; group panes).
-fn plain_label(status: &str) -> String {
-    if status == "healthy" {
+fn plain_label(status: Health) -> String {
+    if status == Health::Healthy {
         String::new()
     } else {
-        format!(" [{status}]")
+        format!(" [{}]", status.as_str())
     }
 }
 
@@ -355,7 +355,7 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
         && slot.table.is_empty()
         && let Some(p) = &slot.main
     {
-        let style = status_style(p.level.as_deref(), p.status);
+        let style = status_style(p.level, p.status);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(p.ts_epoch, |d| d.as_secs_f64());
@@ -380,18 +380,18 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(style)
-                .title(Span::styled(format!(" {title} [{}] ", p.status), style)),
+                .title(Span::styled(format!(" {title} [{}] ", p.status.as_str()), style)),
         )
     } else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
-        let colors: Vec<&str> = slot
+        let colors: Vec<Level> = slot
             .main
             .iter()
             .chain(&slot.secondary)
             .chain(&slot.table)
-            .map(|p| crate::config::status_color(p.level.as_deref(), p.status))
+            .map(|p| crate::config::status_color(p.level, p.status))
             .collect();
         let border_style = color_style(crate::config::worst_color(colors));
         let mut lines: Vec<Line> = Vec::new();
@@ -402,10 +402,10 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
             lines.push(main_or_secondary_line(p, now, Modifier::empty()));
         }
         for p in &slot.table {
-            let style = status_style(p.level.as_deref(), p.status);
+            let style = status_style(p.level, p.status);
             // Only show the age when the value is lagging (stale) — a
             // table line otherwise omits it to stay compact.
-            let updated = if p.status == "stale" {
+            let updated = if p.status == Health::Stale {
                 crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"))
             } else {
                 String::new()
@@ -432,7 +432,7 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
 /// `main` (bold) from `secondary` (plain) (spec: tui — group panes show
 /// multiple labeled, independently colored values).
 fn main_or_secondary_line(p: &Panel, now: f64, value_modifier: Modifier) -> Line<'_> {
-    let style = status_style(p.level.as_deref(), p.status);
+    let style = status_style(p.level, p.status);
     let updated = crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"));
     Line::from(vec![
         Span::styled(p.value.clone(), style.add_modifier(value_modifier)),
@@ -442,13 +442,13 @@ fn main_or_secondary_line(p: &Panel, now: f64, value_modifier: Modifier) -> Line
     ])
 }
 
-/// Style for a normalized `"red"`/`"yellow"`/`"green"` color, shared by a
-/// group panel's own border and (via [`status_style`]) each member line.
-fn color_style(color: &str) -> Style {
+/// Style for a color level, shared by a group panel's own border and (via
+/// [`status_style`]) each member line.
+fn color_style(color: Level) -> Style {
     match color {
-        crate::config::RED => Style::default().fg(Color::Red),
-        crate::config::YELLOW => Style::default().fg(Color::Yellow),
-        _ => Style::default().fg(Color::Green),
+        Level::Red => Style::default().fg(Color::Red),
+        Level::Yellow => Style::default().fg(Color::Yellow),
+        Level::Green => Style::default().fg(Color::Green),
     }
 }
 
@@ -493,7 +493,7 @@ mod tests {
                             name: "echo".into(),
                             value: "42".into(),
                             unit: String::new(),
-                            status: "healthy",
+                            status: Health::Healthy,
                             level: None,
                             ts_epoch: 0.0,
                         }),
@@ -508,7 +508,7 @@ mod tests {
                             name: "Balance".into(),
                             value: "7.25".into(),
                             unit: "USD".into(),
-                            status: "healthy",
+                            status: Health::Healthy,
                             level: None,
                             ts_epoch: 0.0,
                         }),
@@ -526,7 +526,7 @@ mod tests {
                             name: "dead-service".into(),
                             value: "\u{2014}".into(),
                             unit: String::new(),
-                            status: "failing",
+                            status: Health::Failing,
                             level: None,
                             ts_epoch: 0.0,
                         }),
@@ -580,16 +580,16 @@ mod tests {
                         name: "days left".into(),
                         value: "5".into(),
                         unit: "d".into(),
-                        status: "stale",
-                        level: Some("red".into()),
+                        status: Health::Stale,
+                        level: Some(Level::Red),
                         ts_epoch: now - 629.0,
                     },
                     Panel {
                         name: "balance".into(),
                         value: "90".into(),
                         unit: "USD".into(),
-                        status: "healthy",
-                        level: Some("green".into()),
+                        status: Health::Healthy,
+                        level: Some(Level::Green),
                         ts_epoch: now,
                     },
                 ],
@@ -672,15 +672,15 @@ mod tests {
                         name: "days left".into(),
                         value: "5".into(),
                         unit: "d".into(),
-                        status: "healthy",
-                        level: Some("green".into()),
+                        status: Health::Healthy,
+                        level: Some(Level::Green),
                         ts_epoch: 0.0,
                     },
                     Panel {
                         name: "flaky".into(),
                         value: "9".into(),
                         unit: String::new(),
-                        status: "failing",
+                        status: Health::Failing,
                         level: None,
                         ts_epoch: 0.0,
                     },
@@ -730,8 +730,8 @@ mod tests {
                     name: "cpu-load-ignored".into(),
                     value: "42".into(),
                     unit: "%".into(),
-                    status: "healthy",
-                    level: Some("yellow".into()),
+                    status: Health::Healthy,
+                    level: Some(Level::Yellow),
                     ts_epoch: 0.0,
                 }),
                 secondary: Vec::new(),
@@ -773,15 +773,15 @@ mod tests {
                     name: "cpu-load".into(),
                     value: "42".into(),
                     unit: "%".into(),
-                    status: "healthy",
-                    level: Some("green".into()),
+                    status: Health::Healthy,
+                    level: Some(Level::Green),
                     ts_epoch: 0.0,
                 }),
                 secondary: vec![Panel {
                     name: "mem-used".into(),
                     value: "80".into(),
                     unit: "%".into(),
-                    status: "failing",
+                    status: Health::Failing,
                     level: None,
                     ts_epoch: 0.0,
                 }],
@@ -789,8 +789,8 @@ mod tests {
                     name: "days left".into(),
                     value: "5".into(),
                     unit: "d".into(),
-                    status: "healthy",
-                    level: Some("green".into()),
+                    status: Health::Healthy,
+                    level: Some(Level::Green),
                     ts_epoch: 0.0,
                 }],
                 text: None,
@@ -959,7 +959,7 @@ mod tests {
                     name: "weekly-report".into(),
                     value: "first line\nsecond line\nthird line".into(),
                     unit: String::new(),
-                    status: "healthy",
+                    status: Health::Healthy,
                     level: None,
                     ts_epoch: 0.0,
                 }),
@@ -989,8 +989,8 @@ mod tests {
     /// threshold band coloring).
     #[test]
     fn banded_value_colors_by_band_when_healthy() {
-        assert_eq!(status_style(Some("red"), "healthy").fg, Some(Color::Red));
-        assert_eq!(status_style(Some("yellow"), "healthy").fg, Some(Color::Yellow));
+        assert_eq!(status_style(Some(Level::Red), Health::Healthy).fg, Some(Color::Red));
+        assert_eq!(status_style(Some(Level::Yellow), Health::Healthy).fg, Some(Color::Yellow));
     }
 
     /// Health status overrides a stale band reading — even a source with
@@ -998,8 +998,8 @@ mod tests {
     /// (spec: tui — threshold band coloring).
     #[test]
     fn health_overrides_a_stale_band_reading() {
-        assert_eq!(status_style(Some("green"), "failing").fg, Some(Color::Red));
-        assert_eq!(status_style(Some("green"), "stale").fg, Some(Color::Yellow));
+        assert_eq!(status_style(Some(Level::Green), Health::Failing).fg, Some(Color::Red));
+        assert_eq!(status_style(Some(Level::Green), Health::Stale).fg, Some(Color::Yellow));
     }
 
     /// An unbanded, healthy source has no accent color at all — not even
@@ -1007,18 +1007,18 @@ mod tests {
     /// band coloring).
     #[test]
     fn unbanded_healthy_source_has_no_accent_color() {
-        assert_eq!(status_style(None, "healthy").fg, None);
-        assert_eq!(status_style(None, "failing").fg, Some(Color::Red));
-        assert_eq!(status_style(None, "stale").fg, Some(Color::Yellow));
+        assert_eq!(status_style(None, Health::Healthy).fg, None);
+        assert_eq!(status_style(None, Health::Failing).fg, Some(Color::Red));
+        assert_eq!(status_style(None, Health::Stale).fg, Some(Color::Yellow));
     }
 
     /// The plain status label appears for any currently unhealthy value,
     /// banded or not (spec: tui — threshold band coloring; group panes).
     #[test]
     fn plain_label_only_for_non_healthy() {
-        assert_eq!(plain_label("healthy"), "");
-        assert_eq!(plain_label("failing"), " [failing]");
-        assert_eq!(plain_label("stale"), " [stale]");
+        assert_eq!(plain_label(Health::Healthy), "");
+        assert_eq!(plain_label(Health::Failing), " [failing]");
+        assert_eq!(plain_label(Health::Stale), " [stale]");
     }
 
     /// (spec: tui — configurable TUI content width)

@@ -74,6 +74,10 @@ path_param!(source_name: String, error = not_found);
 struct RangeQuery {
     from: Option<f64>,
     to: Option<f64>,
+    /// Capped at `db::MAX_HISTORY_LIMIT`, defaults to `db::DEFAULT_HISTORY_LIMIT`
+    /// (spec: http-api — bounded history queries) — an HTTP client can never
+    /// force an unbounded table scan by omitting it.
+    limit: Option<i64>,
 }
 
 #[route(GET "/api/sources/{source_name}/history")]
@@ -91,7 +95,7 @@ pub async fn history(cx: &Cx) -> Result<Response> {
         serde_urlencoded::from_str(uri(cx).query().unwrap_or("")).map_err(|e| {
             topcoat::Error::from(bad_request(format!("invalid time range query: {e}")))
         })?;
-    match st.db.history(&source, q.from, q.to).await {
+    match st.db.history(&source, q.from, q.to, q.limit).await {
         Ok(rows) => Ok(json_ok(&rows)),
         Err(e) => Ok(json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -105,7 +109,7 @@ pub async fn health_all(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
     let mut out = Vec::new();
     for s in &st.cfg.sources {
-        match health::compute(&st.db, &st.cfg, &s.name) {
+        match health::compute(&st.db, &st.cfg, &s.name).await {
             Ok(h) => out.push(h),
             Err(e) => {
                 return Ok(json_err(

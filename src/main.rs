@@ -100,11 +100,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = std::fs::canonicalize(&cli.config)
         .with_context(|| format!("resolving config path {}", cli.config.display()))?;
-    let config_dir = config_path
-        .parent()
-        .with_context(|| format!("config path {} has no parent directory", config_path.display()))?;
-    std::env::set_current_dir(config_dir)
-        .with_context(|| format!("changing directory to {}", config_dir.display()))?;
+    // `config::load` resolves `database_path` and records `config_dir` itself
+    // — scripts spawn with that directory as their own working directory
+    // (spec: source-configuration — config-relative working directory), so
+    // the process's own current directory never needs to change (leaving
+    // `std::env::current_dir()` correct for any other code in-process).
     let cfg = config::load(&config_path)?;
 
     match cli.cmd {

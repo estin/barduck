@@ -33,23 +33,23 @@ pub struct SourceHealth {
 
 /// Derives live health for one source from its recent fetch logs and the age
 /// of its last success (spec: data-collection — consecutive failures flip to
-/// failing, old successes go stale).
-pub fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth> {
-    let logs = db.logs_sync(Some(source), i64::from(cfg.failure_threshold))?;
+/// failing, old successes go stale). Two bounded queries: the last
+/// `failure_threshold` logs (for the consecutive-failure count) and the
+/// single most recent successful fetch (for staleness) — neither scans the
+/// source's full log history.
+pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth> {
+    let logs = db.logs(Some(source), i64::from(cfg.failure_threshold)).await?;
     #[allow(clippy::cast_possible_truncation)] // counts are small
     let failures = logs.iter().take_while(|l| !l.ok).count() as u32;
 
-    let all = db.logs_sync(Some(source), i64::MAX)?;
-    let last_success_ts = all.iter().find(|l| l.ok).map(|l| l.ts.clone());
+    let last_success = db.last_success(source).await?;
+    let last_success_ts = last_success.as_ref().map(|l| l.ts.clone());
 
     let stale_after = cfg.stale_after.as_secs_f64();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs_f64();
-    let last_ok_age = all
-        .iter()
-        .find(|l| l.ok)
-        .map_or(f64::INFINITY, |l| now - l.ts_epoch);
+    let last_ok_age = last_success.map_or(f64::INFINITY, |l| now - l.ts_epoch);
 
     let status = if failures >= cfg.failure_threshold {
         Health::Failing

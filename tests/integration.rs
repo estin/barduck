@@ -124,24 +124,26 @@ async fn collection_writes_readings_logs_and_health_and_survives_restart() {
     let bal = latest.iter().find(|r| r.source == "balance").expect("balance reading");
     assert_eq!(bal.value, "123.45");
 
-    // Fetch logs exist for all three; `dead` failed with an error message.
+    // Fetch logs exist for all four configured sources; `dead` failed with an
+    // error message, and `gated` logs its own failed setup attempt (its
+    // marker file doesn't exist yet) rather than a fetch attempt.
     let logs = db.logs(None, 100).await.unwrap();
-    assert_eq!(logs.len(), 3);
+    assert_eq!(logs.len(), 4);
     let dead = logs.iter().find(|l| l.source == "dead").unwrap();
     assert!(!dead.ok);
     assert!(dead.error.is_some());
 
     // One failure with threshold 1 → failing.
-    let h = health::compute(&db, &cfg, "dead").unwrap();
+    let h = health::compute(&db, &cfg, "dead").await.unwrap();
     assert_eq!(h.status, health::Health::Failing);
-    let h = health::compute(&db, &cfg, "echo").unwrap();
+    let h = health::compute(&db, &cfg, "echo").await.unwrap();
     assert_eq!(h.status, health::Health::Healthy);
 
     drop(db);
 
     // Restart: reopen the same file, history survives (spec: data-storage).
     let reopened = Db::open_rw(&db_path).unwrap();
-    let hist = reopened.history("echo", None, None).await.unwrap();
+    let hist = reopened.history("echo", None, None, None).await.unwrap();
     assert_eq!(hist.len(), 1);
     assert_eq!(hist[0].value, "42");
 
@@ -1306,7 +1308,7 @@ async fn setup_command_gates_fetch_and_recovers() {
     let err = logs[0].error.as_deref().unwrap();
     assert!(err.starts_with("setup:"), "unexpected error: {err}");
     assert!(db.latest_values().await.unwrap().iter().all(|r| r.source != "gated"));
-    let h = health::compute(&db, &cfg, "gated").unwrap();
+    let h = health::compute(&db, &cfg, "gated").await.unwrap();
     assert_eq!(h.status, health::Health::Failing);
 
     // Dependency appears: next round's setup succeeds and fetching starts.
@@ -1315,7 +1317,7 @@ async fn setup_command_gates_fetch_and_recovers() {
     let latest = db.latest_values().await.unwrap();
     let gated = latest.iter().find(|r| r.source == "gated").expect("gated reading after recovery");
     assert_eq!(gated.value, "gated");
-    let h = health::compute(&db, &cfg, "gated").unwrap();
+    let h = health::compute(&db, &cfg, "gated").await.unwrap();
     assert_eq!(h.status, health::Health::Healthy);
 }
 
@@ -1405,7 +1407,7 @@ cron = "* * * * * *"
 
     tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
-    let hist = db.history("ticker", None, None).await.unwrap();
+    let hist = db.history("ticker", None, None, None).await.unwrap();
     assert!(hist.len() >= 2, "expected multiple cron-triggered fetches, got {}", hist.len());
 }
 

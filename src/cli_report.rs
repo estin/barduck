@@ -20,11 +20,8 @@ fn filter_named<T: Named>(rows: Vec<T>, sources: &[String]) -> Vec<T> {
 /// short scalar — cramming it into `latest`'s fixed-width table would break
 /// the table's alignment, so it's set aside as a "text source" instead.
 fn is_text_source(cfg: &Config, name: &str) -> bool {
-    cfg.sources
-        .iter()
-        .find(|s| s.name == name)
-        .and_then(|s| s.format.as_deref())
-        == Some("markdown")
+    cfg.sources.iter().find(|s| s.name == name).and_then(|s| s.format)
+        == Some(crate::config::ValueFormat::Markdown)
 }
 
 trait Named {
