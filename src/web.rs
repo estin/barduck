@@ -606,9 +606,9 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                     card_content(
                                         formatted_content(format: main.format, value: main.value.clone(), unit: main.unit.clone())
                                         if !main.history.is_empty() {
-                                            <div class="mt-1.5 flex gap-0.5 h-2">
+                                            <div class="mt-1.5 flex h-1">
                                                 for seg in &main.history {
-                                                    <div class=(format!("flex-1 rounded-sm {}", Panel::segment_class(seg.as_deref())))></div>
+                                                    <div class=(format!("flex-1 {}", Panel::segment_class(seg.as_deref())))></div>
                                                 }
                                             </div>
                                         }
@@ -666,9 +666,9 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                                 </a>
                                             </div>
                                             if !main.history.is_empty() {
-                                                <div class="mt-1.5 flex gap-0.5 h-2">
+                                                <div class="mt-1.5 flex h-1">
                                                     for seg in &main.history {
-                                                        <div class=(format!("flex-1 rounded-sm {}", Panel::segment_class(seg.as_deref())))></div>
+                                                        <div class=(format!("flex-1 {}", Panel::segment_class(seg.as_deref())))></div>
                                                     }
                                                 </div>
                                             }
@@ -706,9 +706,9 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                                 </span>
                                             </div>
                                             if !p.history.is_empty() {
-                                                <div class="mt-1 flex gap-0.5 h-1.5">
+                                                <div class="mt-1 flex h-1">
                                                     for seg in &p.history {
-                                                        <div class=(format!("flex-1 rounded-sm {}", Panel::segment_class(seg.as_deref())))></div>
+                                                        <div class=(format!("flex-1 {}", Panel::segment_class(seg.as_deref())))></div>
                                                     }
                                                 </div>
                                             }

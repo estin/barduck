@@ -372,7 +372,7 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
     // Only the two banded members (days-left, balance) render a history bar;
     // the unbanded `note` member renders none.
     assert_eq!(
-        html.matches("mt-1 flex gap-0.5 h-1.5").count(),
+        html.matches("mt-1 flex h-1").count(),
         2,
         "exactly the banded group members should render a history bar"
     );
@@ -468,7 +468,7 @@ async fn web_ui_history_bar_reflects_recent_readings() {
 
     // cpu: 3 segments, colored in reading order, no neutral padding.
     let cpu = panel_slice(&page, "cpu", Some("plain"));
-    assert_eq!(cpu.matches("flex-1 rounded-sm").count(), 3, "cpu bar should have exactly 3 segments");
+    assert_eq!(cpu.matches("flex-1 bg-").count(), 3, "cpu bar should have exactly 3 segments");
     let (i_green, i_yellow, i_red) = (
         cpu.find("bg-emerald-500").expect("green segment"),
         cpu.find("bg-amber-400").expect("yellow segment"),
@@ -478,11 +478,11 @@ async fn web_ui_history_bar_reflects_recent_readings() {
 
     // plain: no thresholds -> no history bar at all.
     let plain = panel_slice(&page, "plain", Some("sparse"));
-    assert!(!plain.contains("flex-1 rounded-sm"), "unbanded panel should have no history bar");
+    assert!(!plain.contains("flex-1 bg-"), "unbanded panel should have no history bar");
 
     // sparse: 5 segments, left-padded with 3 neutral placeholders, then green, red.
     let sparse = panel_slice(&page, "sparse", None);
-    assert_eq!(sparse.matches("flex-1 rounded-sm").count(), 5, "sparse bar should be padded to 5 segments");
+    assert_eq!(sparse.matches("flex-1 bg-").count(), 5, "sparse bar should be padded to 5 segments");
     let neutral_count = sparse.matches("bg-slate-200").count();
     assert_eq!(neutral_count, 3, "3 padding segments expected for 2 readings out of 5 history_points");
     let i_slate3 = sparse.rfind("bg-slate-200").unwrap();
@@ -583,9 +583,9 @@ async fn web_ui_show_history_false_hides_bar_for_banded_source() {
 
     let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
     let shown = panel_slice(&page, "shown", Some("hidden"));
-    assert!(shown.contains("flex-1 rounded-sm"), "shown source should render its history bar");
+    assert!(shown.contains("flex-1 bg-"), "shown source should render its history bar");
     let hidden = panel_slice(&page, "hidden", None);
-    assert!(!hidden.contains("flex-1 rounded-sm"), "show_history=false should hide the bar even though banded");
+    assert!(!hidden.contains("flex-1 bg-"), "show_history=false should hide the bar even though banded");
 }
 
 /// `days-left` is threshold-banded; `flaky` has no thresholds and fails.
@@ -716,7 +716,7 @@ async fn web_ui_main_only_pane_renders_like_single_source_panel() {
     assert!(html.contains("border-color:var(--status-yellow-border);background-color:var(--status-yellow-bg)"), "full yellow panel style expected");
     // `main`'s own history bar (thresholds + a reading) renders, using the
     // same wrapper class a plain single-source panel uses.
-    assert!(html.contains("mt-1.5 flex gap-0.5 h-2"), "main's own history bar expected");
+    assert!(html.contains("mt-1.5 flex h-1"), "main's own history bar expected");
 }
 
 /// A generalized pane combining `main`, `secondary`, and `table`: `secondary`
@@ -836,9 +836,9 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
     // `main`'s own history bar (2-unit height) renders once; `table`'s single
     // banded row (1.5-unit height) renders once too — but `mem-warn`, also
     // banded, contributes no history bar at all as a `secondary` member.
-    assert_eq!(html.matches("mt-1.5 flex gap-0.5 h-2").count(), 1, "only main should render its own history bar");
+    assert_eq!(html.matches("mt-1.5 flex h-1").count(), 1, "only main should render its own history bar");
     assert_eq!(
-        html.matches("mt-1 flex gap-0.5 h-1.5").count(),
+        html.matches("mt-1 flex h-1").count(),
         1,
         "only the table row should render a history bar, not the banded secondary member"
     );
@@ -1182,7 +1182,7 @@ rows = [
     // No footer, no log link, no history bar — there's no source behind it.
     assert!(!html.contains("updated "), "a text panel has no age/footer text");
     assert!(!html.contains("/logs/"), "a text panel has no per-source log link");
-    assert!(!html.contains("flex gap-0.5"), "a text panel has no history bar");
+    assert!(!html.contains("flex h-1"), "a text panel has no history bar");
     // Never colored: no status_style-style border/background override.
     assert!(!html.contains("--status-"), "a text panel's card must never carry a health/threshold color");
 }
