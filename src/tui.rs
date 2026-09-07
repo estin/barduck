@@ -446,8 +446,8 @@ fn main_or_secondary_line(p: &Panel, now: f64, value_modifier: Modifier) -> Line
 /// group panel's own border and (via [`status_style`]) each member line.
 fn color_style(color: &str) -> Style {
     match color {
-        "red" => Style::default().fg(Color::Red),
-        "yellow" => Style::default().fg(Color::Yellow),
+        crate::config::RED => Style::default().fg(Color::Red),
+        crate::config::YELLOW => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::Green),
     }
 }

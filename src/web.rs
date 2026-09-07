@@ -189,8 +189,8 @@ impl Panel {
     /// rationale as [`Panel::status_style`]).
     fn chip_style(&self) -> &'static str {
         match self.level_color() {
-            "red" => "background-color:var(--status-red-border);color:var(--status-red-chip-fg)",
-            "yellow" => "background-color:var(--status-yellow-border);color:var(--status-yellow-chip-fg)",
+            config::RED => "background-color:var(--status-red-border);color:var(--status-red-chip-fg)",
+            config::YELLOW => "background-color:var(--status-yellow-border);color:var(--status-yellow-chip-fg)",
             _ => "background-color:var(--status-green-border);color:var(--status-green-chip-fg)",
         }
     }
@@ -199,9 +199,9 @@ impl Panel {
     /// so a plain utility class is unambiguous (no competing base class).
     fn segment_class(level: Option<&str>) -> &'static str {
         match level {
-            Some("red") => "bg-red-500",
-            Some("yellow") => "bg-amber-400",
-            Some("green") => "bg-emerald-500",
+            Some(config::RED) => "bg-red-500",
+            Some(config::YELLOW) => "bg-amber-400",
+            Some(config::GREEN) => "bg-emerald-500",
             _ => "bg-slate-200",
         }
     }
@@ -339,9 +339,9 @@ impl Slot {
 /// theme-aware (spec: web-ui — light/dark theme toggle).
 fn full_style_for_color(color: Option<&str>) -> &'static str {
     match color {
-        Some("red") => "border-color:var(--status-red-border);background-color:var(--status-red-bg);color:var(--status-red-fg)",
-        Some("yellow") => "border-color:var(--status-yellow-border);background-color:var(--status-yellow-bg);color:var(--status-yellow-fg)",
-        Some("green") => "border-color:var(--status-green-border);background-color:var(--status-green-bg);color:var(--status-green-fg)",
+        Some(config::RED) => "border-color:var(--status-red-border);background-color:var(--status-red-bg);color:var(--status-red-fg)",
+        Some(config::YELLOW) => "border-color:var(--status-yellow-border);background-color:var(--status-yellow-bg);color:var(--status-yellow-fg)",
+        Some(config::GREEN) => "border-color:var(--status-green-border);background-color:var(--status-green-bg);color:var(--status-green-fg)",
         _ => "",
     }
 }
@@ -351,8 +351,8 @@ fn full_style_for_color(color: Option<&str>) -> &'static str {
 /// background.
 fn border_style_for_color(color: &str) -> &'static str {
     match color {
-        "red" => "border-color:var(--status-red-border)",
-        "yellow" => "border-color:var(--status-yellow-border)",
+        config::RED => "border-color:var(--status-red-border)",
+        config::YELLOW => "border-color:var(--status-yellow-border)",
         _ => "border-color:var(--status-green-border)",
     }
 }
@@ -363,9 +363,9 @@ fn border_style_for_color(color: &str) -> &'static str {
 /// forced green.
 fn text_style_for_color(color: Option<&str>) -> &'static str {
     match color {
-        Some("red") => "color:var(--status-red-text)",
-        Some("yellow") => "color:var(--status-yellow-text)",
-        Some("green") => "color:var(--status-green-text)",
+        Some(config::RED) => "color:var(--status-red-text)",
+        Some(config::YELLOW) => "color:var(--status-yellow-text)",
+        Some(config::GREEN) => "color:var(--status-green-text)",
         _ => "",
     }
 }
@@ -783,7 +783,7 @@ pub async fn dashboard(cx: &Cx) -> Result {
                 }) style="display:none"></span>
                 <div class="max-w-5xl mx-auto p-6">
                     <h1 class="text-xl font-bold mb-4 text-foreground flex flex-wrap items-center gap-2">
-                        <span>"barduck v"(config::VERSION)</span>
+                        <a href="/" class="text-foreground no-underline hover:underline">"barduck v"(config::VERSION)</a>
                         badge(
                             variant: BadgeVariant::Outline,
                             attrs: attributes! { class="gap-1.5 font-normal" },

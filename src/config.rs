@@ -5,7 +5,15 @@ use std::time::Duration;
 
 pub const SOURCE_TYPES: &[&str] = &["http", "script"];
 pub const VALUE_FORMATS: &[&str] = &["text", "markdown", "json"];
-pub const LEVELS: &[&str] = &["green", "yellow", "red"];
+
+/// The three threshold-band/accent-color levels, shared by config
+/// validation, the web UI, and the TUI so the color name is never
+/// retyped as a bare string literal.
+pub const GREEN: &str = "green";
+pub const YELLOW: &str = "yellow";
+pub const RED: &str = "red";
+pub const LEVELS: &[&str] = &[GREEN, YELLOW, RED];
+
 pub const VIEWS: &[&str] = &["all", "tui", "web"];
 
 /// App version shown in web UI, TUI, and CLI output.
@@ -69,7 +77,7 @@ pub fn level_for(thresholds: &[Threshold], value: &str) -> Option<String> {
 /// coloring; tui — threshold band coloring).
 #[must_use]
 pub fn status_color(level: Option<&str>, status: &str) -> &'static str {
-    accent_color(level, status).unwrap_or("green")
+    accent_color(level, status).unwrap_or(GREEN)
 }
 
 /// Same priority as [`status_color`], but `None` when the source is
@@ -80,12 +88,12 @@ pub fn status_color(level: Option<&str>, status: &str) -> &'static str {
 #[must_use]
 pub fn accent_color(level: Option<&str>, status: &str) -> Option<&'static str> {
     match status {
-        "failing" => Some("red"),
-        "stale" => Some("yellow"),
+        "failing" => Some(RED),
+        "stale" => Some(YELLOW),
         _ => match level {
-            Some("red") => Some("red"),
-            Some("yellow") => Some("yellow"),
-            Some("green") => Some("green"),
+            Some(RED) => Some(RED),
+            Some(YELLOW) => Some(YELLOW),
+            Some(GREEN) => Some(GREEN),
             _ => None,
         },
     }
@@ -97,13 +105,13 @@ pub fn accent_color(level: Option<&str>, status: &str) -> Option<&'static str> {
 /// rejects an empty `ids` list.
 #[must_use]
 pub fn worst_color<'a>(colors: impl IntoIterator<Item = &'a str>) -> &'static str {
-    let mut worst = "green";
+    let mut worst = GREEN;
     for color in colors {
-        if color == "red" {
-            return "red";
+        if color == RED {
+            return RED;
         }
-        if color == "yellow" {
-            worst = "yellow";
+        if color == YELLOW {
+            worst = YELLOW;
         }
     }
     worst
