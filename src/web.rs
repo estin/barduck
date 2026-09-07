@@ -614,7 +614,11 @@ async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                         }
                                     )
                                     card_footer(
-                                        attrs: attributes! { class="flex justify-between text-xs uppercase tracking-wide" },
+                                        // `mt-auto` pins the footer to the card's bottom edge when the
+                                        // card is stretched taller than its content by the grid row
+                                        // (the row height matches the tallest sibling panel), instead
+                                        // of the footer floating directly under the content.
+                                        attrs: attributes! { class="mt-auto flex justify-between text-xs uppercase tracking-wide" },
                                         <span>(main.status)</span>
                                         <a
                                             href=(format!("/logs/{}", main.source))
