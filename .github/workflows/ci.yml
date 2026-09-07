@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Lets libduckdb-sys download a matching prebuilt libduckdb at build time
+  # instead of requiring a system package or compiling DuckDB from source —
+  # matches `just ci`'s default (unbundled) feature set with no extra setup.
+  DUCKDB_DOWNLOAD_LIB: "1"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `just` runs the `ci` recipe below; `cargo-nextest` is what it runs.
+      - name: Install just and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+
+      # The web-UI integration tests bundle their own Tailwind/font assets by
+      # shelling out to this CLI (see tests/integration.rs's
+      # `test_asset_bundle`); version pinned to match the `topcoat`
+      # dependency in Cargo.toml.
+      - name: Install topcoat CLI
+        run: cargo install topcoat-cli --version 0.6.2
+
+      - name: just ci
+        run: just ci
