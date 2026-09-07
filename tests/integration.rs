@@ -1409,6 +1409,124 @@ cron = "* * * * * *"
     assert!(hist.len() >= 2, "expected multiple cron-triggered fetches, got {}", hist.len());
 }
 
+/// A source that fails every fetch retries at `retry_interval`, not the
+/// (much longer) full `interval` (spec: data-collection — per-source
+/// schedules, failed fetch retries sooner than the full interval).
+#[tokio::test]
+async fn failing_interval_source_retries_at_retry_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("retry.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "flaky"
+type = "script"
+command = "sh -c 'exit 1'"
+interval = "10s"
+retry_interval = "100ms"
+"#,
+        db = db_path.display()
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    barduck::collector::spawn_all(&db, &cfg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    let logs = db.logs(Some("flaky"), 100).await.unwrap();
+    assert!(
+        logs.len() >= 3,
+        "expected several retry attempts within 700ms at a 100ms retry_interval (10s interval would give ~1), got {}",
+        logs.len()
+    );
+    assert!(logs.iter().all(|l| !l.ok), "every attempt should have failed");
+}
+
+/// Once a retrying source's fetch succeeds, it resumes waiting the normal
+/// `interval` instead of continuing to retry at `retry_interval` (spec:
+/// data-collection — per-source schedules, recovery resumes the normal
+/// interval).
+#[tokio::test]
+async fn recovered_interval_source_resumes_normal_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("recover.duckdb");
+    let marker = dir.path().join("recovered");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "recovers"
+type = "script"
+command = "sh -c 'test -f {marker} && echo ok || (touch {marker}; exit 1)'"
+interval = "2s"
+retry_interval = "100ms"
+"#,
+        db = db_path.display(),
+        marker = marker.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    barduck::collector::spawn_all(&db, &cfg);
+
+    // First attempt (immediate) fails and creates the marker; the retry
+    // 100ms later succeeds. If recovery didn't resume the 2s interval, a
+    // third retry-interval-spaced attempt would land well before 900ms.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+    let logs = db.logs(Some("recovers"), 100).await.unwrap();
+    assert_eq!(
+        logs.len(),
+        2,
+        "expected exactly one failed attempt then one successful attempt, then a pause for the full interval, got {} log entries",
+        logs.len()
+    );
+    assert_eq!(logs.iter().filter(|l| l.ok).count(), 1, "expected exactly one successful attempt");
+    assert_eq!(logs.iter().filter(|l| !l.ok).count(), 1, "expected exactly one failed attempt");
+}
+
+/// A cron-scheduled source's next attempt is always the next cron
+/// occurrence, never sped up by a failing fetch (spec: data-collection —
+/// per-source schedules, cron-scheduled source ignores fetch outcome).
+#[tokio::test]
+async fn failing_cron_source_ignores_fetch_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("cron-fail.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "flaky-ticker"
+type = "script"
+command = "sh -c 'exit 1'"
+cron = "* * * * * *"
+"#,
+        db = db_path.display()
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    barduck::collector::spawn_all(&db, &cfg);
+
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+    let logs = db.logs(Some("flaky-ticker"), 100).await.unwrap();
+    assert!(
+        logs.len() >= 2,
+        "expected several cron-cadence attempts despite every fetch failing, got {}",
+        logs.len()
+    );
+    assert!(logs.iter().all(|l| !l.ok), "every attempt should have failed");
+}
+
 /// `latest` sets markdown-format ("text") sources aside from the scalar
 /// table by default, and drops them entirely with `--no-text` (spec: cli —
 /// query commands accept repeatable `--source` filters; this exercises the

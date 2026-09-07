@@ -164,6 +164,13 @@ pub struct SourceCfg {
     /// with an optional leading seconds field, e.g. `"0 0 3 * * *"`).
     /// Mutually exclusive with `interval`.
     pub cron: Option<String>,
+    /// Humantime string (e.g. `"10s"`). How soon an interval-scheduled source
+    /// retries after a failed fetch, instead of waiting the full `interval`;
+    /// defaults to `default_retry_interval()` when not declared. Has no
+    /// effect on a cron-scheduled source (mutually exclusive with `cron`) or
+    /// on setup-command retries.
+    #[serde(default, with = "humantime_serde::option")]
+    pub retry_interval: Option<Duration>,
     /// Humantime string (e.g. `"30s"`).
     #[serde(default = "default_timeout", with = "humantime_serde")]
     pub timeout: Duration,
@@ -206,6 +213,14 @@ impl SourceCfg {
     #[must_use]
     pub fn effective_interval(&self) -> Duration {
         self.interval.unwrap_or_else(default_interval)
+    }
+
+    /// How soon to retry after a failed fetch, when scheduled on `interval`
+    /// rather than `cron`: its declared `retry_interval`, or the default when
+    /// not set (spec: source-configuration — per-source fetch retry interval).
+    #[must_use]
+    pub fn effective_retry_interval(&self) -> Duration {
+        self.retry_interval.unwrap_or_else(default_retry_interval)
     }
 
     /// Whether this source may display in `view` (`"tui"` or `"web"`), per
@@ -387,6 +402,9 @@ fn default_interval() -> Duration {
 fn default_timeout() -> Duration {
     Duration::from_secs(30)
 }
+fn default_retry_interval() -> Duration {
+    Duration::from_secs(30)
+}
 fn default_threshold() -> u32 {
     3
 }
@@ -543,6 +561,17 @@ fn validate_source(s: &SourceCfg) -> Result<()> {
     }
     if s.interval.is_some() && s.cron.is_some() {
         bail!("source `{}` cannot declare both `interval` and `cron`", s.name);
+    }
+    if let Some(iv) = s.retry_interval
+        && iv.is_zero()
+    {
+        bail!("source `{}` retry_interval must be > 0", s.name);
+    }
+    if s.retry_interval.is_some() && s.cron.is_some() {
+        bail!(
+            "source `{}` cannot declare `retry_interval` with `cron` — retry_interval has no effect on a cron-scheduled source",
+            s.name
+        );
     }
     if let Some(expr) = &s.cron {
         let cron: croner::Cron = expr
@@ -705,6 +734,19 @@ mod tests {
     }
 
     #[test]
+    fn effective_retry_interval_falls_back_to_default_when_unset() {
+        let cfg: Config = toml::from_str(&source_toml("")).unwrap();
+        assert_eq!(cfg.sources[0].effective_retry_interval(), default_retry_interval());
+    }
+
+    #[test]
+    fn effective_retry_interval_uses_declared_value() {
+        let cfg: Config = toml::from_str(&source_toml("retry_interval = \"10s\"")).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.sources[0].effective_retry_interval(), Duration::from_secs(10));
+    }
+
+    #[test]
     fn both_interval_and_cron_rejected() {
         let cfg: Config =
             toml::from_str(&source_toml("interval = \"5m\"\ncron = \"0 */5 * * * *\"")).unwrap();
@@ -713,6 +755,32 @@ mod tests {
             err.to_string().contains("interval") && err.to_string().contains("cron"),
             "error should name both fields: {err}"
         );
+    }
+
+    #[test]
+    fn zero_retry_interval_rejected() {
+        let cfg: Config = toml::from_str(&source_toml("retry_interval = \"0s\"")).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("retry_interval"), "error should name the field: {err}");
+    }
+
+    #[test]
+    fn retry_interval_with_cron_rejected() {
+        let cfg: Config =
+            toml::from_str(&source_toml("cron = \"0 */5 * * * *\"\nretry_interval = \"10s\"")).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("retry_interval") && err.to_string().contains("cron"),
+            "error should name both fields: {err}"
+        );
+    }
+
+    #[test]
+    fn interval_and_retry_interval_together_accepted() {
+        let cfg: Config =
+            toml::from_str(&source_toml("interval = \"5m\"\nretry_interval = \"10s\"")).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.sources[0].effective_retry_interval(), Duration::from_secs(10));
     }
 
     #[test]

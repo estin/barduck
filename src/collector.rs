@@ -4,11 +4,13 @@ use croner::Cron;
 use std::time::Instant;
 use tokio::time::timeout;
 
-/// A source's per-tick wait: either a fixed interval or a cron expression's
-/// next occurrence, computed fresh each tick (spec: data-collection —
-/// per-source schedules).
+/// A source's per-tick wait: either an interval-scheduled source's next
+/// attempt time (advanced after each attempt — `interval` after success,
+/// `retry_interval` after a failed fetch, spec: data-collection —
+/// per-source schedules), or a cron expression's next occurrence, computed
+/// fresh each tick and unaffected by fetch outcome.
 enum Schedule {
-    Interval(tokio::time::Interval),
+    Interval { effective_interval: std::time::Duration, retry_interval: std::time::Duration, next: tokio::time::Instant },
     Cron(Box<Cron>),
 }
 
@@ -21,16 +23,20 @@ impl Schedule {
             let cron: Cron = expr.parse().expect("cron expression validated at config load");
             Schedule::Cron(Box::new(cron))
         } else {
-            let mut tick = tokio::time::interval(src.effective_interval());
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            Schedule::Interval(tick)
+            Schedule::Interval {
+                effective_interval: src.effective_interval(),
+                retry_interval: src.effective_retry_interval(),
+                // Fires immediately, matching the collector's long-standing
+                // "fetch right away at startup" behavior.
+                next: tokio::time::Instant::now(),
+            }
         }
     }
 
     async fn tick(&mut self) {
         match self {
-            Schedule::Interval(t) => {
-                t.tick().await;
+            Schedule::Interval { next, .. } => {
+                tokio::time::sleep_until(*next).await;
             }
             Schedule::Cron(cron) => {
                 let now = chrono::Utc::now();
@@ -41,6 +47,19 @@ impl Schedule {
                     .unwrap_or(std::time::Duration::from_mins(1));
                 tokio::time::sleep_until(tokio::time::Instant::now() + delta).await;
             }
+        }
+    }
+
+    /// Sets an interval-scheduled source's next wait: `retry_interval` when
+    /// `retry` is true (the just-attempted fetch failed), `interval`
+    /// otherwise (fetch succeeded, or setup isn't satisfied yet — setup
+    /// retries stay on the normal schedule tick, spec: data-collection —
+    /// setup gates first fetch). No-op for a cron schedule, whose next tick
+    /// is always the next cron occurrence regardless of outcome.
+    fn advance(&mut self, retry: bool) {
+        if let Schedule::Interval { effective_interval, retry_interval, next } = self {
+            let wait = if retry { *retry_interval } else { *effective_interval };
+            *next = tokio::time::Instant::now() + wait;
         }
     }
 }
@@ -73,10 +92,12 @@ async fn loop_source(db: Db, src: SourceCfg, cfg: Config) -> Result<()> {
     loop {
         schedule.tick().await;
         if !setup_done && !try_setup(&db, &src).await {
+            schedule.advance(false);
             continue;
         }
         setup_done = true;
-        fetch_once(&db, &cfg, &src, &kind, &mut last_status).await;
+        let success = fetch_once(&db, &cfg, &src, &kind, &mut last_status).await;
+        schedule.advance(!success);
     }
 }
 
@@ -128,9 +149,14 @@ async fn try_setup(db: &Db, src: &SourceCfg) -> bool {
     }
 }
 
-pub async fn fetch_once(db: &Db, cfg: &Config, src: &SourceCfg, kind: &source::SourceKind, last_status: &mut String) {
+/// Runs one fetch attempt, logging its outcome and updating health.  Returns
+/// whether the fetch itself succeeded, so callers scheduling the next
+/// attempt (spec: data-collection — per-source schedules) know whether to
+/// wait the normal interval or retry sooner.
+pub async fn fetch_once(db: &Db, cfg: &Config, src: &SourceCfg, kind: &source::SourceKind, last_status: &mut String) -> bool {
     let start = Instant::now();
     let outcome = tokio::time::timeout(src.timeout, kind.fetch()).await;
+    let success = matches!(outcome, Ok(Ok(_)));
     #[allow(clippy::cast_possible_truncation)] // durations fit easily
     {
         let ms = start.elapsed().as_millis() as i64;
@@ -170,6 +196,8 @@ pub async fn fetch_once(db: &Db, cfg: &Config, src: &SourceCfg, kind: &source::S
         }
         Err(e) => tracing::error!("health compute `{}`: {e:#}", src.name),
     }
+
+    success
 }
 
 async fn record_failure(db: &Db, name: &str, ms: i64, error: &str) {
