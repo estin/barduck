@@ -132,7 +132,8 @@ impl WriteCmd {
             } => (
                 db.with_lock(|| {
                     conn.execute(
-                        "INSERT INTO fetch_logs VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO fetch_logs (id, source, ts_epoch, ts, ok, duration_ms, error, value)
+                         VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?, ?)",
                         params![source, ts_epoch, ts, ok, duration_ms, error, value],
                     )?;
                     Ok(())
@@ -148,7 +149,8 @@ impl WriteCmd {
             } => (
                 db.with_lock(|| {
                     conn.execute(
-                        "INSERT INTO health_events VALUES (?, ?, ?, ?)",
+                        "INSERT INTO health_events (id, source, ts_epoch, ts, status)
+                         VALUES (nextval('health_events_id_seq'), ?, ?, ?, ?)",
                         params![source, ts_epoch, ts, status],
                     )?;
                     Ok(())
@@ -177,6 +179,19 @@ impl WriteCmd {
                 reply,
             ),
         };
+        // A read-only connection opened by another process (direct-mode
+        // CLI/TUI, `Db::open_ro`) can only see what's checkpointed into the
+        // main file — never this connection's WAL. Left to `DuckDB`'s own
+        // size-based auto-checkpoint, that can go a long time without
+        // happening for this app's small, infrequent writes, so a
+        // concurrent direct-mode read appears stuck while the daemon runs
+        // (spec: data-storage — concurrent access safety). Checkpointing
+        // here, before the reply, means a caller's successful `.await`
+        // durably guarantees visibility, not just a race with it; writes
+        // are minutes apart, so the extra fsync is free at this scale.
+        let result = result.and_then(|()| {
+            db.with_lock(|| conn.execute_batch("CHECKPOINT").map_err(Into::into))
+        });
         let _ = reply.send(result);
     }
 
@@ -238,7 +253,15 @@ fn now() -> (f64, String) {
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE SEQUENCE IF NOT EXISTS readings_id_seq;
+        CREATE SEQUENCE IF NOT EXISTS fetch_logs_id_seq;
+        CREATE SEQUENCE IF NOT EXISTS health_events_id_seq;
+        -- Explicit monotonic id on every table, not just `readings`: two
+        -- rows can share the same millisecond `ts_epoch` (e.g. every source
+        -- fetched at daemon startup), and `rowid` is a physical-storage
+        -- identifier `DuckDB` doesn't guarantee as a stable ordering key —
+        -- `id` is the only reliable tie-break for `ORDER BY ts_epoch DESC`.
         CREATE TABLE IF NOT EXISTS readings (
+            id     BIGINT NOT NULL,
             source VARCHAR NOT NULL,
             value  VARCHAR NOT NULL,
             unit   VARCHAR,
@@ -246,6 +269,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             ts     VARCHAR NOT NULL
         );
         CREATE TABLE IF NOT EXISTS fetch_logs (
+            id          BIGINT NOT NULL,
             source      VARCHAR NOT NULL,
             ts_epoch    DOUBLE NOT NULL,
             ts          VARCHAR NOT NULL,
@@ -255,18 +279,12 @@ fn create_schema(conn: &Connection) -> Result<()> {
             value       VARCHAR
         );
         CREATE TABLE IF NOT EXISTS health_events (
+            id       BIGINT NOT NULL,
             source   VARCHAR NOT NULL,
             ts_epoch DOUBLE NOT NULL,
             ts       VARCHAR NOT NULL,
             status   VARCHAR NOT NULL
         );
-        ALTER TABLE fetch_logs ADD COLUMN IF NOT EXISTS value VARCHAR;
-        -- Explicit monotonic id, replacing `rowid` (a physical-storage
-        -- identifier `DuckDB` doesn't guarantee as a stable ordering key) for
-        -- tie-breaking same-timestamp readings. NULL on rows inserted before
-        -- this column existed; `latest_values`/`history` fall back to `rowid`
-        -- for those via COALESCE, so old data keeps its previous ordering.
-        ALTER TABLE readings ADD COLUMN IF NOT EXISTS id BIGINT;
         CREATE INDEX IF NOT EXISTS idx_readings_source_ts ON readings(source, ts_epoch);
         CREATE INDEX IF NOT EXISTS idx_fetch_logs_source_ts ON fetch_logs(source, ts_epoch);
         CREATE INDEX IF NOT EXISTS idx_health_events_source_ts ON health_events(source, ts_epoch);",
@@ -370,7 +388,9 @@ impl Db {
                 "DROP TABLE IF EXISTS readings;
                 DROP TABLE IF EXISTS fetch_logs;
                 DROP TABLE IF EXISTS health_events;
-                DROP SEQUENCE IF EXISTS readings_id_seq;",
+                DROP SEQUENCE IF EXISTS readings_id_seq;
+                DROP SEQUENCE IF EXISTS fetch_logs_id_seq;
+                DROP SEQUENCE IF EXISTS health_events_id_seq;",
             )?;
             create_schema(conn)
         })
@@ -543,7 +563,8 @@ impl Db {
         }
         let (_guard, conn) = self.connect_async().await?;
         conn.execute(
-            "INSERT INTO fetch_logs VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO fetch_logs (id, source, ts_epoch, ts, ok, duration_ms, error, value)
+             VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?, ?)",
             params![source, ts_epoch, ts, ok, duration_ms, error, value],
         )?;
         Ok(())
@@ -551,8 +572,11 @@ impl Db {
 
     pub async fn last_health(&self, source: &str) -> Result<Option<String>> {
         let (_guard, conn) = self.connect_async().await?;
+        // `id DESC` breaks ties between events sharing the same millisecond
+        // `ts_epoch`; `ORDER BY ts_epoch DESC` alone picked an arbitrary tied
+        // row, not necessarily the actually-latest one.
         let mut stmt = conn.prepare(
-            "SELECT status FROM health_events WHERE source = ? ORDER BY ts_epoch DESC LIMIT 1",
+            "SELECT status FROM health_events WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![source])?;
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
@@ -576,21 +600,19 @@ impl Db {
         }
         let (_guard, conn) = self.connect_async().await?;
         conn.execute(
-            "INSERT INTO health_events VALUES (?, ?, ?, ?)",
+            "INSERT INTO health_events (id, source, ts_epoch, ts, status)
+             VALUES (nextval('health_events_id_seq'), ?, ?, ?, ?)",
             params![source, ts_epoch, ts, status],
         )?;
         Ok(())
     }
 
-    /// Latest reading per source: highest `ts_epoch`, with
-    /// `COALESCE(id, rowid)` only as a tie-break for same-timestamp rows
-    /// (matching `history`'s own ordering). `ts_epoch` must be the primary
-    /// key here, not `COALESCE(id, rowid)` alone — a row inserted before the
-    /// `id` column existed keeps `id = NULL` and falls back to its `rowid`,
-    /// a physical offset that isn't comparable to the fresh `id` sequence
-    /// newer rows get; ordering by that value directly stuck this query on
-    /// the last pre-migration row per source forever, regardless of how
-    /// many newer readings came in after.
+    /// Latest reading per source: highest `ts_epoch`, with `id` (a
+    /// monotonic sequence, not `rowid` — a physical-storage offset `DuckDB`
+    /// doesn't guarantee as a stable ordering key) as a tie-break for
+    /// same-timestamp rows (matching `history`'s own ordering) — readings
+    /// for different sources routinely land in the same millisecond (e.g.
+    /// every source fetched at daemon startup).
     pub async fn latest_values(&self) -> Result<Vec<ReadingRow>> {
         let (_guard, conn) = self.connect_async().await?;
         let mut stmt = conn.prepare(
@@ -598,7 +620,7 @@ impl Db {
                 SELECT source, value, unit, ts_epoch, ts,
                        ROW_NUMBER() OVER (
                            PARTITION BY source
-                           ORDER BY ts_epoch DESC, COALESCE(id, rowid) DESC
+                           ORDER BY ts_epoch DESC, id DESC
                        ) AS rn
                 FROM readings
              ) sub
@@ -635,7 +657,7 @@ impl Db {
         let (_guard, conn) = self.connect_async().await?;
         let mut stmt = conn.prepare(
             "SELECT source, value, unit, ts_epoch, ts FROM (
-                SELECT source, value, unit, ts_epoch, ts, COALESCE(id, rowid) AS ord FROM readings
+                SELECT source, value, unit, ts_epoch, ts, id AS ord FROM readings
                 WHERE source = ?
                   AND (?::DOUBLE IS NULL OR ts_epoch >= ?::DOUBLE)
                   AND (?::DOUBLE IS NULL OR ts_epoch <= ?::DOUBLE)
@@ -660,10 +682,14 @@ impl Db {
 
     pub async fn logs(&self, source: Option<&str>, limit: i64) -> Result<Vec<LogRow>> {
         let (_guard, conn) = self.connect_async().await?;
+        // `id DESC` breaks ties between attempts sharing the same
+        // millisecond `ts_epoch` — callers (e.g. the consecutive-failure
+        // count in `health::compute`) rely on this being true newest-first
+        // order, not an arbitrary tied order.
         let mut stmt = conn.prepare(
             "SELECT source, ts_epoch, ts, ok, duration_ms, error, value FROM fetch_logs
              WHERE (?::VARCHAR IS NULL OR source = ?::VARCHAR)
-             ORDER BY ts_epoch DESC LIMIT ?",
+             ORDER BY ts_epoch DESC, id DESC LIMIT ?",
         )?;
         let rows = stmt
             .query_map(params![source, source, limit], |r| {
@@ -689,7 +715,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT source, ts_epoch, ts, ok, duration_ms, error, value FROM fetch_logs
              WHERE source = ? AND ok
-             ORDER BY ts_epoch DESC LIMIT 1",
+             ORDER BY ts_epoch DESC, id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![source])?;
         Ok(rows
@@ -741,7 +767,77 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
-    use super::panic_message;
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// A separate process's read-only connection (direct-mode CLI/TUI) must
+    /// see a write as soon as the daemon's `insert_*` call returns success —
+    /// not only after the daemon stops. Without a checkpoint after every
+    /// write, `DuckDB`'s read-only mode can only see what was checkpointed
+    /// into the main file, leaving concurrent reads stuck on stale data.
+    #[tokio::test]
+    async fn readonly_reader_sees_a_write_without_the_writer_stopping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let writer = Db::open_rw_daemon(&path).unwrap();
+        writer.insert_reading("cpu", "42", None).await.unwrap();
+
+        let reader = Db::open_ro(&path).unwrap();
+        let latest = reader.latest_values().await.unwrap();
+        assert_eq!(latest.len(), 1, "read-only reader should already see the write");
+        assert_eq!(latest[0].value, "42");
+    }
+
+    /// Two attempts landing in the same millisecond (routine — every source
+    /// fires at daemon startup) must still resolve to a deterministic order:
+    /// `id DESC`, not whatever order `DuckDB` happens to return equal
+    /// `ts_epoch` rows in.
+    #[tokio::test]
+    async fn logs_and_last_success_break_ts_epoch_ties_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO fetch_logs (id, source, ts_epoch, ts, ok, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'a', 1000.0, 't', true, 1, NULL, 'first');
+                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, ok, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'a', 1000.0, 't', true, 1, NULL, 'second');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let logs = db.logs(Some("a"), 10).await.unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(
+            logs[0].value.as_deref(),
+            Some("second"),
+            "the higher-id row should sort first despite an equal ts_epoch"
+        );
+        assert_eq!(logs[1].value.as_deref(), Some("first"));
+
+        let last = db.last_success("a").await.unwrap().unwrap();
+        assert_eq!(last.value.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn last_health_breaks_ts_epoch_ties_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO health_events (id, source, ts_epoch, ts, status)
+                 VALUES (nextval('health_events_id_seq'), 'a', 1000.0, 't', 'failing');
+                 INSERT INTO health_events (id, source, ts_epoch, ts, status)
+                 VALUES (nextval('health_events_id_seq'), 'a', 1000.0, 't', 'healthy');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let status = db.last_health("a").await.unwrap();
+        assert_eq!(status.as_deref(), Some("healthy"));
+    }
 
     #[test]
     fn panic_message_extracts_str_payload() {

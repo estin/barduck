@@ -156,16 +156,6 @@ async fn loop_source(
     let mut setup_done = src.setup.is_none();
 
     let mut schedule = Schedule::new(&src);
-    match &schedule {
-        Schedule::Interval {
-            effective_interval,
-            retry_interval,
-            next,
-        } => {
-            tracing::debug!("Source next: {:?}", next);
-        }
-        _ => {}
-    };
     loop {
         match &mut shutdown {
             Some(sd) => {
