@@ -24,23 +24,28 @@ enum Schedule {
 
 impl Schedule {
     /// Built once per source at collector startup; the cron string was
-    /// already validated at config load, so parsing here cannot fail.
-    fn new(src: &SourceCfg) -> Self {
+    /// already validated at config load, so parsing here cannot fail. An
+    /// interval-scheduled source's first tick is due immediately unless its
+    /// last recorded success is still fresh, in which case it's deferred
+    /// until the remaining freshness window elapses instead of firing
+    /// unconditionally (spec: data-collection — Per-source schedules: daemon
+    /// startup scheduled by freshness).
+    async fn new(db: &Db, src: &SourceCfg) -> Result<Self> {
         if let Some(expr) = &src.cron {
             #[allow(clippy::expect_used)]
             // validated at config load (spec: source-configuration — cron schedule)
             let cron: Cron = expr
                 .parse()
                 .expect("cron expression validated at config load");
-            Schedule::Cron(Box::new(cron))
+            Ok(Schedule::Cron(Box::new(cron)))
         } else {
-            Schedule::Interval {
-                effective_interval: src.effective_interval(),
+            let effective_interval = src.effective_interval();
+            let next = first_interval_tick(db, &src.name, effective_interval).await?;
+            Ok(Schedule::Interval {
+                effective_interval,
                 retry_interval: src.effective_retry_interval(),
-                // Fires immediately, matching the collector's long-standing
-                // "fetch right away at startup" behavior.
-                next: tokio::time::Instant::now(),
-            }
+                next,
+            })
         }
     }
 
@@ -90,6 +95,31 @@ fn next_cron_delay(cron: &Cron, now: chrono::DateTime<chrono::Utc>) -> std::time
         .ok()
         .and_then(|next| (next - now).to_std().ok())
         .unwrap_or(std::time::Duration::from_mins(1))
+}
+
+/// An interval-scheduled source's first tick after collector startup: due
+/// immediately if it has never succeeded, or its last success is already at
+/// least `interval` old; otherwise deferred until the remaining freshness
+/// window elapses (spec: data-collection — Per-source schedules: daemon
+/// startup scheduled by freshness, not unconditional).
+async fn first_interval_tick(
+    db: &Db,
+    source: &str,
+    interval: std::time::Duration,
+) -> Result<tokio::time::Instant> {
+    let Some(last) = db.last_success(source).await? else {
+        return Ok(tokio::time::Instant::now());
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs_f64();
+    let age = now - last.ts_epoch;
+    let interval_secs = interval.as_secs_f64();
+    Ok(if age >= interval_secs {
+        tokio::time::Instant::now()
+    } else {
+        tokio::time::Instant::now() + std::time::Duration::from_secs_f64(interval_secs - age)
+    })
 }
 
 /// Spawns one independent task per source so a hanging fetch cannot block
@@ -155,7 +185,7 @@ async fn loop_source(
     // is retried on this source's schedule tick instead of fetching.
     let mut setup_done = src.setup.is_none();
 
-    let mut schedule = Schedule::new(&src);
+    let mut schedule = Schedule::new(&db, &src).await?;
     loop {
         match &mut shutdown {
             Some(sd) => {
@@ -349,5 +379,83 @@ mod tests {
         let far_future = chrono::DateTime::<chrono::Utc>::MAX_UTC;
         let delay = next_cron_delay(&cron, far_future);
         assert_eq!(delay, std::time::Duration::from_mins(1));
+    }
+
+    fn cron_source(name: &str, expr: &str) -> SourceCfg {
+        toml::from_str(&format!(
+            "name = \"{name}\"\ntype = \"script\"\ncommand = \"echo 0\"\ncron = \"{expr}\"\n"
+        ))
+        .unwrap()
+    }
+
+    /// (spec: data-collection — Per-source schedules: daemon startup
+    /// scheduled by freshness, not unconditional)
+    #[tokio::test]
+    async fn first_tick_is_immediate_when_source_never_succeeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let before = tokio::time::Instant::now();
+
+        let next = first_interval_tick(&db, "cpu", std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert!(
+            next.saturating_duration_since(before) < std::time::Duration::from_millis(300),
+            "a source with no prior success must be due immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_tick_is_deferred_when_last_success_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_log("cpu", true, 1, None, Some("42")).await.unwrap();
+
+        let before = tokio::time::Instant::now();
+        let next = first_interval_tick(&db, "cpu", std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        let wait = next.saturating_duration_since(before);
+        assert!(
+            wait > std::time::Duration::from_millis(2500),
+            "a fresh source's first fetch should be deferred close to the full interval, got {wait:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_tick_is_immediate_when_last_success_is_older_than_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_log("cpu", true, 1, None, Some("42")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let before = tokio::time::Instant::now();
+        let next = first_interval_tick(&db, "cpu", std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert!(
+            next.saturating_duration_since(before) < std::time::Duration::from_millis(300),
+            "a source whose last success is already older than its interval must be due immediately"
+        );
+    }
+
+    /// Cron scheduling never consults freshness at startup — it always waits
+    /// for its next absolute occurrence regardless of `last_success` (spec:
+    /// data-collection — cron-scheduled source ignores fetch outcome).
+    #[tokio::test]
+    async fn schedule_new_ignores_freshness_for_cron_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_log("backup", true, 1, None, Some("ok"))
+            .await
+            .unwrap();
+        let src = cron_source("backup", "0 0 3 * * *");
+
+        let schedule = Schedule::new(&db, &src).await.unwrap();
+
+        assert!(matches!(schedule, Schedule::Cron(_)));
     }
 }
