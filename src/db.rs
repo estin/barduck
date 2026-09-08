@@ -503,15 +503,28 @@ impl Db {
         Ok(())
     }
 
-    /// Latest reading per source.
+    /// Latest reading per source: highest `ts_epoch`, with
+    /// `COALESCE(id, rowid)` only as a tie-break for same-timestamp rows
+    /// (matching `history`'s own ordering). `ts_epoch` must be the primary
+    /// key here, not `COALESCE(id, rowid)` alone — a row inserted before the
+    /// `id` column existed keeps `id = NULL` and falls back to its `rowid`,
+    /// a physical offset that isn't comparable to the fresh `id` sequence
+    /// newer rows get; ordering by that value directly stuck this query on
+    /// the last pre-migration row per source forever, regardless of how
+    /// many newer readings came in after.
     pub async fn latest_values(&self) -> Result<Vec<ReadingRow>> {
         let (_guard, conn) = self.connect_async().await?;
         let mut stmt = conn.prepare(
-            "SELECT r.source, r.value, r.unit, r.ts_epoch, r.ts
-             FROM readings r
-             JOIN (SELECT source, MAX(COALESCE(id, rowid)) AS rid FROM readings GROUP BY source) t
-               ON COALESCE(r.id, r.rowid) = t.rid
-             ORDER BY r.source",
+            "SELECT source, value, unit, ts_epoch, ts FROM (
+                SELECT source, value, unit, ts_epoch, ts,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY source
+                           ORDER BY ts_epoch DESC, COALESCE(id, rowid) DESC
+                       ) AS rn
+                FROM readings
+             ) sub
+             WHERE rn = 1
+             ORDER BY source",
         )?;
         let rows = stmt
             .query_map([], |r| {
