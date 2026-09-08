@@ -44,9 +44,19 @@ const CONNECTION_SCRIPT: &str = r"(function () {
         offline: 'var(--status-red-border)'
     };
     var labels = { checking: 'checking…', online: 'online', offline: 'offline' };
+    var banner = document.getElementById('bd-offline-banner');
+    var panels = document.getElementById('bd-panel-wrapper');
     function setState(state) {
         dot.style.backgroundColor = colors[state];
         label.textContent = labels[state];
+        // Shared with `FAVICON_SCRIPT`, which polls this on its own timer
+        // rather than duplicating the ping loop (spec: web-ui — global
+        // connection health indicator: favicon/banner/dim react to offline).
+        document.body.dataset.bdConnection = state;
+        var offline = state === 'offline';
+        banner.hidden = !offline;
+        panels.classList.toggle('opacity-50', offline);
+        panels.classList.toggle('pointer-events-none', offline);
     }
     function ping() {
         fetch('/api/ping', { signal: AbortSignal.timeout(3000) })
@@ -93,6 +103,15 @@ const FAVICON_SCRIPT: &str = r#"(function () {
         );
     }
     function refresh() {
+        // An offline connection overrides whatever health status was last
+        // known — the favicon means "something needs your attention," and a
+        // stale green tab during an outage would be actively misleading
+        // (spec: web-ui — global connection health indicator: favicon turns
+        // red when offline / resumes reflecting health after recovery).
+        if (document.body.dataset.bdConnection === 'offline') {
+            link.href = svgFor(colors.red);
+            return;
+        }
         var el = document.getElementById('bd-status');
         var status = (el && el.dataset.status) || 'green';
         link.href = svgFor(colors[status] || colors.green);
@@ -169,6 +188,9 @@ pub async fn dashboard(cx: &Cx) -> Result {
                     let _t = tick;
                     raw!("(globalThis.__bdTick ??= setInterval(() => ${_t}.increment(), 5000), 'tick')", "tick")
                 }) style="display:none"></span>
+                <div id="bd-offline-banner" hidden="" class="px-4 py-2 text-sm font-medium text-center" style="border-bottom:1px solid var(--status-red-border);background-color:var(--status-red-bg);color:var(--status-red-fg)">
+                    "Connection lost — retrying…"
+                </div>
                 <div class="max-w-5xl mx-auto p-6">
                     <h1 class="text-xl font-bold mb-4 text-foreground flex flex-wrap items-center gap-2">
                         <a href="/" class="text-foreground no-underline hover:underline">"barduck v"(config::VERSION)</a>
@@ -191,7 +213,7 @@ pub async fn dashboard(cx: &Cx) -> Result {
                             </svg>
                         )
                     </h1>
-                    <div>
+                    <div id="bd-panel-wrapper">
                         panels_grid(tick: $(tick.get()))
                     </div>
                     <footer class="mt-6 text-xs text-muted-foreground">

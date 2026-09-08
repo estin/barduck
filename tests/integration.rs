@@ -1249,6 +1249,68 @@ async fn dashboard_includes_connection_indicator() {
     );
 }
 
+/// (spec: web-ui — global connection health indicator: favicon turns red
+/// when offline, offline banner and dim shown/cleared)
+#[tokio::test]
+async fn dashboard_includes_offline_banner_and_dim_toggle() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let (addr, _server) = test_server();
+    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // Banner exists, starts hidden, and is styled with the status-red tokens
+    // rather than a raw hardcoded color (spec: web-ui — consistent
+    // token-based visual theme).
+    assert!(
+        page.contains(r#"id="bd-offline-banner""#),
+        "offline banner element expected"
+    );
+    assert!(
+        page.contains(r#"id="bd-offline-banner" hidden="""#),
+        "offline banner should start hidden"
+    );
+    assert!(
+        page.contains("--status-red-border") && page.contains("--status-red-bg"),
+        "offline banner should be styled with status-red tokens"
+    );
+    // Panel wrapper exists as the dim-toggle hook.
+    assert!(
+        page.contains(r#"id="bd-panel-wrapper""#),
+        "panel wrapper hook for dimming expected"
+    );
+    // The connection script toggles the banner/dim/favicon-flag together.
+    assert!(
+        page.contains("document.body.dataset.bdConnection = state"),
+        "connection script should publish state for the favicon script to read"
+    );
+    assert!(
+        page.contains("banner.hidden = !offline"),
+        "connection script should toggle the offline banner"
+    );
+    assert!(
+        page.contains("classList.toggle('opacity-50', offline)"),
+        "connection script should dim the panel wrapper when offline"
+    );
+    // The favicon script checks the same shared flag before falling back to
+    // the health-derived status.
+    assert!(
+        page.contains("document.body.dataset.bdConnection === 'offline'"),
+        "favicon script should override to red when offline"
+    );
+}
+
 /// (spec: web-ui — light/dark theme toggle; responsive layout for small viewports)
 #[tokio::test]
 async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() {
@@ -1447,13 +1509,19 @@ rows = [
     );
     // Never colored: no status_style-style border/background/text override.
     // Checked as the concrete `<property>:var(--status-...)` style pattern,
-    // not a bare `--status-` substring: the page-wide favicon script now
-    // legitimately references `--status-*` custom property *names* as JS
-    // string literals (spec: web-ui — dark theme uses moderated contrast and
-    // desaturated status colors) on every page regardless of content, which
-    // a bare substring check would wrongly trip on here.
+    // not a bare `--status-` substring, and past the page-wide offline
+    // banner (spec: web-ui — global connection health indicator: offline
+    // banner) — both legitimately reference `--status-red-*` on every page
+    // regardless of content, which a bare/page-wide check would wrongly
+    // trip on here.
+    let banner_start = html.find(r#"id="bd-offline-banner""#).expect("offline banner expected");
+    let banner_end = html[banner_start..]
+        .find("</div>")
+        .map_or(html.len(), |e| banner_start + e + "</div>".len());
+    let mut scoped = html.clone();
+    scoped.replace_range(banner_start..banner_end, "");
     assert!(
-        !html.contains("color:var(--status-"),
+        !scoped.contains("color:var(--status-"),
         "a text panel's card must never carry a health/threshold color"
     );
 }
