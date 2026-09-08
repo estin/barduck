@@ -1,8 +1,12 @@
 #![allow(clippy::cast_precision_loss)]
 
-use crate::{config::Config, db::Db};
+use crate::{
+    config::{Config, SourceCfg},
+    db::Db,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,15 +49,15 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
     let last_success = db.last_success(source).await?;
     let last_success_ts = last_success.as_ref().map(|l| l.ts.clone());
 
-    let stale_after = cfg.stale_after.as_secs_f64();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs_f64();
     let last_ok_age = last_success.map_or(f64::INFINITY, |l| now - l.ts_epoch);
+    let source_cfg = cfg.sources.iter().find(|s| s.name == source);
 
     let status = if failures >= cfg.failure_threshold {
         Health::Failing
-    } else if last_ok_age > stale_after {
+    } else if is_stale(last_ok_age, source_cfg, cfg.interval) {
         Health::Stale
     } else {
         Health::Healthy
@@ -65,4 +69,65 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
         consecutive_failures: failures,
         last_success_ts,
     })
+}
+
+/// Staleness derived from the source's own schedule, not a global window
+/// (spec: data-collection — Health status derived from fetch outcomes): a
+/// cron source has no fixed period to derive a window from, so it's stale
+/// only until its first success (`last_ok_age` infinite); an interval source
+/// is stale once it has missed its second expected call. `fallback_interval`
+/// covers a source name not found in `cfg.sources` (shouldn't happen for a
+/// validated config, but callers pass one regardless).
+fn is_stale(last_ok_age: f64, source: Option<&SourceCfg>, fallback_interval: Duration) -> bool {
+    let interval = match source {
+        Some(s) if s.cron.is_some() => return last_ok_age.is_infinite(),
+        Some(s) => s.effective_interval(),
+        None => fallback_interval,
+    };
+    last_ok_age > 2.0 * interval.as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn source(name: &str, interval: Option<Duration>, cron: Option<&str>) -> SourceCfg {
+        toml::from_str(&format!(
+            "name = \"{name}\"\ntype = \"script\"\ncommand = \"echo 0\"\n{}{}",
+            interval.map(|d| format!("interval = \"{}\"\n", humantime::format_duration(d))).unwrap_or_default(),
+            cron.map(|c| format!("cron = \"{c}\"\n")).unwrap_or_default(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn interval_source_within_window_is_not_stale() {
+        let s = source("cpu", Some(Duration::from_mins(5)), None);
+        assert!(!is_stale(6.0 * 60.0, Some(&s), Duration::from_mins(5)));
+    }
+
+    #[test]
+    fn interval_source_past_second_missed_call_is_stale() {
+        let s = source("cpu", Some(Duration::from_mins(5)), None);
+        assert!(is_stale(11.0 * 60.0, Some(&s), Duration::from_mins(5)));
+    }
+
+    #[test]
+    fn cron_source_with_no_success_yet_is_stale() {
+        let s = source("backup", None, Some("0 0 3 * * *"));
+        assert!(is_stale(f64::INFINITY, Some(&s), Duration::from_mins(5)));
+    }
+
+    #[test]
+    fn cron_source_with_an_old_success_is_not_stale() {
+        let s = source("backup", None, Some("0 0 3 * * *"));
+        assert!(!is_stale(365.0 * 24.0 * 60.0 * 60.0, Some(&s), Duration::from_mins(5)));
+    }
+
+    #[test]
+    fn unknown_source_falls_back_to_the_given_interval() {
+        assert!(is_stale(11.0 * 60.0, None, Duration::from_mins(5)));
+        assert!(!is_stale(6.0 * 60.0, None, Duration::from_mins(5)));
+    }
 }

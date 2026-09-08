@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 
 use barduck::{AppState, build_router_with_bundle, collect_once, config, db::Db, health, query::Backend};
+use fs2::FileExt as _;
 use std::sync::{Arc, OnceLock};
 
 /// The asset bundle for page-rendering tests, built once per test-binary run.
@@ -14,10 +15,27 @@ use std::sync::{Arc, OnceLock};
 /// `target/debug/assets`; loading that explicitly via `load_dir` is what
 /// lets a test render `dashboard()`/`source_logs()` (both reference bundled
 /// assets: the Tailwind stylesheet, the Geist font) without panicking.
+///
+/// `cargo nextest` runs every test as its own process, so every
+/// page-rendering test in this binary calls this function in a *separate*
+/// process running in parallel with the others — the `OnceLock` above only
+/// dedups within one process. Two concurrent `topcoat asset bundle`
+/// invocations writing the same `target/debug/assets` directory can
+/// interleave, leaving a manifest that's missing (or has a torn/inconsistent
+/// entry for) an asset a reader expects — the same "concurrent writers can
+/// see torn state" hazard `src/db.rs`'s own advisory lock exists for, just
+/// in this CLI's asset bundler instead of `DuckDB`. So the bundle-and-load
+/// step is itself guarded by a cross-process advisory lock.
 fn test_asset_bundle() -> Option<topcoat::asset::AssetBundle> {
     static BUNDLE: OnceLock<Option<topcoat::asset::AssetBundle>> = OnceLock::new();
     BUNDLE
         .get_or_init(|| {
+            let target_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            std::fs::create_dir_all(&target_dir).expect("creating target directory");
+            let lock_file = std::fs::File::create(target_dir.join(".topcoat-asset-bundle.lock"))
+                .expect("creating asset-bundle lockfile");
+            lock_file.lock_exclusive().expect("locking asset-bundle lockfile");
+
             let status = std::process::Command::new("topcoat")
                 .args(["asset", "bundle"])
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -26,7 +44,10 @@ fn test_asset_bundle() -> Option<topcoat::asset::AssetBundle> {
                 eprintln!("topcoat asset bundle failed ({status:?}); page-rendering tests will fail");
             }
             let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/assets");
-            topcoat::asset::AssetBundle::load_dir(dir).ok()
+            let bundle = topcoat::asset::AssetBundle::load_dir(dir).ok();
+
+            let _ = lock_file.unlock();
+            bundle
         })
         .clone()
 }
@@ -61,7 +82,6 @@ fn test_config(db_path: &std::path::Path, http_addr: &str, marker: &std::path::P
         r#"
 database_path = "{db}"
 failure_threshold = 1
-stale_after = "30m"
 
 [[sources]]
 name = "echo"

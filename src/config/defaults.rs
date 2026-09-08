@@ -23,9 +23,6 @@ pub(crate) fn default_retry_interval() -> Duration {
 pub(crate) fn default_threshold() -> u32 {
     3
 }
-pub(crate) fn default_stale() -> Duration {
-    Duration::from_mins(30)
-}
 pub(crate) fn default_history_points() -> u32 {
     30
 }
@@ -60,9 +57,6 @@ pub(crate) fn apply_env_overrides_from(cfg: &mut Config, lookup: impl Fn(&str) -
     }
     if let Some(v) = lookup("BARDUCK_FAILURE_THRESHOLD") {
         cfg.failure_threshold = parse_env_u32("BARDUCK_FAILURE_THRESHOLD", &v)?;
-    }
-    if let Some(v) = lookup("BARDUCK_STALE_AFTER") {
-        cfg.stale_after = parse_env_duration("BARDUCK_STALE_AFTER", &v)?;
     }
     if let Some(v) = lookup("BARDUCK_HISTORY_POINTS") {
         cfg.history_points = parse_env_u32("BARDUCK_HISTORY_POINTS", &v)?;

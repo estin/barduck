@@ -9,10 +9,9 @@
 database_path = "dashboard.duckdb"
 listen = "127.0.0.1:18420"
 
-# A source flips to "failing" after this many consecutive failures...
+# A source flips to "failing" after this many consecutive failures, and to
+# "stale" once it has missed its second expected call on its own schedule.
 failure_threshold = 2
-# ...and to "stale" when its last success is older than this (humantime, e.g. "30s", "5m", "1h").
-stale_after = "1m"
 
 [[sources]]
 name = "disk-root"

@@ -104,8 +104,10 @@ Then:
 - **Config-relative commands** — `load-average` runs `scripts/load-average.sh`
   via a relative path; it resolves against `demo/` (this config file's
   directory) no matter where the daemon was launched from.
-- **Stale source** — stop the mock server (`kill %1`); after 60s without a
-  success, `bank-balance` and `work-hours` turn amber (`stale`).
+- **Stale source** — stop the mock server (`kill %1`); a source turns amber
+  (`stale`) once it has missed its second expected call, so `bank-balance`
+  (`interval = "5s"`) turns stale after ~10s and `work-hours`
+  (`interval = "10s"`) after ~20s.
 - **Restart persistence** — Ctrl-C the daemon, restart it: history is still
   there.
 

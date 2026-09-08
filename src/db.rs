@@ -45,6 +45,17 @@ pub struct Db {
 
 struct DbLock(#[allow(dead_code)] File);
 
+/// Best-effort text for a `catch_unwind` payload: panics from `panic!("{}", ...)`
+/// and friends carry a `&str` or `String`; anything else falls back to a
+/// generic label rather than failing to log at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
+}
+
 fn is_lock_conflict(e: &anyhow::Error) -> bool {
     let msg = format!("{e:#}");
     msg.contains("Conflicting lock") || msg.contains("Could not read enough bytes")
@@ -253,7 +264,17 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
             }
         };
         while let Some(cmd) = rx.blocking_recv() {
-            cmd.run(&db, &conn);
+            // One daemon-wide writer serves every source (spec: data-storage
+            // — single daemon writer), so a panic here — a bug tripped by
+            // one source's unusual value — must not unwind out of this loop
+            // and kill the writer thread, or persistence for every other
+            // source dies with it until the daemon restarts (spec:
+            // data-collection — collector resilience). The caller still gets
+            // an error either way: `run`'s reply sender is dropped mid-panic,
+            // which resolves its `oneshot::Receiver` await to an error.
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.run(&db, &conn))) {
+                tracing::error!("db writer: write command panicked: {}", panic_message(&panic));
+            }
         }
     });
     tx
@@ -643,5 +664,28 @@ impl Db {
         conn.execute("DELETE FROM fetch_logs WHERE ts_epoch < ?", params![cutoff_epoch])?;
         conn.execute("DELETE FROM health_events WHERE ts_epoch < ?", params![cutoff_epoch])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panic_message;
+
+    #[test]
+    fn panic_message_extracts_str_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&*payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_extracts_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("boom"));
+        assert_eq!(panic_message(&*payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_other_payloads() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(panic_message(&*payload), "<non-string panic payload>");
     }
 }

@@ -20,7 +20,7 @@ pub use source::{
 
 use defaults::{
     apply_env_overrides, default_config_dir, default_db_path, default_history_points,
-    default_interval, default_listen, default_stale, default_threshold, default_tui_width,
+    default_interval, default_listen, default_threshold, default_tui_width,
 };
 use validation::{validate_cell, validate_source};
 
@@ -44,9 +44,6 @@ pub struct Config {
     pub interval: Duration,
     #[serde(default = "default_threshold")]
     pub failure_threshold: u32,
-    /// Humantime string (e.g. `"30m"`).
-    #[serde(default = "default_stale", with = "humantime_serde")]
-    pub stale_after: Duration,
     /// Default number of recent readings shown in a banded source's web UI
     /// history bar; overridable per source via `SourceCfg::history_points`.
     #[serde(default = "default_history_points")]
@@ -79,7 +76,6 @@ impl Default for Config {
             listen: default_listen(),
             interval: default_interval(),
             failure_threshold: default_threshold(),
-            stale_after: default_stale(),
             history_points: default_history_points(),
             retention: None,
             sources: Vec::new(),
@@ -492,9 +488,9 @@ mod tests {
     #[test]
     fn unparseable_env_override_rejected() {
         let mut cfg = Config::default();
-        let err = apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_STALE_AFTER", "not-a-duration")]))
+        let err = apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_INTERVAL", "not-a-duration")]))
             .unwrap_err();
-        assert!(err.to_string().contains("BARDUCK_STALE_AFTER"), "error should name the variable: {err}");
+        assert!(err.to_string().contains("BARDUCK_INTERVAL"), "error should name the variable: {err}");
     }
 
     #[test]
