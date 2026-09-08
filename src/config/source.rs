@@ -49,6 +49,21 @@ impl Level {
     }
 }
 
+/// How a source's fetched value is stored (spec: source-configuration —
+/// configurable stored value type): `string` (default) leaves storage
+/// unchanged; `bigint`/`double`/`json` additionally populate the matching
+/// typed column on `readings` alongside the existing string value.
+/// Orthogonal to `format`, which only controls UI rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValueType {
+    #[default]
+    String,
+    Bigint,
+    Double,
+    Json,
+}
+
 /// Which UI(s) a source may display in (spec: source-configuration —
 /// per-source view visibility).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -177,6 +192,10 @@ pub struct SourceCfg {
     /// its schedule regardless (spec: source-configuration — per-source view
     /// visibility).
     pub show_in: Option<View>,
+    /// How to store the fetched value: `string` (default), `bigint`,
+    /// `double`, or `json` (spec: source-configuration — configurable
+    /// stored value type).
+    pub value_type: Option<ValueType>,
     // http
     pub url: Option<String>,
     pub selector: Option<String>,
@@ -215,6 +234,14 @@ impl SourceCfg {
             None | Some(View::All) => true,
             Some(v) => v == view,
         }
+    }
+
+    /// The type to store this source's readings as: its declared
+    /// `value_type`, or the default `string` when not set (spec:
+    /// source-configuration — configurable stored value type).
+    #[must_use]
+    pub fn effective_value_type(&self) -> ValueType {
+        self.value_type.unwrap_or_default()
     }
 }
 

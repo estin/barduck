@@ -543,13 +543,15 @@ async fn web_ui_history_bar_reflects_recent_readings() {
     let db = Db::open_rw(&db_path).unwrap();
     // cpu: exactly 3 readings for history_points = 3 -> green, yellow, red, no padding.
     for v in ["40", "70", "95"] {
-        db.insert_reading("cpu", v, None).await.unwrap();
+        db.insert_reading("cpu", v, None, None, None, None).await.unwrap();
     }
     // sparse: only 2 of 5 history_points -> 3 neutral padding segments, then green, red.
     for v in ["40", "95"] {
-        db.insert_reading("sparse", v, None).await.unwrap();
+        db.insert_reading("sparse", v, None, None, None, None).await.unwrap();
     }
-    db.insert_reading("plain", "hello", None).await.unwrap();
+    db.insert_reading("plain", "hello", None, None, None, None)
+        .await
+        .unwrap();
 
     let state = AppState {
         db: db.clone(),
@@ -2006,4 +2008,59 @@ format = "markdown"
         !filtered_stdout.contains("notes"),
         "--no-text should exclude the markdown source entirely"
     );
+}
+
+/// A source's declared `value_type` populates the matching typed column on
+/// `readings`, alongside the unchanged string `value` column (spec:
+/// data-storage — typed value columns; source-configuration — configurable
+/// stored value type).
+#[tokio::test]
+async fn typed_source_stores_matching_typed_column_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = "[[sources]]\nname = \"count\"\ntype = \"script\"\ncommand = \"echo 7\"\nvalue_type = \"bigint\"\n\n\
+                [[sources]]\nname = \"flag\"\ntype = \"script\"\ncommand = \"echo true\"\nvalue_type = \"json\"\n";
+    let cfg: config::Config = toml::from_str(toml).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let conn = duckdb::Connection::open(&db_path).unwrap();
+    let row = |source: &str| -> (String, Option<i64>, Option<f64>, Option<String>) {
+        conn.query_row(
+            "SELECT value, value_bigint, value_double, value_json FROM readings WHERE source = ?",
+            duckdb::params![source],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(row("count"), ("7".to_string(), Some(7), None, None));
+    assert_eq!(
+        row("flag"),
+        ("true".to_string(), None, None, Some("true".to_string()))
+    );
+}
+
+/// A source with no `value_type` keeps producing rows shaped exactly as
+/// before this change: only `value` populated, all three new columns `NULL`
+/// (spec: data-storage — typed value columns).
+#[tokio::test]
+async fn default_value_type_leaves_typed_columns_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = "[[sources]]\nname = \"plain\"\ntype = \"script\"\ncommand = \"echo hello\"\n";
+    let cfg: config::Config = toml::from_str(toml).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let conn = duckdb::Connection::open(&db_path).unwrap();
+    let row: (String, Option<i64>, Option<f64>, Option<String>) = conn
+        .query_row(
+            "SELECT value, value_bigint, value_double, value_json FROM readings WHERE source = 'plain'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("hello".to_string(), None, None, None));
 }

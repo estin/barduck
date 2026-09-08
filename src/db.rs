@@ -70,6 +70,9 @@ enum WriteCmd {
         source: String,
         value: String,
         unit: Option<String>,
+        value_bigint: Option<i64>,
+        value_double: Option<f64>,
+        value_json: Option<String>,
         ts_epoch: f64,
         ts: String,
         reply: oneshot::Sender<Result<()>>,
@@ -106,15 +109,18 @@ impl WriteCmd {
                 source,
                 value,
                 unit,
+                value_bigint,
+                value_double,
+                value_json,
                 ts_epoch,
                 ts,
                 reply,
             } => (
                 db.with_lock(|| {
                     conn.execute(
-                        "INSERT INTO readings (id, source, value, unit, ts_epoch, ts)
-                         VALUES (nextval('readings_id_seq'), ?, ?, ?, ?, ?)",
-                        params![source, value, unit, ts_epoch, ts],
+                        "INSERT INTO readings (id, source, value, unit, ts_epoch, ts, value_bigint, value_double, value_json)
+                         VALUES (nextval('readings_id_seq'), ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))",
+                        params![source, value, unit, ts_epoch, ts, value_bigint, value_double, value_json],
                     )?;
                     Ok(())
                 }),
@@ -266,7 +272,14 @@ fn create_schema(conn: &Connection) -> Result<()> {
             value  VARCHAR NOT NULL,
             unit   VARCHAR,
             ts_epoch DOUBLE NOT NULL,
-            ts     VARCHAR NOT NULL
+            ts     VARCHAR NOT NULL,
+            -- Populated only when the source declares a non-default
+            -- `value_type` (spec: source-configuration — configurable
+            -- stored value type); `value` above is always populated
+            -- regardless, so existing consumers are unaffected.
+            value_bigint BIGINT,
+            value_double DOUBLE,
+            value_json   JSON
         );
         CREATE TABLE IF NOT EXISTS fetch_logs (
             id          BIGINT NOT NULL,
@@ -505,11 +518,15 @@ impl Db {
         f()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_reading(
         &self,
         source: &str,
         value: &str,
         unit: Option<&str>,
+        value_bigint: Option<i64>,
+        value_double: Option<f64>,
+        value_json: Option<&str>,
     ) -> Result<()> {
         let (ts_epoch, ts) = now();
         if let Some(writer) = &self.writer {
@@ -518,6 +535,9 @@ impl Db {
                 source: source.to_string(),
                 value: value.to_string(),
                 unit: unit.map(str::to_string),
+                value_bigint,
+                value_double,
+                value_json: value_json.map(str::to_string),
                 ts_epoch,
                 ts,
                 reply,
@@ -529,9 +549,9 @@ impl Db {
         }
         let (_guard, conn) = self.connect_async().await?;
         conn.execute(
-            "INSERT INTO readings (id, source, value, unit, ts_epoch, ts)
-             VALUES (nextval('readings_id_seq'), ?, ?, ?, ?, ?)",
-            params![source, value, unit, ts_epoch, ts],
+            "INSERT INTO readings (id, source, value, unit, ts_epoch, ts, value_bigint, value_double, value_json)
+             VALUES (nextval('readings_id_seq'), ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))",
+            params![source, value, unit, ts_epoch, ts, value_bigint, value_double, value_json],
         )?;
         Ok(())
     }
@@ -780,7 +800,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.duckdb");
         let writer = Db::open_rw_daemon(&path).unwrap();
-        writer.insert_reading("cpu", "42", None).await.unwrap();
+        writer
+            .insert_reading("cpu", "42", None, None, None, None)
+            .await
+            .unwrap();
 
         let reader = Db::open_ro(&path).unwrap();
         let latest = reader.latest_values().await.unwrap();
@@ -837,6 +860,63 @@ mod tests {
 
         let status = db.last_health("a").await.unwrap();
         assert_eq!(status.as_deref(), Some("healthy"));
+    }
+
+    /// (spec: data-storage — typed value columns)
+    #[tokio::test]
+    async fn readings_table_has_typed_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cols: Vec<String> = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("DESCRIBE readings")?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        for col in ["value_bigint", "value_double", "value_json"] {
+            assert!(cols.contains(&col.to_string()), "missing column {col}: {cols:?}");
+        }
+    }
+
+    /// Each typed insert populates exactly its own typed column, leaving the
+    /// other two `NULL` and `value` populated as always (spec: data-storage —
+    /// typed value columns).
+    #[tokio::test]
+    async fn insert_reading_populates_only_its_declared_typed_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_reading("bi", "42", None, Some(42), None, None)
+            .await
+            .unwrap();
+        db.insert_reading("db", "1.5", None, None, Some(1.5), None)
+            .await
+            .unwrap();
+        db.insert_reading("js", "{\"ok\":true}", None, None, None, Some("{\"ok\":true}"))
+            .await
+            .unwrap();
+        db.insert_reading("plain", "hello", None, None, None, None)
+            .await
+            .unwrap();
+
+        let fetch = |source: &str| -> (Option<i64>, Option<f64>, Option<String>) {
+            db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT value_bigint, value_double, value_json FROM readings WHERE source = ?",
+                    params![source],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap()
+        };
+
+        assert_eq!(fetch("bi"), (Some(42), None, None));
+        assert_eq!(fetch("db"), (None, Some(1.5), None));
+        assert_eq!(fetch("js"), (None, None, Some("{\"ok\":true}".to_string())));
+        assert_eq!(fetch("plain"), (None, None, None));
     }
 
     #[test]

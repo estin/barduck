@@ -14,7 +14,7 @@ mod validation;
 
 pub use layout::{Cell, LayoutCfg, TuiWidth, VALUE_FORMATS, ValueFormat};
 pub use source::{
-    GroupItem, Level, SourceCfg, SourceType, Threshold, View, accent_color, level_for,
+    GroupItem, Level, SourceCfg, SourceType, Threshold, ValueType, View, accent_color, level_for,
     source_visible_in, status_color, visible_items, worst_color,
 };
 
@@ -580,6 +580,38 @@ mod tests {
         assert!(
             err.to_string().contains("BARDUCK_INTERVAL"),
             "error should name the variable: {err}"
+        );
+    }
+
+    #[test]
+    fn value_type_defaults_to_string_when_unset() {
+        let cfg: Config = toml::from_str(&source_toml("")).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.sources[0].value_type, None);
+        assert_eq!(cfg.sources[0].effective_value_type(), ValueType::String);
+    }
+
+    #[test]
+    fn value_type_bigint_double_json_parse() {
+        for (toml_val, expected) in [
+            ("bigint", ValueType::Bigint),
+            ("double", ValueType::Double),
+            ("json", ValueType::Json),
+        ] {
+            let cfg: Config =
+                toml::from_str(&source_toml(&format!("value_type = \"{toml_val}\""))).unwrap();
+            validate(&cfg).unwrap();
+            assert_eq!(cfg.sources[0].effective_value_type(), expected);
+        }
+    }
+
+    #[test]
+    fn value_type_invalid_value_rejected() {
+        let err =
+            toml::from_str::<Config>(&source_toml("value_type = \"decimal\"")).unwrap_err();
+        assert!(
+            err.to_string().contains("decimal"),
+            "error should name the invalid value: {err}"
         );
     }
 

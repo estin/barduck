@@ -287,32 +287,46 @@ pub async fn fetch_once(
     #[allow(clippy::cast_possible_truncation)] // durations fit easily
     let ms = start.elapsed().as_millis() as i64;
     let success = match &outcome {
-        Ok(Ok(value)) => {
-            let stored = db
-                .insert_reading(&src.name, value, src.unit.as_deref())
-                .await;
-            if let Err(e) = &stored {
-                tracing::error!("insert reading `{}`: {e:#}", src.name);
-            }
-            match &stored {
-                Ok(()) => {
-                    if let Err(e) = db.insert_log(&src.name, true, ms, None, Some(value)).await {
-                        tracing::error!("insert log `{}`: {e:#}", src.name);
-                    }
-                    true
-                }
-                Err(e) => {
-                    record_failure(
-                        db,
+        Ok(Ok(value)) => match source::convert_value_type(value, src.effective_value_type()) {
+            Ok((value_bigint, value_double, value_json)) => {
+                let stored = db
+                    .insert_reading(
                         &src.name,
-                        ms,
-                        &format!("fetched but failed to store: {e:#}"),
+                        value,
+                        src.unit.as_deref(),
+                        value_bigint,
+                        value_double,
+                        value_json.as_deref(),
                     )
                     .await;
-                    false
+                if let Err(e) = &stored {
+                    tracing::error!("insert reading `{}`: {e:#}", src.name);
+                }
+                match &stored {
+                    Ok(()) => {
+                        if let Err(e) = db.insert_log(&src.name, true, ms, None, Some(value)).await
+                        {
+                            tracing::error!("insert log `{}`: {e:#}", src.name);
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        record_failure(
+                            db,
+                            &src.name,
+                            ms,
+                            &format!("fetched but failed to store: {e:#}"),
+                        )
+                        .await;
+                        false
+                    }
                 }
             }
-        }
+            Err(e) => {
+                record_failure(db, &src.name, ms, &format!("{e:#}")).await;
+                false
+            }
+        },
         Ok(Err(e)) => {
             record_failure(db, &src.name, ms, &format!("{e:#}")).await;
             false
@@ -386,6 +400,84 @@ mod tests {
             "name = \"{name}\"\ntype = \"script\"\ncommand = \"echo 0\"\ncron = \"{expr}\"\n"
         ))
         .unwrap()
+    }
+
+    fn script_source(name: &str, command: &str, value_type: Option<&str>) -> SourceCfg {
+        let vt = value_type
+            .map(|v| format!("value_type = \"{v}\"\n"))
+            .unwrap_or_default();
+        toml::from_str(&format!(
+            "name = \"{name}\"\ntype = \"script\"\ncommand = \"{command}\"\n{vt}"
+        ))
+        .unwrap()
+    }
+
+    /// A valid value converts and lands in exactly the typed column matching
+    /// the source's declared `value_type` (spec: source-configuration —
+    /// configurable stored value type).
+    #[tokio::test]
+    async fn fetch_once_stores_typed_value_matching_source_value_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = Config::default();
+
+        for (name, command, value_type) in [
+            ("bi", "echo 42", "bigint"),
+            ("db", "echo 98.6", "double"),
+            ("js", "echo true", "json"),
+        ] {
+            let src = script_source(name, command, Some(value_type));
+            let kind = source::build(&src).unwrap();
+            let mut status = "healthy".to_string();
+            let ok = fetch_once(&db, &cfg, &src, &kind, &mut status).await;
+            assert!(ok, "{name} fetch should succeed");
+        }
+
+        let conn = duckdb::Connection::open(dir.path().join("t.duckdb")).unwrap();
+        let row = |source: &str| -> (Option<i64>, Option<f64>, Option<String>) {
+            conn.query_row(
+                "SELECT value_bigint, value_double, value_json FROM readings WHERE source = ?",
+                duckdb::params![source],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(row("bi"), (Some(42), None, None));
+        assert_eq!(row("db"), (None, Some(98.6), None));
+        assert_eq!(row("js"), (None, None, Some("true".to_string())));
+    }
+
+    /// A value that fails to convert to the declared `value_type` is treated
+    /// like any other fetch failure: no reading recorded, failure logged with
+    /// the conversion error (spec: source-configuration — configurable
+    /// stored value type).
+    #[tokio::test]
+    async fn fetch_once_fails_when_value_does_not_convert_to_declared_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = Config::default();
+        let src = script_source("bad", "echo not-a-number", Some("bigint"));
+        let kind = source::build(&src).unwrap();
+        let mut status = "healthy".to_string();
+
+        let ok = fetch_once(&db, &cfg, &src, &kind, &mut status).await;
+
+        assert!(!ok, "a non-convertible value must fail the fetch");
+        assert!(
+            db.latest_values().await.unwrap().is_empty(),
+            "no reading should be recorded"
+        );
+        let logs = db.logs(Some("bad"), 10).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(!logs[0].ok);
+        assert!(
+            logs[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("does not convert to bigint")),
+            "error should name the conversion failure: {:?}",
+            logs[0].error
+        );
     }
 
     /// (spec: data-collection — Per-source schedules: daemon startup

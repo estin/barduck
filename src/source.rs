@@ -1,4 +1,4 @@
-use crate::config::{SourceCfg, SourceType};
+use crate::config::{SourceCfg, SourceType, ValueType};
 use anyhow::{Context as _, Result, bail};
 use std::{path::Path, sync::LazyLock};
 
@@ -31,6 +31,38 @@ pub fn build(cfg: &SourceCfg) -> Result<SourceKind> {
                 anyhow::anyhow!("script source `{}` requires `command`", cfg.name)
             })?,
         }),
+    }
+}
+
+/// Converts a fetched value against a source's declared `value_type` (spec:
+/// source-configuration — configurable stored value type), returning the
+/// `(bigint, double, json)` triple to store alongside the existing string
+/// value — at most one is ever `Some`. `Json` deliberately isn't validated
+/// here: the raw string is cast to `DuckDB`'s `JSON` type at insert time
+/// instead, so invalid JSON surfaces through the same "fetched but failed to
+/// store" path as any other insert failure, rather than a second bespoke
+/// validation error for the same underlying problem.
+pub fn convert_value_type(
+    value: &str,
+    value_type: ValueType,
+) -> Result<(Option<i64>, Option<f64>, Option<String>)> {
+    match value_type {
+        ValueType::String => Ok((None, None, None)),
+        ValueType::Bigint => {
+            let v = value
+                .trim()
+                .parse::<i64>()
+                .with_context(|| format!("value `{value}` does not convert to bigint"))?;
+            Ok((Some(v), None, None))
+        }
+        ValueType::Double => {
+            let v = value
+                .trim()
+                .parse::<f64>()
+                .with_context(|| format!("value `{value}` does not convert to double"))?;
+            Ok((None, Some(v), None))
+        }
+        ValueType::Json => Ok((None, None, Some(value.trim().to_string()))),
     }
 }
 
