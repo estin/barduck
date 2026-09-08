@@ -148,55 +148,63 @@
       its own; its only job is to disable this block via `:not(.light)`. */
 @media (prefers-color-scheme: dark) {
   :root:not(.light) {
-    --background: oklch(0.17 0.012 260);
-    --foreground: oklch(0.93 0.006 260);
-    --muted-foreground: oklch(0.68 0.012 260);
-    --primary: oklch(0.92 0.008 260);
-    --primary-foreground: oklch(0.21 0.015 260);
-    --destructive: oklch(0.66 0.18 25);
-    --destructive-foreground: oklch(0.14 0.02 25);
-    --border: oklch(0.3 0.012 260);
-    --ring: oklch(0.6 0.05 260);
-    --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
-    --shadow-sm: 0 1px 2px oklch(0 0 0 / 35%), 0 2px 8px -2px oklch(0 0 0 / 30%);
+    --background: oklch(0.2 0.014 260);
+    --foreground: oklch(0.88 0.008 260);
+    --muted-foreground: oklch(0.64 0.012 260);
+    --primary: oklch(0.85 0.01 260);
+    --primary-foreground: oklch(0.22 0.015 260);
+    --destructive: oklch(0.62 0.13 25);
+    --destructive-foreground: oklch(0.16 0.02 25);
+    --border: oklch(0.32 0.014 260);
+    --ring: oklch(0.58 0.045 260);
+    --shadow-xs: 0 1px 2px oklch(0 0 0 / 42%);
+    --shadow-sm: 0 1px 2px oklch(0 0 0 / 42%), 0 2px 8px -2px oklch(0 0 0 / 36%);
 
     --status-red-border: #f87171;
     --status-red-bg: #3f1315;
     --status-red-fg: #fecaca;
     --status-red-text: #f87171;
+    --status-red-chip-fg: #3f1013;
+    --status-yellow-border: #c9944e;
     --status-yellow-bg: #3a2a0d;
     --status-yellow-fg: #fde68a;
-    --status-yellow-text: #fbbf24;
-    --status-green-border: #34d399;
-    --status-green-text: #34d399;
+    --status-yellow-text: #dda75d;
+    --status-yellow-chip-fg: #451a03;
+    --status-green-border: #4f9e7c;
+    --status-green-text: #5cbf94;
+    --status-green-chip-fg: #0d2e21;
   }
 }
 
 /* Explicit dark override — keep in sync with the media query above; see the
    comment there for why the same values live in two places. */
 .dark {
-  --background: oklch(0.17 0.012 260);
-  --foreground: oklch(0.93 0.006 260);
-  --muted-foreground: oklch(0.68 0.012 260);
-  --primary: oklch(0.92 0.008 260);
-  --primary-foreground: oklch(0.21 0.015 260);
-  --destructive: oklch(0.66 0.18 25);
-  --destructive-foreground: oklch(0.14 0.02 25);
-  --border: oklch(0.3 0.012 260);
-  --ring: oklch(0.6 0.05 260);
+  --background: oklch(0.2 0.014 260);
+  --foreground: oklch(0.88 0.008 260);
+  --muted-foreground: oklch(0.64 0.012 260);
+  --primary: oklch(0.85 0.01 260);
+  --primary-foreground: oklch(0.22 0.015 260);
+  --destructive: oklch(0.62 0.13 25);
+  --destructive-foreground: oklch(0.16 0.02 25);
+  --border: oklch(0.32 0.014 260);
+  --ring: oklch(0.58 0.045 260);
   /* Light-mode shadows disappear on a dark background, so these are deeper. */
-  --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
-  --shadow-sm: 0 1px 2px oklch(0 0 0 / 35%), 0 2px 8px -2px oklch(0 0 0 / 30%);
+  --shadow-xs: 0 1px 2px oklch(0 0 0 / 42%);
+  --shadow-sm: 0 1px 2px oklch(0 0 0 / 42%), 0 2px 8px -2px oklch(0 0 0 / 36%);
 
   --status-red-border: #f87171;
   --status-red-bg: #3f1315;
   --status-red-fg: #fecaca;
   --status-red-text: #f87171;
+  --status-red-chip-fg: #3f1013;
+  --status-yellow-border: #c9944e;
   --status-yellow-bg: #3a2a0d;
   --status-yellow-fg: #fde68a;
-  --status-yellow-text: #fbbf24;
-  --status-green-border: #34d399;
-  --status-green-text: #34d399;
+  --status-yellow-text: #dda75d;
+  --status-yellow-chip-fg: #451a03;
+  --status-green-border: #4f9e7c;
+  --status-green-text: #5cbf94;
+  --status-green-chip-fg: #0d2e21;
 }
 
 @layer base {

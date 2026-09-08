@@ -33,7 +33,16 @@ const GEIST: Font = fontsource_font!(GEIST);
 const CONNECTION_SCRIPT: &str = r"(function () {
     var dot = document.getElementById('bd-conn-dot');
     var label = document.getElementById('bd-conn-label');
-    var colors = { checking: '#94a3b8', online: '#10b981', offline: '#ef4444' };
+    // `var(--token)` (not a resolved hex/oklch string) so the dot's color
+    // tracks whichever theme is active via the normal CSS cascade, the same
+    // tokens the rest of the page uses (spec: web-ui — consistent
+    // token-based visual theme; dark theme uses moderated contrast and
+    // desaturated status colors).
+    var colors = {
+        checking: 'var(--muted-foreground)',
+        online: 'var(--status-green-border)',
+        offline: 'var(--status-red-border)'
+    };
     var labels = { checking: 'checking…', online: 'online', offline: 'offline' };
     function setState(state) {
         dot.style.backgroundColor = colors[state];
@@ -58,15 +67,27 @@ const CONNECTION_SCRIPT: &str = r"(function () {
 /// summary strip's own colors. Polls the hidden status marker `panels_grid`
 /// renders on the same interval as the connection ping, rather than
 /// depending on exactly how the shard patches the DOM.
-const FAVICON_SCRIPT: &str = r##"(function () {
+const FAVICON_SCRIPT: &str = r#"(function () {
     var link = document.getElementById('bd-favicon');
-    var colors = { red: '#ef4444', yellow: '#fbbf24', green: '#10b981' };
+    // A data-URI SVG is its own standalone document with no access to the
+    // host page's CSS custom properties, so (unlike the connection dot) the
+    // actual computed color has to be read and baked into the SVG markup
+    // here rather than referenced as `var(--token)` (spec: web-ui —
+    // consistent token-based visual theme; dark theme uses moderated
+    // contrast and desaturated status colors).
+    var style = getComputedStyle(document.documentElement);
+    var base = style.getPropertyValue('--muted-foreground').trim();
+    var colors = {
+        red: style.getPropertyValue('--status-red-border').trim(),
+        yellow: style.getPropertyValue('--status-yellow-border').trim(),
+        green: style.getPropertyValue('--status-green-border').trim()
+    };
     function svgFor(hex) {
         return 'data:image/svg+xml,' + encodeURIComponent(
             '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
-            '<rect x="3" y="3" width="12" height="12" rx="2.5" fill="#767d78"/>' +
-            '<rect x="17" y="3" width="12" height="12" rx="2.5" fill="#767d78"/>' +
-            '<rect x="3" y="17" width="12" height="12" rx="2.5" fill="#767d78"/>' +
+            '<rect x="3" y="3" width="12" height="12" rx="2.5" fill="' + base + '"/>' +
+            '<rect x="17" y="3" width="12" height="12" rx="2.5" fill="' + base + '"/>' +
+            '<rect x="3" y="17" width="12" height="12" rx="2.5" fill="' + base + '"/>' +
             '<rect x="16.5" y="16.5" width="13" height="13" rx="2.5" fill="' + hex + '" transform="rotate(24 23 23)"/>' +
             '</svg>'
         );
@@ -78,7 +99,7 @@ const FAVICON_SCRIPT: &str = r##"(function () {
     }
     refresh();
     setInterval(refresh, 5000);
-})();"##;
+})();"#;
 
 /// Wires the theme toggle button: persists the chosen theme via `POST
 /// /api/theme`, then reloads the page so the server renders it with the new
@@ -154,7 +175,7 @@ pub async fn dashboard(cx: &Cx) -> Result {
                         badge(
                             variant: BadgeVariant::Outline,
                             attrs: attributes! { class="gap-1.5 font-normal" },
-                            <span id="bd-conn-dot" class="inline-block w-2 h-2 rounded-full" style="background-color:#94a3b8"></span>
+                            <span id="bd-conn-dot" class="inline-block w-2 h-2 rounded-full" style="background-color:var(--muted-foreground)"></span>
                             <span id="bd-conn-label">"checking…"</span>
                         )
                         button(

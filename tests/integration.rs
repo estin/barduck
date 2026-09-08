@@ -418,13 +418,26 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
         html.contains("border-color:var(--status-red-border)"),
         "group card border should reflect the worst row"
     );
-    // Neither the card nor its rows carry a background color — scoped past
-    // the summary-strip chips, which legitimately use background-color.
+    // Neither the card nor its rows carry a background color of their own —
+    // scoped past the summary-strip chips (which legitimately use
+    // background-color) and past each row's own history-bar segments, which
+    // also legitimately use background-color (spec: web-ui — panel
+    // retrospective history bar; dark theme uses moderated contrast and
+    // desaturated status colors — segments are now inline-styled rather than
+    // Tailwind classes, so they must be excluded explicitly here).
     let id_idx = html
         .find("id=\"panel-days-left\"")
         .expect("group card expected");
+    let mut scoped = html[id_idx..].to_string();
+    let segment_prefix = r#"<div class="flex-1" style="background-color"#;
+    while let Some(start) = scoped.find(segment_prefix) {
+        let end = scoped[start..]
+            .find("></div>")
+            .map_or(scoped.len(), |e| start + e + "></div>".len());
+        scoped.replace_range(start..end, "");
+    }
     assert!(
-        !html[id_idx..].contains("background-color"),
+        !scoped.contains("background-color"),
         "group card/rows should carry no background color"
     );
     // Each row's label (not the "updated ago" text) links to its own
@@ -552,14 +565,15 @@ async fn web_ui_history_bar_reflects_recent_readings() {
     // cpu: 3 segments, colored in reading order, no neutral padding.
     let cpu = panel_slice(&page, "cpu", Some("plain"));
     assert_eq!(
-        cpu.matches("flex-1 bg-").count(),
+        cpu.matches("class=\"flex-1\" style=\"background-color:var(--")
+            .count(),
         3,
         "cpu bar should have exactly 3 segments"
     );
     let (i_green, i_yellow, i_red) = (
-        cpu.find("bg-emerald-500").expect("green segment"),
-        cpu.find("bg-amber-400").expect("yellow segment"),
-        cpu.find("bg-red-500").expect("red segment"),
+        cpu.find("--status-green-border").expect("green segment"),
+        cpu.find("--status-yellow-border").expect("yellow segment"),
+        cpu.find("--status-red-border").expect("red segment"),
     );
     assert!(
         i_green < i_yellow && i_yellow < i_red,
@@ -569,27 +583,31 @@ async fn web_ui_history_bar_reflects_recent_readings() {
     // plain: no thresholds -> no history bar at all.
     let plain = panel_slice(&page, "plain", Some("sparse"));
     assert!(
-        !plain.contains("flex-1 bg-"),
+        !plain.contains("class=\"flex-1\" style=\"background-color:var(--"),
         "unbanded panel should have no history bar"
     );
 
     // sparse: 5 segments, left-padded with 3 neutral placeholders, then green, red.
     let sparse = panel_slice(&page, "sparse", None);
     assert_eq!(
-        sparse.matches("flex-1 bg-").count(),
+        sparse
+            .matches("class=\"flex-1\" style=\"background-color:var(--")
+            .count(),
         5,
         "sparse bar should be padded to 5 segments"
     );
-    let neutral_count = sparse.matches("bg-slate-200").count();
+    let neutral_count = sparse
+        .matches("background-color:var(--border)")
+        .count();
     assert_eq!(
         neutral_count, 3,
         "3 padding segments expected for 2 readings out of 5 history_points"
     );
-    let i_slate3 = sparse.rfind("bg-slate-200").unwrap();
-    let i_green = sparse.find("bg-emerald-500").expect("green segment");
-    let i_red = sparse.find("bg-red-500").expect("red segment");
+    let i_neutral3 = sparse.rfind("background-color:var(--border)").unwrap();
+    let i_green = sparse.find("--status-green-border").expect("green segment");
+    let i_red = sparse.find("--status-red-border").expect("red segment");
     assert!(
-        i_slate3 < i_green && i_green < i_red,
+        i_neutral3 < i_green && i_green < i_red,
         "padding segments should precede the real readings"
     );
 }
@@ -696,12 +714,12 @@ async fn web_ui_show_history_false_hides_bar_for_banded_source() {
     let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
     let shown = panel_slice(&page, "shown", Some("hidden"));
     assert!(
-        shown.contains("flex-1 bg-"),
+        shown.contains("class=\"flex-1\" style=\"background-color:var(--"),
         "shown source should render its history bar"
     );
     let hidden = panel_slice(&page, "hidden", None);
     assert!(
-        !hidden.contains("flex-1 bg-"),
+        !hidden.contains("class=\"flex-1\" style=\"background-color:var(--"),
         "show_history=false should hide the bar even though banded"
     );
 }
@@ -1427,9 +1445,15 @@ rows = [
         !html.contains("flex h-1"),
         "a text panel has no history bar"
     );
-    // Never colored: no status_style-style border/background override.
+    // Never colored: no status_style-style border/background/text override.
+    // Checked as the concrete `<property>:var(--status-...)` style pattern,
+    // not a bare `--status-` substring: the page-wide favicon script now
+    // legitimately references `--status-*` custom property *names* as JS
+    // string literals (spec: web-ui — dark theme uses moderated contrast and
+    // desaturated status colors) on every page regardless of content, which
+    // a bare substring check would wrongly trip on here.
     assert!(
-        !html.contains("--status-"),
+        !html.contains("color:var(--status-"),
         "a text panel's card must never carry a health/threshold color"
     );
 }

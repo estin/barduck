@@ -94,14 +94,18 @@ impl Panel {
         }
     }
 
-    /// Tailwind class for one history-bar segment. No component wraps these,
-    /// so a plain utility class is unambiguous (no competing base class).
-    fn segment_class(level: Option<Level>) -> &'static str {
+    /// Inline CSS for one history-bar segment, from the same `--status-*`
+    /// tokens the panel border/chip use, so segments pick up the same
+    /// dark-theme desaturation instead of being pinned to fixed Tailwind
+    /// color classes regardless of theme (spec: web-ui — consistent
+    /// token-based visual theme; dark theme uses moderated contrast and
+    /// desaturated status colors).
+    fn segment_style(level: Option<Level>) -> &'static str {
         match level {
-            Some(Level::Red) => "bg-red-500",
-            Some(Level::Yellow) => "bg-amber-400",
-            Some(Level::Green) => "bg-emerald-500",
-            None => "bg-slate-200",
+            Some(Level::Red) => "background-color:var(--status-red-border)",
+            Some(Level::Yellow) => "background-color:var(--status-yellow-border)",
+            Some(Level::Green) => "background-color:var(--status-green-border)",
+            None => "background-color:var(--border)",
         }
     }
 
@@ -505,7 +509,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                         if !main.history.is_empty() {
                                             <div class="mt-1.5 flex h-1">
                                                 for seg in &main.history {
-                                                    <div class=(format!("flex-1 {}", Panel::segment_class(*seg)))></div>
+                                                    <div class="flex-1" style=(Panel::segment_style(*seg))></div>
                                                 }
                                             </div>
                                         }
@@ -565,7 +569,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                             if !main.history.is_empty() {
                                                 <div class="mt-1.5 flex h-1">
                                                     for seg in &main.history {
-                                                        <div class=(format!("flex-1 {}", Panel::segment_class(*seg)))></div>
+                                                        <div class="flex-1" style=(Panel::segment_style(*seg))></div>
                                                     }
                                                 </div>
                                             }
@@ -605,7 +609,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                             if !p.history.is_empty() {
                                                 <div class="mt-1 flex h-1">
                                                     for seg in &p.history {
-                                                        <div class=(format!("flex-1 {}", Panel::segment_class(*seg)))></div>
+                                                        <div class="flex-1" style=(Panel::segment_style(*seg))></div>
                                                     }
                                                 </div>
                                             }
