@@ -1,6 +1,14 @@
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
-use crate::{config::{Config, Level, TuiWidth, VERSION, View}, health::Health, query::Backend};
+use crate::{
+    config::{Config, Level, TuiWidth, VERSION, View},
+    health::Health,
+    query::Backend,
+};
 use anyhow::Result;
 use ratatui::{
     Terminal,
@@ -41,7 +49,10 @@ fn event_loop(
         if crossterm::event::poll(Duration::from_millis(250))?
             && let crossterm::event::Event::Key(key) = crossterm::event::read()?
             && matches!(key.kind, crossterm::event::KeyEventKind::Press)
-            && matches!(key.code, crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc)
+            && matches!(
+                key.code,
+                crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
+            )
         {
             return Ok(());
         }
@@ -114,7 +125,10 @@ fn build_panel(
         name: label.to_string(),
         value: row.map_or_else(|| "—".into(), |r| r.value.clone()),
         unit: row.and_then(|r| r.unit.clone()).unwrap_or_default(),
-        status: healths.iter().find(|h| h.source == name).map_or(Health::Stale, |h| h.status),
+        status: healths
+            .iter()
+            .find(|h| h.source == name)
+            .map_or(Health::Stale, |h| h.status),
         level,
         ts_epoch: row.map_or(0.0, |r| r.ts_epoch),
     }
@@ -167,22 +181,47 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                         // explicit `space` cell (spec: tui — hidden sources render as
                         // space in the TUI).
                         let (main, secondary, table, group_title, text) = match cell {
-                            crate::config::Cell::Group { title, main, secondary, table } => (
+                            crate::config::Cell::Group {
+                                title,
+                                main,
+                                secondary,
+                                table,
+                            } => (
                                 main.as_ref()
-                                    .filter(|item| crate::config::source_visible_in(cfg, item.id(), View::Tui))
+                                    .filter(|item| {
+                                        crate::config::source_visible_in(cfg, item.id(), View::Tui)
+                                    })
                                     .map(|item| {
-                                        build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
+                                        build_panel(
+                                            cfg,
+                                            &latest,
+                                            &healths,
+                                            item.id(),
+                                            item.explicit_label(),
+                                        )
                                     }),
                                 crate::config::visible_items(cfg, secondary, View::Tui)
                                     .iter()
                                     .map(|item| {
-                                        build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
+                                        build_panel(
+                                            cfg,
+                                            &latest,
+                                            &healths,
+                                            item.id(),
+                                            item.explicit_label(),
+                                        )
                                     })
                                     .collect(),
                                 crate::config::visible_items(cfg, table, View::Tui)
                                     .iter()
                                     .map(|item| {
-                                        build_panel(cfg, &latest, &healths, item.id(), item.explicit_label())
+                                        build_panel(
+                                            cfg,
+                                            &latest,
+                                            &healths,
+                                            item.id(),
+                                            item.explicit_label(),
+                                        )
                                     })
                                     .collect(),
                                 title.clone(),
@@ -197,19 +236,33 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                                 None,
                             ),
                             crate::config::Cell::Pane { id, title } => (
-                                crate::config::source_visible_in(cfg, id, View::Tui)
-                                    .then(|| build_panel(cfg, &latest, &healths, id, title.as_deref())),
+                                crate::config::source_visible_in(cfg, id, View::Tui).then(|| {
+                                    build_panel(cfg, &latest, &healths, id, title.as_deref())
+                                }),
                                 Vec::new(),
                                 Vec::new(),
                                 None,
                                 None,
                             ),
-                            crate::config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None),
-                            crate::config::Cell::Text { title, text, .. } => {
-                                (None, Vec::new(), Vec::new(), title.clone(), Some(text.clone()))
+                            crate::config::Cell::Space { .. } => {
+                                (None, Vec::new(), Vec::new(), None, None)
                             }
+                            crate::config::Cell::Text { title, text, .. } => (
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                                title.clone(),
+                                Some(text.clone()),
+                            ),
                         };
-                        slots.push(Slot { span: cell.span(), group_title, main, secondary, table, text });
+                        slots.push(Slot {
+                            span: cell.span(),
+                            group_title,
+                            main,
+                            secondary,
+                            table,
+                            text,
+                        });
                     }
                     rows.push(slots);
                 }
@@ -250,7 +303,11 @@ const AUTO_COLUMN_WIDTH: u16 = 30;
 /// against the widest row's column count in `"auto"` mode. Leaves `area`
 /// unchanged when there's nothing to size around (`max_columns == 0`)
 /// (spec: tui — configurable TUI content width).
-fn content_rect(area: ratatui::layout::Rect, tui_width: &TuiWidth, max_columns: usize) -> ratatui::layout::Rect {
+fn content_rect(
+    area: ratatui::layout::Rect,
+    tui_width: &TuiWidth,
+    max_columns: usize,
+) -> ratatui::layout::Rect {
     if max_columns == 0 {
         return area;
     }
@@ -260,7 +317,12 @@ fn content_rect(area: ratatui::layout::Rect, tui_width: &TuiWidth, max_columns: 
     };
     let width = desired.min(area.width);
     let x = area.x + (area.width - width) / 2;
-    ratatui::layout::Rect { x, y: area.y, width, height: area.height }
+    ratatui::layout::Rect {
+        x,
+        y: area.y,
+        width,
+        height: area.height,
+    }
 }
 
 fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
@@ -268,9 +330,16 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
 
     // Grid rows stacked vertically (equal height each), columns within a row
     // proportional to cell spans.
-    let rows: Vec<&Vec<Slot>> =
-        state.rows.iter().filter(|row| row.iter().map(|c| c.span).sum::<usize>() > 0).collect();
-    let max_columns = rows.iter().map(|r| r.iter().map(|c| c.span).sum::<usize>()).max().unwrap_or(0);
+    let rows: Vec<&Vec<Slot>> = state
+        .rows
+        .iter()
+        .filter(|row| row.iter().map(|c| c.span).sum::<usize>() > 0)
+        .collect();
+    let max_columns = rows
+        .iter()
+        .map(|r| r.iter().map(|c| c.span).sum::<usize>())
+        .max()
+        .unwrap_or(0);
     let content = content_rect(area, tui_width, max_columns);
 
     let mut idx = 0usize;
@@ -308,21 +377,39 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
     };
     let row_areas = Layout::vertical(vec![Constraint::Fill(1); rows.len()]).split(body);
     for (row, rect) in rows.iter().zip(row_areas.iter()) {
-        let col_areas =
-            Layout::horizontal(row.iter().map(|c| Constraint::Fill(c.span as u16)).collect::<Vec<_>>())
-                .split(*rect);
+        let col_areas = Layout::horizontal(
+            row.iter()
+                .map(|c| Constraint::Fill(c.span as u16))
+                .collect::<Vec<_>>(),
+        )
+        .split(*rect);
         for (cell, crect) in row.iter().zip(col_areas.iter()) {
-            if cell.main.is_some() || !cell.secondary.is_empty() || !cell.table.is_empty() || cell.text.is_some() {
+            if cell.main.is_some()
+                || !cell.secondary.is_empty()
+                || !cell.table.is_empty()
+                || cell.text.is_some()
+            {
                 f.render_widget(panel_widget(cell), *crect);
             }
         }
     }
 }
 
-fn header_line(f: &mut ratatui::Frame, area: ratatui::layout::Rect, y: u16, text: String, style: Style) {
+fn header_line(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    y: u16,
+    text: String,
+    style: Style,
+) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(text, style))),
-        ratatui::layout::Rect { x: area.x, y, width: area.width, height: 1 },
+        ratatui::layout::Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        },
     );
 }
 
@@ -359,28 +446,43 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(p.ts_epoch, |d| d.as_secs_f64());
-        let updated = crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"));
+        let updated =
+            crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"));
         // A value can itself span multiple lines (e.g. a markdown-format
         // source's fetched content) — each of its lines becomes its own
         // `Line` so they stack instead of being joined into one, with the
         // unit/age suffix trailing the last line.
-        let value_lines: Vec<&str> = { let l = p.value.lines().collect::<Vec<_>>(); if l.is_empty() { vec![""] } else { l } };
+        let value_lines: Vec<&str> = {
+            let l = p.value.lines().collect::<Vec<_>>();
+            if l.is_empty() { vec![""] } else { l }
+        };
         let mut lines: Vec<Line> = value_lines
             .into_iter()
-            .map(|l| Line::from(Span::styled(l.to_string(), style.add_modifier(Modifier::BOLD))))
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.to_string(),
+                    style.add_modifier(Modifier::BOLD),
+                ))
+            })
             .collect();
         if let Some(last) = lines.last_mut() {
             if !p.unit.is_empty() {
                 last.spans.push(Span::raw(format!(" {}", p.unit)));
             }
-            last.spans.push(Span::styled(updated, Style::default().add_modifier(Modifier::DIM)));
+            last.spans.push(Span::styled(
+                updated,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
         }
         let title = slot.group_title.as_deref().unwrap_or(&p.name);
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(style)
-                .title(Span::styled(format!(" {title} [{}] ", p.status.as_str()), style)),
+                .title(Span::styled(
+                    format!(" {title} [{}] ", p.status.as_str()),
+                    style,
+                )),
         )
     } else {
         let now = std::time::SystemTime::now()
@@ -411,10 +513,20 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
                 String::new()
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{}: ", p.name), Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    format!("{}: ", p.name),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
                 Span::styled(p.value.clone(), style.add_modifier(Modifier::BOLD)),
-                Span::raw(if p.unit.is_empty() { String::new() } else { format!(" {}", p.unit) }),
-                Span::styled(plain_label(p.status), Style::default().add_modifier(Modifier::DIM)),
+                Span::raw(if p.unit.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", p.unit)
+                }),
+                Span::styled(
+                    plain_label(p.status),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
                 Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
             ]));
         }
@@ -436,8 +548,15 @@ fn main_or_secondary_line(p: &Panel, now: f64, value_modifier: Modifier) -> Line
     let updated = crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"));
     Line::from(vec![
         Span::styled(p.value.clone(), style.add_modifier(value_modifier)),
-        Span::raw(if p.unit.is_empty() { String::new() } else { format!(" {}", p.unit) }),
-        Span::styled(plain_label(p.status), Style::default().add_modifier(Modifier::DIM)),
+        Span::raw(if p.unit.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", p.unit)
+        }),
+        Span::styled(
+            plain_label(p.status),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
         Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
     ])
 }
@@ -518,7 +637,14 @@ mod tests {
                     },
                 ],
                 vec![
-                    Slot { span: 2, group_title: None, main: None, secondary: Vec::new(), table: Vec::new(), text: None },
+                    Slot {
+                        span: 2,
+                        group_title: None,
+                        main: None,
+                        secondary: Vec::new(),
+                        table: Vec::new(),
+                        text: None,
+                    },
                     Slot {
                         span: 1,
                         group_title: None,
@@ -540,7 +666,9 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area().height)
             .map(|y| {
@@ -602,24 +730,43 @@ mod tests {
         // one-column default width to render without truncating.
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Fixed(38))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Fixed(38)))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
         assert!(text.contains("ihor"), "group title missing");
         assert!(text.contains("days left"), "first member label missing");
         assert!(text.contains('5'), "first member value missing");
         assert!(text.contains("balance"), "second member label missing");
         assert!(text.contains("90"), "second member value missing");
-        assert!(text.contains("10m ago"), "stale first member's update age missing");
+        assert!(
+            text.contains("10m ago"),
+            "stale first member's update age missing"
+        );
 
         // A member that isn't lagging shows no age at all.
         let rows: Vec<String> = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
-        let balance_row = rows.iter().find(|r| r.contains("balance")).expect("balance line missing");
-        assert!(!balance_row.contains("ago"), "fresh member should show no age: {balance_row:?}");
+        let balance_row = rows
+            .iter()
+            .find(|r| r.contains("balance"))
+            .expect("balance line missing");
+        assert!(
+            !balance_row.contains("ago"),
+            "fresh member should show no age: {balance_row:?}"
+        );
 
         // The two value cells carry their own colors, not one shared color
         // for the whole panel — and "days left"'s stale health overrides its
@@ -630,8 +777,9 @@ mod tests {
             for y in 0..buf.area().height {
                 for x in 0..buf.area().width {
                     if buf[(x, y)].symbol() == &needle[..1] {
-                        let row: String =
-                            (x..buf.area().width).map(|xi| buf[(xi, y)].symbol()).collect();
+                        let row: String = (x..buf.area().width)
+                            .map(|xi| buf[(xi, y)].symbol())
+                            .collect();
                         if row.starts_with(needle) {
                             return Some(buf[(x, y)].fg);
                         }
@@ -640,7 +788,11 @@ mod tests {
             }
             None
         };
-        assert_eq!(find_fg("5"), Some(Color::Yellow), "stale health should override the red band");
+        assert_eq!(
+            find_fg("5"),
+            Some(Color::Yellow),
+            "stale health should override the red band"
+        );
         assert_eq!(find_fg("90"), Some(Color::Green));
 
         // The panel's own border is yellow — the worst of its two members
@@ -649,7 +801,11 @@ mod tests {
             .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
             .find(|&(x, y)| buf[(x, y)].symbol() == "─")
             .map(|(x, y)| buf[(x, y)].fg);
-        assert_eq!(border_fg, Some(Color::Yellow), "panel border should reflect the worst member");
+        assert_eq!(
+            border_fg,
+            Some(Color::Yellow),
+            "panel border should reflect the worst member"
+        );
     }
 
     /// An unbanded, failing group member renders its value in red
@@ -691,28 +847,51 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
-        let (y, flaky_row) =
-            rows.iter().enumerate().find(|(_, r)| r.contains("flaky")).expect("flaky line missing");
-        assert!(flaky_row.contains("[failing]"), "plain failing label expected: {flaky_row:?}");
+        let (y, flaky_row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("flaky"))
+            .expect("flaky line missing");
+        assert!(
+            flaky_row.contains("[failing]"),
+            "plain failing label expected: {flaky_row:?}"
+        );
 
         // The value itself now renders red — health-derived, alongside the
         // label. Use a char (column) index, not a byte index: the border's
         // box-drawing characters are multi-byte, so `str::find` would
         // misalign with the buffer's column coordinates.
-        let value_x = flaky_row.chars().position(|c| c == '9').expect("flaky value missing");
-        assert_eq!(buf[(value_x as u16, y as u16)].fg, Color::Red, "unbanded failing value should render red");
+        let value_x = flaky_row
+            .chars()
+            .position(|c| c == '9')
+            .expect("flaky value missing");
+        assert_eq!(
+            buf[(value_x as u16, y as u16)].fg,
+            Color::Red,
+            "unbanded failing value should render red"
+        );
 
         // The panel's own border still reflects the failing unbanded member.
         let border_fg = (0..buf.area().height)
             .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
             .find(|&(x, y)| buf[(x, y)].symbol() == "─")
             .map(|(x, y)| buf[(x, y)].fg);
-        assert_eq!(border_fg, Some(Color::Red), "border should still flag the failing unbanded member");
+        assert_eq!(
+            border_fg,
+            Some(Color::Red),
+            "border should still flag the failing unbanded member"
+        );
     }
 
     /// A generalized pane with only `main` set renders exactly like a
@@ -742,19 +921,35 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
-        assert!(text.contains("CPU"), "cell title should be used, not main's own label");
-        assert!(!text.contains("cpu-load-ignored"), "main's own label should not appear");
+        assert!(
+            text.contains("CPU"),
+            "cell title should be used, not main's own label"
+        );
+        assert!(
+            !text.contains("cpu-load-ignored"),
+            "main's own label should not appear"
+        );
         assert!(text.contains("42"), "main value missing");
         let border_fg = (0..buf.area().height)
             .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
             .find(|&(x, y)| buf[(x, y)].symbol() == "─")
             .map(|(x, y)| buf[(x, y)].fg);
-        assert_eq!(border_fg, Some(Color::Yellow), "border should reflect main's own band color");
+        assert_eq!(
+            border_fg,
+            Some(Color::Yellow),
+            "border should reflect main's own band color"
+        );
     }
 
     /// A generalized pane combining all three sections renders `main`,
@@ -799,15 +994,24 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
         assert!(text.contains("Server"), "cell title missing");
         assert!(text.contains("42"), "main value missing");
         assert!(text.contains("80"), "secondary value missing");
-        assert!(text.contains("mem-used") || text.contains('%'), "secondary content missing");
+        assert!(
+            text.contains("mem-used") || text.contains('%'),
+            "secondary content missing"
+        );
         assert!(text.contains("days left"), "table label missing");
         assert!(text.contains('5'), "table value missing");
         let border_fg = (0..buf.area().height)
@@ -840,10 +1044,16 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
         assert!(text.contains("Links"), "panel title missing");
         assert!(text.contains("github.com"), "panel content missing");
@@ -876,10 +1086,16 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
         assert!(text.contains("Just a note."), "panel content missing");
     }
@@ -903,12 +1119,21 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
-        assert!(text.contains("# Heading"), "literal markdown text should appear uninterpreted");
+        assert!(
+            text.contains("# Heading"),
+            "literal markdown text should appear uninterpreted"
+        );
     }
 
     /// A static-text panel's embedded newlines become separate lines in the
@@ -930,10 +1155,16 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
         let y_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
         let (y1, y2, y3) = (
@@ -941,7 +1172,10 @@ mod tests {
             y_of("second line").expect("second line missing"),
             y_of("third line").expect("third line missing"),
         );
-        assert!(y1 < y2 && y2 < y3, "each line should render on its own row, in order: {y1}, {y2}, {y3}");
+        assert!(
+            y1 < y2 && y2 < y3,
+            "each line should render on its own row, in order: {y1}, {y2}, {y3}"
+        );
     }
 
     /// A single-source panel's value can itself be multi-line (e.g. a
@@ -971,10 +1205,16 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &state, &TuiWidth::Named("auto".into()))).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area().height)
-            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect();
         let y_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
         let (y1, y2, y3) = (
@@ -982,15 +1222,24 @@ mod tests {
             y_of("second line").expect("second line missing"),
             y_of("third line").expect("third line missing"),
         );
-        assert!(y1 < y2 && y2 < y3, "each line should render on its own row, in order: {y1}, {y2}, {y3}");
+        assert!(
+            y1 < y2 && y2 < y3,
+            "each line should render on its own row, in order: {y1}, {y2}, {y3}"
+        );
     }
 
     /// A banded value colors by its band when healthy (spec: tui —
     /// threshold band coloring).
     #[test]
     fn banded_value_colors_by_band_when_healthy() {
-        assert_eq!(status_style(Some(Level::Red), Health::Healthy).fg, Some(Color::Red));
-        assert_eq!(status_style(Some(Level::Yellow), Health::Healthy).fg, Some(Color::Yellow));
+        assert_eq!(
+            status_style(Some(Level::Red), Health::Healthy).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            status_style(Some(Level::Yellow), Health::Healthy).fg,
+            Some(Color::Yellow)
+        );
     }
 
     /// Health status overrides a stale band reading — even a source with
@@ -998,8 +1247,14 @@ mod tests {
     /// (spec: tui — threshold band coloring).
     #[test]
     fn health_overrides_a_stale_band_reading() {
-        assert_eq!(status_style(Some(Level::Green), Health::Failing).fg, Some(Color::Red));
-        assert_eq!(status_style(Some(Level::Green), Health::Stale).fg, Some(Color::Yellow));
+        assert_eq!(
+            status_style(Some(Level::Green), Health::Failing).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            status_style(Some(Level::Green), Health::Stale).fg,
+            Some(Color::Yellow)
+        );
     }
 
     /// An unbanded, healthy source has no accent color at all — not even
@@ -1024,33 +1279,68 @@ mod tests {
     /// (spec: tui — configurable TUI content width)
     #[test]
     fn auto_width_stays_narrow_for_few_columns() {
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 220, height: 40 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 220,
+            height: 40,
+        };
         let rect = content_rect(area, &TuiWidth::Named("auto".into()), 2);
-        assert!(rect.width < area.width, "2 columns should not fill a 220-wide terminal");
+        assert!(
+            rect.width < area.width,
+            "2 columns should not fill a 220-wide terminal"
+        );
         assert_eq!(rect.width, 60);
     }
 
     #[test]
     fn auto_width_grows_with_more_columns_but_stays_capped() {
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 220, height: 40 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 220,
+            height: 40,
+        };
         let narrow = content_rect(area, &TuiWidth::Named("auto".into()), 2);
         let wide = content_rect(area, &TuiWidth::Named("auto".into()), 6);
-        assert!(wide.width > narrow.width, "more columns should use more space");
-        assert!(wide.width <= area.width, "auto width must never exceed the terminal");
+        assert!(
+            wide.width > narrow.width,
+            "more columns should use more space"
+        );
+        assert!(
+            wide.width <= area.width,
+            "auto width must never exceed the terminal"
+        );
     }
 
     #[test]
     fn fixed_width_caps_at_terminal_width() {
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 220, height: 40 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 220,
+            height: 40,
+        };
         let rect = content_rect(area, &TuiWidth::Fixed(300), 2);
-        assert_eq!(rect.width, 220, "fixed width larger than the terminal should be capped");
+        assert_eq!(
+            rect.width, 220,
+            "fixed width larger than the terminal should be capped"
+        );
     }
 
     #[test]
     fn empty_rows_keep_full_width() {
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 220, height: 40 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 220,
+            height: 40,
+        };
         let rect = content_rect(area, &TuiWidth::Named("auto".into()), 0);
-        assert_eq!(rect, area, "nothing to size around should leave the area unchanged");
+        assert_eq!(
+            rect, area,
+            "nothing to size around should leave the area unchanged"
+        );
     }
 
     fn cfg_from(toml: &str) -> Config {
@@ -1060,7 +1350,11 @@ mod tests {
     }
 
     fn only_slot(cfg: &Config) -> Slot {
-        let mut state = UiState { error: None, rows: Vec::new(), tick: 0 };
+        let mut state = UiState {
+            error: None,
+            rows: Vec::new(),
+            tick: 0,
+        };
         apply_outcome(cfg, Outcome::Data(Vec::new(), Vec::new()), &mut state);
         state.rows.remove(0).remove(0)
     }
@@ -1074,7 +1368,12 @@ mod tests {
             "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
         );
         let slot = only_slot(&cfg);
-        assert!(slot.main.is_none() && slot.secondary.is_empty() && slot.table.is_empty() && slot.text.is_none());
+        assert!(
+            slot.main.is_none()
+                && slot.secondary.is_empty()
+                && slot.table.is_empty()
+                && slot.text.is_none()
+        );
     }
 
     /// A layout cell for a source visible in the TUI (`show_in = "tui"` or
@@ -1087,12 +1386,18 @@ mod tests {
                 "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"{show_in}\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n"
             ));
             let slot = only_slot(&cfg);
-            assert!(slot.main.is_some(), "show_in = {show_in:?} should still render in the TUI");
+            assert!(
+                slot.main.is_some(),
+                "show_in = {show_in:?} should still render in the TUI"
+            );
         }
         let cfg = cfg_from(
             "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
         );
-        assert!(only_slot(&cfg).main.is_some(), "no show_in should still render in the TUI");
+        assert!(
+            only_slot(&cfg).main.is_some(),
+            "no show_in should still render in the TUI"
+        );
     }
 
     /// A generalized pane's `secondary` member hidden from the TUI is
@@ -1104,7 +1409,11 @@ mod tests {
             "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[sources]]\nname = \"b\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"grp\", secondary = [\"a\", \"b\"] }]]\n",
         );
         let slot = only_slot(&cfg);
-        assert_eq!(slot.secondary.len(), 1, "the hidden member should be omitted, not just left empty");
+        assert_eq!(
+            slot.secondary.len(),
+            1,
+            "the hidden member should be omitted, not just left empty"
+        );
     }
 
     /// A generalized pane cell whose every member is hidden from the TUI
@@ -1116,7 +1425,12 @@ mod tests {
             "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"grp\", secondary = [\"a\"] }]]\n",
         );
         let slot = only_slot(&cfg);
-        assert!(slot.main.is_none() && slot.secondary.is_empty() && slot.table.is_empty() && slot.text.is_none());
+        assert!(
+            slot.main.is_none()
+                && slot.secondary.is_empty()
+                && slot.table.is_empty()
+                && slot.text.is_none()
+        );
     }
 
     /// Hiding a source from the TUI does not change the layout's column
@@ -1130,13 +1444,32 @@ mod tests {
         let hidden = cfg_from(
             "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\", { kind = \"space\", colspan = 2 }]]\n",
         );
-        let mut visible_state = UiState { error: None, rows: Vec::new(), tick: 0 };
-        apply_outcome(&visible, Outcome::Data(Vec::new(), Vec::new()), &mut visible_state);
-        let mut hidden_state = UiState { error: None, rows: Vec::new(), tick: 0 };
-        apply_outcome(&hidden, Outcome::Data(Vec::new(), Vec::new()), &mut hidden_state);
+        let mut visible_state = UiState {
+            error: None,
+            rows: Vec::new(),
+            tick: 0,
+        };
+        apply_outcome(
+            &visible,
+            Outcome::Data(Vec::new(), Vec::new()),
+            &mut visible_state,
+        );
+        let mut hidden_state = UiState {
+            error: None,
+            rows: Vec::new(),
+            tick: 0,
+        };
+        apply_outcome(
+            &hidden,
+            Outcome::Data(Vec::new(), Vec::new()),
+            &mut hidden_state,
+        );
         let visible_spans: Vec<usize> = visible_state.rows[0].iter().map(|s| s.span).collect();
         let hidden_spans: Vec<usize> = hidden_state.rows[0].iter().map(|s| s.span).collect();
-        assert_eq!(visible_spans, hidden_spans, "column spans must not change when a source is hidden");
+        assert_eq!(
+            visible_spans, hidden_spans,
+            "column spans must not change when a source is hidden"
+        );
     }
 
     /// From the same shared layout, a source restricted to the web view
@@ -1149,6 +1482,9 @@ mod tests {
             "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
         );
         let slot = only_slot(&cfg);
-        assert!(slot.main.is_none(), "a web-only source should render as space in the TUI");
+        assert!(
+            slot.main.is_none(),
+            "a web-only source should render as space in the TUI"
+        );
     }
 }

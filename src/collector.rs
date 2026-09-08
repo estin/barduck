@@ -1,4 +1,8 @@
-use crate::{config::{Config, SourceCfg}, db::Db, health, source};
+use crate::{
+    config::{Config, SourceCfg},
+    db::Db,
+    health, source,
+};
 use anyhow::Result;
 use croner::Cron;
 use std::time::Instant;
@@ -10,7 +14,11 @@ use tokio::time::timeout;
 /// per-source schedules), or a cron expression's next occurrence, computed
 /// fresh each tick and unaffected by fetch outcome.
 enum Schedule {
-    Interval { effective_interval: std::time::Duration, retry_interval: std::time::Duration, next: tokio::time::Instant },
+    Interval {
+        effective_interval: std::time::Duration,
+        retry_interval: std::time::Duration,
+        next: tokio::time::Instant,
+    },
     Cron(Box<Cron>),
 }
 
@@ -19,8 +27,11 @@ impl Schedule {
     /// already validated at config load, so parsing here cannot fail.
     fn new(src: &SourceCfg) -> Self {
         if let Some(expr) = &src.cron {
-            #[allow(clippy::expect_used)] // validated at config load (spec: source-configuration — cron schedule)
-            let cron: Cron = expr.parse().expect("cron expression validated at config load");
+            #[allow(clippy::expect_used)]
+            // validated at config load (spec: source-configuration — cron schedule)
+            let cron: Cron = expr
+                .parse()
+                .expect("cron expression validated at config load");
             Schedule::Cron(Box::new(cron))
         } else {
             Schedule::Interval {
@@ -52,8 +63,17 @@ impl Schedule {
     /// setup gates first fetch). No-op for a cron schedule, whose next tick
     /// is always the next cron occurrence regardless of outcome.
     fn advance(&mut self, retry: bool) {
-        if let Schedule::Interval { effective_interval, retry_interval, next } = self {
-            let wait = if retry { *retry_interval } else { *effective_interval };
+        if let Schedule::Interval {
+            effective_interval,
+            retry_interval,
+            next,
+        } = self
+        {
+            let wait = if retry {
+                *retry_interval
+            } else {
+                *effective_interval
+            };
             *next = tokio::time::Instant::now() + wait;
         }
     }
@@ -127,12 +147,25 @@ async fn loop_source(
 ) -> Result<()> {
     let kind = source::build(&src)?;
     // Re-derive the last known status so restarts don't duplicate transitions.
-    let mut last_status = db.last_health(&src.name).await?.unwrap_or_else(|| "healthy".into());
+    let mut last_status = db
+        .last_health(&src.name)
+        .await?
+        .unwrap_or_else(|| "healthy".into());
     // A declared setup command runs once before the first fetch; on failure it
     // is retried on this source's schedule tick instead of fetching.
     let mut setup_done = src.setup.is_none();
 
     let mut schedule = Schedule::new(&src);
+    match &schedule {
+        Schedule::Interval {
+            effective_interval,
+            retry_interval,
+            next,
+        } => {
+            tracing::debug!("Source next: {:?}", next);
+        }
+        _ => {}
+    };
     loop {
         match &mut shutdown {
             Some(sd) => {
@@ -165,7 +198,9 @@ async fn loop_source(
 /// tests and one-shot runs.
 pub async fn collect_once(db: &Db, cfg: &Config) {
     for src in &cfg.sources {
-        let Ok(kind) = source::build(src) else { continue };
+        let Ok(kind) = source::build(src) else {
+            continue;
+        };
         if !try_setup(db, src, cfg).await {
             continue;
         }
@@ -202,7 +237,10 @@ async fn try_setup(db: &Db, src: &SourceCfg, cfg: &Config) -> bool {
                 db,
                 &src.name,
                 ms,
-                &format!("setup: timed out after {}", humantime::format_duration(src.timeout)),
+                &format!(
+                    "setup: timed out after {}",
+                    humantime::format_duration(src.timeout)
+                ),
             )
             .await;
             false
@@ -217,14 +255,22 @@ async fn try_setup(db: &Db, src: &SourceCfg, cfg: &Config) -> bool {
 /// succeeds but fails to persist is recorded as a failed attempt, not a
 /// silent success — otherwise health would report "healthy" for data that
 /// was never actually written.
-pub async fn fetch_once(db: &Db, cfg: &Config, src: &SourceCfg, kind: &source::SourceKind, last_status: &mut String) -> bool {
+pub async fn fetch_once(
+    db: &Db,
+    cfg: &Config,
+    src: &SourceCfg,
+    kind: &source::SourceKind,
+    last_status: &mut String,
+) -> bool {
     let start = Instant::now();
     let outcome = tokio::time::timeout(src.timeout, kind.fetch(&cfg.config_dir)).await;
     #[allow(clippy::cast_possible_truncation)] // durations fit easily
     let ms = start.elapsed().as_millis() as i64;
     let success = match &outcome {
         Ok(Ok(value)) => {
-            let stored = db.insert_reading(&src.name, value, src.unit.as_deref()).await;
+            let stored = db
+                .insert_reading(&src.name, value, src.unit.as_deref())
+                .await;
             if let Err(e) = &stored {
                 tracing::error!("insert reading `{}`: {e:#}", src.name);
             }
@@ -236,7 +282,13 @@ pub async fn fetch_once(db: &Db, cfg: &Config, src: &SourceCfg, kind: &source::S
                     true
                 }
                 Err(e) => {
-                    record_failure(db, &src.name, ms, &format!("fetched but failed to store: {e:#}")).await;
+                    record_failure(
+                        db,
+                        &src.name,
+                        ms,
+                        &format!("fetched but failed to store: {e:#}"),
+                    )
+                    .await;
                     false
                 }
             }
@@ -250,7 +302,10 @@ pub async fn fetch_once(db: &Db, cfg: &Config, src: &SourceCfg, kind: &source::S
                 db,
                 &src.name,
                 ms,
-                &format!("timed out after {}", humantime::format_duration(src.timeout)),
+                &format!(
+                    "timed out after {}",
+                    humantime::format_duration(src.timeout)
+                ),
             )
             .await;
             false
@@ -290,7 +345,10 @@ mod tests {
         let cron: Cron = "* * * * * *".parse().unwrap();
         let now = chrono::Utc::now();
         let delay = next_cron_delay(&cron, now);
-        assert!(delay <= std::time::Duration::from_secs(1), "a per-second cron should fire within a second: {delay:?}");
+        assert!(
+            delay <= std::time::Duration::from_secs(1),
+            "a per-second cron should fire within a second: {delay:?}"
+        );
     }
 
     #[test]

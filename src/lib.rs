@@ -72,7 +72,9 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
 async fn shutdown_signal() {
     let ctrl_c = async {
         #[allow(clippy::expect_used)] // no reasonable fallback if this fails
-        tokio::signal::ctrl_c().await.expect("failed to install the Ctrl+C signal handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install the Ctrl+C signal handler");
     };
     #[cfg(unix)]
     let terminate = async {
@@ -134,7 +136,10 @@ pub fn build_router(state: AppState) -> topcoat::router::Router {
 /// tests: `AssetBundle::load()`'s next-to-executable convention doesn't
 /// apply to the test harness binary, which isn't `barduck`.
 #[must_use]
-pub fn build_router_with_bundle(state: AppState, bundle: Option<AssetBundle>) -> topcoat::router::Router {
+pub fn build_router_with_bundle(
+    state: AppState,
+    bundle: Option<AssetBundle>,
+) -> topcoat::router::Router {
     let builder = topcoat::router::Router::builder().discover().cookies();
     let builder = if let Some(b) = bundle {
         builder.assets(b)

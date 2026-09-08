@@ -5,7 +5,11 @@
 //! panel data model and the live panel-grid shard), and [`routes`] (the two
 //! actual pages).
 
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
 mod markdown;
 mod panels;

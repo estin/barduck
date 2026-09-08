@@ -4,9 +4,10 @@
 
 use super::markdown::formatted_content;
 use crate::{
-    AppState, config,
-    config::{Level, ValueFormat},
+    AppState,
     components::card::{card, card_content, card_footer},
+    config,
+    config::{Level, ValueFormat},
     health::{self, Health},
 };
 use topcoat::{
@@ -81,9 +82,15 @@ impl Panel {
     /// rationale as [`Panel::status_style`]).
     fn chip_style(&self) -> &'static str {
         match self.level_color() {
-            Level::Red => "background-color:var(--status-red-border);color:var(--status-red-chip-fg)",
-            Level::Yellow => "background-color:var(--status-yellow-border);color:var(--status-yellow-chip-fg)",
-            Level::Green => "background-color:var(--status-green-border);color:var(--status-green-chip-fg)",
+            Level::Red => {
+                "background-color:var(--status-red-border);color:var(--status-red-chip-fg)"
+            }
+            Level::Yellow => {
+                "background-color:var(--status-yellow-border);color:var(--status-yellow-chip-fg)"
+            }
+            Level::Green => {
+                "background-color:var(--status-green-border);color:var(--status-green-chip-fg)"
+            }
         }
     }
 
@@ -113,7 +120,11 @@ impl Panel {
     /// alongside it (spec: web-ui — group panes combining main/secondary/
     /// table sections).
     fn secondary_text(&self) -> String {
-        if self.status == Health::Failing { "FAILING".to_string() } else { self.value_and_unit() }
+        if self.status == Health::Failing {
+            "FAILING".to_string()
+        } else {
+            self.value_and_unit()
+        }
     }
 
     /// Human age of the latest reading, e.g. "12s ago" (spec: last update time).
@@ -174,7 +185,11 @@ impl Slot {
     /// member across all sections).
     fn group_status_style(&self) -> &'static str {
         border_style_for_color(config::worst_color(
-            self.main.iter().chain(&self.secondary).chain(&self.table).map(Panel::level_color),
+            self.main
+                .iter()
+                .chain(&self.secondary)
+                .chain(&self.table)
+                .map(Panel::level_color),
         ))
     }
 }
@@ -192,9 +207,15 @@ impl Slot {
 /// theme-aware (spec: web-ui — light/dark theme toggle).
 fn full_style_for_color(color: Option<Level>) -> &'static str {
     match color {
-        Some(Level::Red) => "border-color:var(--status-red-border);background-color:var(--status-red-bg);color:var(--status-red-fg)",
-        Some(Level::Yellow) => "border-color:var(--status-yellow-border);background-color:var(--status-yellow-bg);color:var(--status-yellow-fg)",
-        Some(Level::Green) => "border-color:var(--status-green-border);background-color:var(--status-green-bg);color:var(--status-green-fg)",
+        Some(Level::Red) => {
+            "border-color:var(--status-red-border);background-color:var(--status-red-bg);color:var(--status-red-fg)"
+        }
+        Some(Level::Yellow) => {
+            "border-color:var(--status-yellow-border);background-color:var(--status-yellow-bg);color:var(--status-yellow-fg)"
+        }
+        Some(Level::Green) => {
+            "border-color:var(--status-green-border);background-color:var(--status-green-bg);color:var(--status-green-fg)"
+        }
         None => "",
     }
 }
@@ -248,7 +269,9 @@ async fn build_panel(
         .or_else(|| src.and_then(config::SourceCfg::display_title))
         .unwrap_or(name);
     let row = latest.iter().find(|r| r.source == name);
-    let status = health::compute(&st.db, &st.cfg, name).await.map_or(Health::Stale, |h| h.status);
+    let status = health::compute(&st.db, &st.cfg, name)
+        .await
+        .map_or(Health::Stale, |h| h.status);
     let level = match row {
         Some(r) => src
             .filter(|s| !s.thresholds.is_empty())
@@ -258,9 +281,15 @@ async fn build_panel(
     let history = match src.filter(|s| !s.thresholds.is_empty() && s.show_history.unwrap_or(true)) {
         Some(s) => {
             let n = s.history_points.unwrap_or(st.cfg.history_points);
-            let recent = st.db.history(name, None, None, Some(i64::from(n))).await.unwrap_or_default();
-            let mut segments: Vec<Option<Level>> =
-                recent.iter().map(|r| config::level_for(&s.thresholds, &r.value)).collect();
+            let recent = st
+                .db
+                .history(name, None, None, Some(i64::from(n)))
+                .await
+                .unwrap_or_default();
+            let mut segments: Vec<Option<Level>> = recent
+                .iter()
+                .map(|r| config::level_for(&s.thresholds, &r.value))
+                .collect();
             let mut padded = vec![None; (n as usize).saturating_sub(segments.len())];
             padded.append(&mut segments);
             padded
@@ -297,21 +326,31 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
                 // explicit `space` cell (spec: web-ui — hidden sources render as
                 // space in the web dashboard).
                 let (main, secondary, table_panels, group_title, text_panel) = match cell {
-                    config::Cell::Group { title, main, secondary, table: cell_table } => {
-                        let main = match main
-                            .as_ref()
-                            .filter(|item| config::source_visible_in(&st.cfg, item.id(), config::View::Web))
-                        {
-                            Some(item) => Some(build_panel(st, &latest, item.id(), item.explicit_label()).await),
+                    config::Cell::Group {
+                        title,
+                        main,
+                        secondary,
+                        table: cell_table,
+                    } => {
+                        let main = match main.as_ref().filter(|item| {
+                            config::source_visible_in(&st.cfg, item.id(), config::View::Web)
+                        }) {
+                            Some(item) => Some(
+                                build_panel(st, &latest, item.id(), item.explicit_label()).await,
+                            ),
                             None => None,
                         };
                         let mut secondary_panels = Vec::new();
                         for item in config::visible_items(&st.cfg, secondary, config::View::Web) {
-                            secondary_panels.push(build_panel(st, &latest, item.id(), item.explicit_label()).await);
+                            secondary_panels.push(
+                                build_panel(st, &latest, item.id(), item.explicit_label()).await,
+                            );
                         }
                         let mut table_out = Vec::new();
                         for item in config::visible_items(&st.cfg, cell_table, config::View::Web) {
-                            table_out.push(build_panel(st, &latest, item.id(), item.explicit_label()).await);
+                            table_out.push(
+                                build_panel(st, &latest, item.id(), item.explicit_label()).await,
+                            );
                         }
                         (main, secondary_panels, table_out, title.clone(), None)
                     }
@@ -332,13 +371,20 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
                         (main, Vec::new(), Vec::new(), None, None)
                     }
                     config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None),
-                    config::Cell::Text { title, format, text } => (
+                    config::Cell::Text {
+                        title,
+                        format,
+                        text,
+                    } => (
                         None,
                         Vec::new(),
                         Vec::new(),
                         title.clone(),
                         Some(TextPanel {
-                            format: format.as_deref().and_then(|f| ValueFormat::parse(f).ok()).unwrap_or_default(),
+                            format: format
+                                .as_deref()
+                                .and_then(|f| ValueFormat::parse(f).ok())
+                                .unwrap_or_default(),
                             text: text.clone(),
                         }),
                     ),

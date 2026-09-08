@@ -20,7 +20,10 @@ fn filter_named<T: Named>(rows: Vec<T>, sources: &[String]) -> Vec<T> {
 /// short scalar — cramming it into `latest`'s fixed-width table would break
 /// the table's alignment, so it's set aside as a "text source" instead.
 fn is_text_source(cfg: &Config, name: &str) -> bool {
-    cfg.sources.iter().find(|s| s.name == name).and_then(|s| s.format)
+    cfg.sources
+        .iter()
+        .find(|s| s.name == name)
+        .and_then(|s| s.format)
         == Some(crate::config::ValueFormat::Markdown)
 }
 
@@ -59,8 +62,9 @@ pub async fn print_latest(
     // table — `--no-text` drops them entirely; otherwise they're appended
     // after the table (or after the array, in `--json` mode) instead of
     // being interleaved with the tabular rows.
-    let (mut values, mut text): (Vec<_>, Vec<_>) =
-        rows.into_iter().partition(|r| !is_text_source(cfg, &r.source));
+    let (mut values, mut text): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|r| !is_text_source(cfg, &r.source));
     if exclude_text {
         text.clear();
     }
@@ -73,7 +77,13 @@ pub async fn print_latest(
     header("latest values");
     println!("{:<24} {:>14}  {:<6} TIMESTAMP", "SOURCE", "VALUE", "UNIT");
     for r in values {
-        println!("{:<24} {:>14}  {:<6} {}", r.source, r.value, r.unit.unwrap_or_default(), r.ts);
+        println!(
+            "{:<24} {:>14}  {:<6} {}",
+            r.source,
+            r.value,
+            r.unit.unwrap_or_default(),
+            r.ts
+        );
     }
     if !text.is_empty() {
         println!();
@@ -102,7 +112,13 @@ pub async fn print_history(
     header(&format!("history for `{source}`"));
     println!("{:<24} {:>14}  {:<6} TIMESTAMP", "SOURCE", "VALUE", "UNIT");
     for r in rows {
-        println!("{:<24} {:>14}  {:<6} {}", r.source, r.value, r.unit.unwrap_or_default(), r.ts);
+        println!(
+            "{:<24} {:>14}  {:<6} {}",
+            r.source,
+            r.value,
+            r.unit.unwrap_or_default(),
+            r.ts
+        );
     }
     Ok(())
 }
@@ -119,7 +135,10 @@ pub async fn print_health(
         return Ok(());
     }
     header("source health");
-    println!("{:<24} {:<10} {:>10} LAST SUCCESS", "SOURCE", "STATUS", "FAILS");
+    println!(
+        "{:<24} {:<10} {:>10} LAST SUCCESS",
+        "SOURCE", "STATUS", "FAILS"
+    );
     for h in rows {
         println!(
             "{:<24} {:<10} {:>10} {}",
@@ -132,7 +151,12 @@ pub async fn print_health(
     Ok(())
 }
 
-pub async fn print_logs(backend: &Backend, limit: i64, sources: &[String], json: bool) -> Result<()> {
+pub async fn print_logs(
+    backend: &Backend,
+    limit: i64,
+    sources: &[String],
+    json: bool,
+) -> Result<()> {
     let rows = filter_named(backend.logs(limit).await?, sources);
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -176,8 +200,20 @@ mod tests {
     #[test]
     fn source_filter_is_noop_when_empty_and_filters_otherwise() {
         let rows = vec![
-            ReadingRow { source: "a".into(), value: "1".into(), unit: None, ts_epoch: 0.0, ts: String::new() },
-            ReadingRow { source: "b".into(), value: "2".into(), unit: None, ts_epoch: 0.0, ts: String::new() },
+            ReadingRow {
+                source: "a".into(),
+                value: "1".into(),
+                unit: None,
+                ts_epoch: 0.0,
+                ts: String::new(),
+            },
+            ReadingRow {
+                source: "b".into(),
+                value: "2".into(),
+                unit: None,
+                ts_epoch: 0.0,
+                ts: String::new(),
+            },
         ];
         assert_eq!(filter_named(rows.clone(), &[]).len(), 2);
         let filtered = filter_named(rows, &["b".into()]);

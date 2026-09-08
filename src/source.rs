@@ -20,9 +20,10 @@ pub enum SourceKind {
 pub fn build(cfg: &SourceCfg) -> Result<SourceKind> {
     match cfg.kind {
         SourceType::Http => Ok(SourceKind::Http {
-            url: cfg.url.clone().ok_or_else(|| {
-                anyhow::anyhow!("http source `{}` requires `url`", cfg.name)
-            })?,
+            url: cfg
+                .url
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("http source `{}` requires `url`", cfg.name))?,
             selector: cfg.selector.clone().unwrap_or_default(),
         }),
         SourceType::Script => Ok(SourceKind::Script {
@@ -90,7 +91,10 @@ impl Drop for KillGroupOnDrop {
         if let Some(pgid) = self.0.take() {
             // Fire-and-forget: the negative pid targets the whole process
             // group `process_group(0)` put the command in at spawn time.
-            let _ = std::process::Command::new("kill").arg("-KILL").arg(format!("-{pgid}")).spawn();
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{pgid}"))
+                .spawn();
         }
     }
 }
@@ -151,8 +155,12 @@ mod tests {
         // leader; `$$` inside it is that leader's pid.
         let cmd = format!("echo $$ > {}; sleep 5", pid_file.display());
 
-        let outcome = tokio::time::timeout(Duration::from_millis(200), run_shell(&cmd, dir.path())).await;
-        assert!(outcome.is_err(), "expected the outer timeout to fire before `sleep 5` finishes");
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(200), run_shell(&cmd, dir.path())).await;
+        assert!(
+            outcome.is_err(),
+            "expected the outer timeout to fire before `sleep 5` finishes"
+        );
 
         let pid = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -175,6 +183,9 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(!alive, "process group {pid} is still alive after cancellation");
+        assert!(
+            !alive,
+            "process group {pid} is still alive after cancellation"
+        );
     }
 }

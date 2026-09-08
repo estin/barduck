@@ -10,7 +10,10 @@ use anyhow::{Context as _, Result};
 #[derive(Clone)]
 pub enum Backend {
     Direct(Db),
-    Daemon { base: String, client: reqwest::Client },
+    Daemon {
+        base: String,
+        client: reqwest::Client,
+    },
 }
 
 impl Backend {
@@ -34,7 +37,12 @@ impl Backend {
         }
     }
 
-    pub async fn history(&self, source: &str, from: Option<f64>, to: Option<f64>) -> Result<Vec<db::ReadingRow>> {
+    pub async fn history(
+        &self,
+        source: &str,
+        from: Option<f64>,
+        to: Option<f64>,
+    ) -> Result<Vec<db::ReadingRow>> {
         match self {
             Backend::Direct(db) => db.history(source, from, to, None).await,
             Backend::Daemon { base, client } => {
@@ -89,7 +97,9 @@ async fn get<T: serde::de::DeserializeOwned>(client: &reqwest::Client, url: &str
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("daemon returned {status}: {}", truncate(&body, 300));
     }
-    resp.json().await.with_context(|| format!("decoding response from {url}"))
+    resp.json()
+        .await
+        .with_context(|| format!("decoding response from {url}"))
 }
 
 fn truncate(s: &str, n: usize) -> String {

@@ -1,8 +1,6 @@
 use anyhow::{Context as _, Result};
+use barduck::{cli_report, config, db::Db, query::Backend, run_daemon, tui};
 use clap::{Args, Parser, Subcommand};
-use barduck::{
-    cli_report, config, db::Db, query::Backend, run_daemon, tui,
-};
 use std::io::Write as _;
 
 #[derive(Parser)]
@@ -92,8 +90,7 @@ fn confirm(prompt: &str) -> Result<bool> {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -117,7 +114,12 @@ fn main() -> Result<()> {
             flags.json,
             no_text,
         )),
-        Cmd::History { source, from, to, flags } => {
+        Cmd::History {
+            source,
+            from,
+            to,
+            flags,
+        } => {
             let from = from.as_deref().map(cli_report::parse_time).transpose()?;
             let to = to.as_deref().map(cli_report::parse_time).transpose()?;
             rt()?.block_on(cli_report::print_history(
@@ -128,8 +130,18 @@ fn main() -> Result<()> {
                 flags.json,
             ))
         }
-        Cmd::Health(a) => rt()?.block_on(cli_report::print_health(&Backend::new(&cfg, a.daemon)?, &cfg, &a.source, a.json)),
-        Cmd::Logs { limit, flags } => rt()?.block_on(cli_report::print_logs(&Backend::new(&cfg, flags.daemon)?, limit, &flags.source, flags.json)),
+        Cmd::Health(a) => rt()?.block_on(cli_report::print_health(
+            &Backend::new(&cfg, a.daemon)?,
+            &cfg,
+            &a.source,
+            a.json,
+        )),
+        Cmd::Logs { limit, flags } => rt()?.block_on(cli_report::print_logs(
+            &Backend::new(&cfg, flags.daemon)?,
+            limit,
+            &flags.source,
+            flags.json,
+        )),
         Cmd::Reset { yes } => {
             if !yes
                 && !confirm(&format!(

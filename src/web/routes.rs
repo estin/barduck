@@ -1,17 +1,15 @@
 //! The two server-rendered pages: the dashboard itself and the per-source
 //! log view.
 
-use super::{
-    panels::panels_grid,
-    theme::theme_class,
-};
+use super::{panels::panels_grid, theme::theme_class};
 use crate::{
-    AppState, config,
+    AppState,
     components::{
         badge::{BadgeVariant, badge},
         button::{ButtonSize, ButtonVariant, button},
         table::{table, table_body, table_cell, table_head, table_header, table_row},
     },
+    config,
 };
 use topcoat::{
     Result,
@@ -205,9 +203,9 @@ pub async fn source_logs(cx: &Cx) -> Result {
         }
     };
     let Some(src) = st.cfg.sources.iter().find(|s| s.name == source) else {
-        return Err(topcoat::Error::from(topcoat::router::error::bad_request(format!(
-            "unknown source `{source}`"
-        ))));
+        return Err(topcoat::Error::from(topcoat::router::error::bad_request(
+            format!("unknown source `{source}`"),
+        )));
     };
     let rows = st.db.logs(Some(&source), 50).await.unwrap_or_default();
     let theme = theme_class(cx);

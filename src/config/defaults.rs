@@ -45,7 +45,10 @@ pub(crate) fn apply_env_overrides(cfg: &mut Config) -> Result<()> {
 /// Same as [`apply_env_overrides`], but reads variables through `lookup`
 /// instead of the real process environment — lets tests exercise the
 /// override logic without mutating global process state.
-pub(crate) fn apply_env_overrides_from(cfg: &mut Config, lookup: impl Fn(&str) -> Option<String>) -> Result<()> {
+pub(crate) fn apply_env_overrides_from(
+    cfg: &mut Config,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
     if let Some(v) = lookup("BARDUCK_DATABASE_PATH") {
         cfg.database_path = PathBuf::from(v);
     }

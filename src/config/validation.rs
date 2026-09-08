@@ -13,7 +13,11 @@ pub(crate) fn validate_source(s: &SourceCfg) -> Result<()> {
     // nowhere, so it's restricted to a safe charset rather than trusted as
     // opaque (spec: source-configuration — source names are URL-safe
     // identifiers); use `title` for a human-friendly display label instead.
-    if !s.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !s
+        .name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         bail!(
             "source `{}` name must contain only ASCII letters, digits, `_`, or `-`",
             s.name
@@ -31,7 +35,10 @@ pub(crate) fn validate_source(s: &SourceCfg) -> Result<()> {
         bail!("source `{}` interval must be > 0", s.name);
     }
     if s.interval.is_some() && s.cron.is_some() {
-        bail!("source `{}` cannot declare both `interval` and `cron`", s.name);
+        bail!(
+            "source `{}` cannot declare both `interval` and `cron`",
+            s.name
+        );
     }
     if let Some(iv) = s.retry_interval
         && iv.is_zero()
@@ -45,11 +52,20 @@ pub(crate) fn validate_source(s: &SourceCfg) -> Result<()> {
         );
     }
     if let Some(expr) = &s.cron {
-        let cron: croner::Cron = expr
-            .parse()
-            .map_err(|e| anyhow::anyhow!("source `{}` has invalid cron expression `{expr}`: {e}", s.name))?;
-        if cron.find_next_occurrence(&chrono::Utc::now(), true).is_err() {
-            bail!("source `{}` cron expression `{expr}` has no future occurrence", s.name);
+        let cron: croner::Cron = expr.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "source `{}` has invalid cron expression `{expr}`: {e}",
+                s.name
+            )
+        })?;
+        if cron
+            .find_next_occurrence(&chrono::Utc::now(), true)
+            .is_err()
+        {
+            bail!(
+                "source `{}` cron expression `{expr}` has no future occurrence",
+                s.name
+            );
         }
     }
     for t in &s.thresholds {
@@ -58,7 +74,10 @@ pub(crate) fn validate_source(s: &SourceCfg) -> Result<()> {
         }
     }
     if s.thresholds.len() == 1 {
-        bail!("source `{}` needs at least 2 thresholds to form bands", s.name);
+        bail!(
+            "source `{}` needs at least 2 thresholds to form bands",
+            s.name
+        );
     }
     if s.history_points == Some(0) {
         bail!("source `{}` history_points must be > 0", s.name);
@@ -66,7 +85,12 @@ pub(crate) fn validate_source(s: &SourceCfg) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_cell(cfg: &Config, layout_title: &str, row_idx: usize, cell: &Cell) -> Result<()> {
+pub(crate) fn validate_cell(
+    cfg: &Config,
+    layout_title: &str,
+    row_idx: usize,
+    cell: &Cell,
+) -> Result<()> {
     match cell {
         Cell::Source(name) | Cell::Pane { id: name, .. } => {
             if !cfg.sources.iter().any(|s| &s.name == name) {
@@ -81,20 +105,37 @@ pub(crate) fn validate_cell(cfg: &Config, layout_title: &str, row_idx: usize, ce
         Cell::Space {
             colspan: Some(0), ..
         } => {
-            bail!("layout `{}` row {} has a space with colspan 0", layout_title, row_idx + 1);
+            bail!(
+                "layout `{}` row {} has a space with colspan 0",
+                layout_title,
+                row_idx + 1
+            );
         }
         Cell::Space { .. } => {}
         Cell::Text { text, format, .. } => {
             if text.is_empty() {
-                bail!("layout `{}` row {} has a text panel with empty text", layout_title, row_idx + 1);
+                bail!(
+                    "layout `{}` row {} has a text panel with empty text",
+                    layout_title,
+                    row_idx + 1
+                );
             }
             if let Some(fmt) = format {
                 ValueFormat::parse(fmt)?;
             }
         }
-        Cell::Group { title, main, secondary, table } => {
+        Cell::Group {
+            title,
+            main,
+            secondary,
+            table,
+        } => {
             if title.as_deref() == Some("") {
-                bail!("layout `{}` row {} has a group with an empty title", layout_title, row_idx + 1);
+                bail!(
+                    "layout `{}` row {} has a group with an empty title",
+                    layout_title,
+                    row_idx + 1
+                );
             }
             let group_label = title.as_deref().unwrap_or("<untitled>");
             if main.is_none() && secondary.is_empty() && table.is_empty() {

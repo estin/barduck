@@ -46,7 +46,11 @@ pub(super) fn markdown_to_html(value: &str) -> Unescaped<String> {
 /// (design.md — factor format-rendering logic).
 #[component]
 pub(super) async fn formatted_content(format: ValueFormat, value: String, unit: String) -> Result {
-    let value_and_unit = if unit.is_empty() { value.clone() } else { format!("{value} {unit}") };
+    let value_and_unit = if unit.is_empty() {
+        value.clone()
+    } else {
+        format!("{value} {unit}")
+    };
     view! {
         if format == ValueFormat::Markdown {
             <div class="prose prose-sm max-w-none">(markdown_to_html(&value))</div>

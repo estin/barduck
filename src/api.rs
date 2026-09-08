@@ -1,13 +1,12 @@
-use crate::{AppState, health};use serde::Deserialize;
+use crate::{AppState, health};
+use serde::Deserialize;
 use topcoat::{
     Result,
     context::{Cx, app_context},
     cookie::{Cookie, Cookies, cookie, cookies, time::Duration},
     router::{
-        Body, StatusCode,
-        content::Json,
-        error::bad_request,
-        path_param, request::uri, response::Response, route,
+        Body, StatusCode, content::Json, error::bad_request, path_param, request::uri,
+        response::Response, route,
     },
 };
 
@@ -91,10 +90,8 @@ pub async fn history(cx: &Cx) -> Result<Response> {
             &format!("unknown source `{source}`"),
         ));
     }
-    let q: RangeQuery =
-        serde_urlencoded::from_str(uri(cx).query().unwrap_or("")).map_err(|e| {
-            topcoat::Error::from(bad_request(format!("invalid time range query: {e}")))
-        })?;
+    let q: RangeQuery = serde_urlencoded::from_str(uri(cx).query().unwrap_or(""))
+        .map_err(|e| topcoat::Error::from(bad_request(format!("invalid time range query: {e}"))))?;
     match st.db.history(&source, q.from, q.to, q.limit).await {
         Ok(rows) => Ok(json_ok(&rows)),
         Err(e) => Ok(json_err(
@@ -115,7 +112,7 @@ pub async fn health_all(cx: &Cx) -> Result<Response> {
                 return Ok(json_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("{e:#}"),
-                ))
+                ));
             }
         }
     }
@@ -144,7 +141,10 @@ struct ThemeBody {
 #[route(POST "/api/theme")]
 pub async fn set_theme(cx: &Cx, Json(body): Json<ThemeBody>) -> Result<Response> {
     if body.theme != "dark" && body.theme != "light" {
-        return Ok(json_err(StatusCode::BAD_REQUEST, "theme must be \"dark\" or \"light\""));
+        return Ok(json_err(
+            StatusCode::BAD_REQUEST,
+            "theme must be \"dark\" or \"light\"",
+        ));
     }
     let name = crate::web::THEME_COOKIE;
     let c: Cookie = cookie! {

@@ -76,7 +76,11 @@ pub fn level_for(thresholds: &[Threshold], value: &str) -> Option<Level> {
     let v: f64 = value.trim().parse().ok()?;
     let mut bands: Vec<&Threshold> = thresholds.iter().collect();
     bands.sort_by(|a, b| a.bound.total_cmp(&b.bound));
-    bands.iter().find(|t| v <= t.bound).or_else(|| bands.last()).map(|t| t.level)
+    bands
+        .iter()
+        .find(|t| v <= t.bound)
+        .or_else(|| bands.last())
+        .map(|t| t.level)
 }
 
 /// Resolves the accent color for a source's aggregate/alerting signal (a
@@ -221,7 +225,10 @@ impl SourceCfg {
 /// source-configuration — per-source view visibility).
 #[must_use]
 pub fn source_visible_in(cfg: &Config, name: &str, view: View) -> bool {
-    cfg.sources.iter().find(|s| s.name == name).is_none_or(|s| s.visible_in(view))
+    cfg.sources
+        .iter()
+        .find(|s| s.name == name)
+        .is_none_or(|s| s.visible_in(view))
 }
 
 /// One member of a [`super::Cell::Group`]'s `main`/`secondary`/`table`
@@ -259,5 +266,8 @@ impl GroupItem {
 /// sources render as space/empty).
 #[must_use]
 pub fn visible_items<'a>(cfg: &Config, items: &'a [GroupItem], view: View) -> Vec<&'a GroupItem> {
-    items.iter().filter(|item| source_visible_in(cfg, item.id(), view)).collect()
+    items
+        .iter()
+        .filter(|item| source_visible_in(cfg, item.id(), view))
+        .collect()
 }

@@ -1,4 +1,8 @@
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
 //! Shared "N ago" formatting for panel update times (web UI and TUI).
 
@@ -56,11 +60,17 @@ mod tests {
 
     #[test]
     fn rounds_down_to_hours() {
-        assert_eq!(ago(1000.0 + 3_600.0 * 3.0 + 59.0, 1000.0), Some("3h ago".into()));
+        assert_eq!(
+            ago(1000.0 + 3_600.0 * 3.0 + 59.0, 1000.0),
+            Some("3h ago".into())
+        );
     }
 
     #[test]
     fn rounds_down_to_days() {
-        assert_eq!(ago(1000.0 + 86_400.0 * 2.0 + 3_600.0, 1000.0), Some("2d ago".into()));
+        assert_eq!(
+            ago(1000.0 + 86_400.0 * 2.0 + 3_600.0, 1000.0),
+            Some("2d ago".into())
+        );
     }
 }

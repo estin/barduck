@@ -152,23 +152,27 @@ mod tests {
     use defaults::{apply_env_overrides_from, default_interval, default_retry_interval};
 
     fn source_toml(extra: &str) -> String {
-        format!(
-            "[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n{extra}\n"
-        )
+        format!("[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n{extra}\n")
     }
 
     #[test]
     fn invalid_tui_width_string_rejected() {
         let cfg: Config = toml::from_str("tui_width = \"wide\"").unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("wide"), "error should name the invalid value: {err}");
+        assert!(
+            err.to_string().contains("wide"),
+            "error should name the invalid value: {err}"
+        );
     }
 
     #[test]
     fn zero_tui_width_rejected() {
         let cfg: Config = toml::from_str("tui_width = 0").unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("tui_width"), "error should name the field: {err}");
+        assert!(
+            err.to_string().contains("tui_width"),
+            "error should name the field: {err}"
+        );
     }
 
     #[test]
@@ -180,7 +184,8 @@ mod tests {
 
     #[test]
     fn humantime_duration_parses_and_applies() {
-        let cfg: Config = toml::from_str(&source_toml("interval = \"5m\"\ntimeout = \"30s\"")).unwrap();
+        let cfg: Config =
+            toml::from_str(&source_toml("interval = \"5m\"\ntimeout = \"30s\"")).unwrap();
         validate(&cfg).unwrap();
         assert_eq!(cfg.sources[0].interval, Some(Duration::from_mins(5)));
         assert_eq!(cfg.sources[0].timeout, Duration::from_secs(30));
@@ -190,8 +195,14 @@ mod tests {
     fn invalid_duration_string_rejected() {
         let err = toml::from_str::<Config>(&source_toml("timeout = \"banana\"")).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("banana"), "error should name the invalid value: {msg}");
-        assert!(msg.contains("timeout"), "error should name the offending field: {msg}");
+        assert!(
+            msg.contains("banana"),
+            "error should name the invalid value: {msg}"
+        );
+        assert!(
+            msg.contains("timeout"),
+            "error should name the offending field: {msg}"
+        );
     }
 
     #[test]
@@ -211,14 +222,20 @@ mod tests {
     #[test]
     fn effective_retry_interval_falls_back_to_default_when_unset() {
         let cfg: Config = toml::from_str(&source_toml("")).unwrap();
-        assert_eq!(cfg.sources[0].effective_retry_interval(), default_retry_interval());
+        assert_eq!(
+            cfg.sources[0].effective_retry_interval(),
+            default_retry_interval()
+        );
     }
 
     #[test]
     fn effective_retry_interval_uses_declared_value() {
         let cfg: Config = toml::from_str(&source_toml("retry_interval = \"10s\"")).unwrap();
         validate(&cfg).unwrap();
-        assert_eq!(cfg.sources[0].effective_retry_interval(), Duration::from_secs(10));
+        assert_eq!(
+            cfg.sources[0].effective_retry_interval(),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]
@@ -236,13 +253,18 @@ mod tests {
     fn zero_retry_interval_rejected() {
         let cfg: Config = toml::from_str(&source_toml("retry_interval = \"0s\"")).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("retry_interval"), "error should name the field: {err}");
+        assert!(
+            err.to_string().contains("retry_interval"),
+            "error should name the field: {err}"
+        );
     }
 
     #[test]
     fn retry_interval_with_cron_rejected() {
-        let cfg: Config =
-            toml::from_str(&source_toml("cron = \"0 */5 * * * *\"\nretry_interval = \"10s\"")).unwrap();
+        let cfg: Config = toml::from_str(&source_toml(
+            "cron = \"0 */5 * * * *\"\nretry_interval = \"10s\"",
+        ))
+        .unwrap();
         let err = validate(&cfg).unwrap_err();
         assert!(
             err.to_string().contains("retry_interval") && err.to_string().contains("cron"),
@@ -255,14 +277,20 @@ mod tests {
         let cfg: Config =
             toml::from_str(&source_toml("interval = \"5m\"\nretry_interval = \"10s\"")).unwrap();
         validate(&cfg).unwrap();
-        assert_eq!(cfg.sources[0].effective_retry_interval(), Duration::from_secs(10));
+        assert_eq!(
+            cfg.sources[0].effective_retry_interval(),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]
     fn invalid_cron_expression_rejected() {
         let cfg: Config = toml::from_str(&source_toml("cron = \"not a cron\"")).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("cron"), "error should mention the invalid cron expression: {err}");
+        assert!(
+            err.to_string().contains("cron"),
+            "error should mention the invalid cron expression: {err}"
+        );
     }
 
     #[test]
@@ -296,12 +324,19 @@ mod tests {
         };
         assert_eq!(cell.span(), 1);
         assert_eq!(cell.pane_title(), Some("Links"));
-        assert!(cell.source_names().is_empty(), "a text cell has no backing source");
+        assert!(
+            cell.source_names().is_empty(),
+            "a text cell has no backing source"
+        );
     }
 
     #[test]
     fn text_cell_without_title_has_no_pane_title() {
-        let cell = Cell::Text { title: None, format: None, text: "note".into() };
+        let cell = Cell::Text {
+            title: None,
+            format: None,
+            text: "note".into(),
+        };
         assert_eq!(cell.pane_title(), None);
     }
 
@@ -313,7 +348,10 @@ mod tests {
         let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"Links\", format = \"markdown\", text = \"hi\" }]]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let cell = &cfg.layouts[0].rows[0][0];
-        assert!(matches!(cell, Cell::Text { .. }), "expected Cell::Text, got a different variant: {cell:?}");
+        assert!(
+            matches!(cell, Cell::Text { .. }),
+            "expected Cell::Text, got a different variant: {cell:?}"
+        );
         assert_eq!(cell.pane_title(), Some("Links"));
     }
 
@@ -329,7 +367,10 @@ mod tests {
         let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"Links\", text = \"\" }]]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("empty text"), "error should mention the empty text panel: {err}");
+        assert!(
+            err.to_string().contains("empty text"),
+            "error should mention the empty text panel: {err}"
+        );
     }
 
     #[test]
@@ -337,18 +378,30 @@ mod tests {
         let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ text = \"hi\", format = \"yaml\" }]]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("yaml"), "error should name the invalid format: {err}");
+        assert!(
+            err.to_string().contains("yaml"),
+            "error should name the invalid format: {err}"
+        );
     }
 
     #[test]
     fn accent_color_prioritizes_health_over_a_stale_band() {
         // Unhealthy overrides any band reading, banded or not.
-        assert_eq!(accent_color(Some(Level::Green), Health::Failing), Some(Level::Red));
-        assert_eq!(accent_color(Some(Level::Green), Health::Stale), Some(Level::Yellow));
+        assert_eq!(
+            accent_color(Some(Level::Green), Health::Failing),
+            Some(Level::Red)
+        );
+        assert_eq!(
+            accent_color(Some(Level::Green), Health::Stale),
+            Some(Level::Yellow)
+        );
         assert_eq!(accent_color(None, Health::Failing), Some(Level::Red));
         assert_eq!(accent_color(None, Health::Stale), Some(Level::Yellow));
         // Healthy: band color when present, else nothing to accent.
-        assert_eq!(accent_color(Some(Level::Red), Health::Healthy), Some(Level::Red));
+        assert_eq!(
+            accent_color(Some(Level::Red), Health::Healthy),
+            Some(Level::Red)
+        );
         assert_eq!(accent_color(None, Health::Healthy), None);
     }
 
@@ -360,7 +413,10 @@ mod tests {
 
     #[test]
     fn worst_color_ranks_red_over_yellow_over_green() {
-        assert_eq!(worst_color([Level::Green, Level::Yellow, Level::Red]), Level::Red);
+        assert_eq!(
+            worst_color([Level::Green, Level::Yellow, Level::Red]),
+            Level::Red
+        );
         assert_eq!(worst_color([Level::Green, Level::Yellow]), Level::Yellow);
         assert_eq!(worst_color([Level::Green, Level::Green]), Level::Green);
         assert_eq!(worst_color([]), Level::Green);
@@ -370,7 +426,11 @@ mod tests {
     fn group_item_explicit_label_none_for_bare_id() {
         assert_eq!(GroupItem::Id("vds-base1".into()).explicit_label(), None);
         assert_eq!(
-            GroupItem::Labeled { id: "vds-base1".into(), label: "days left".into() }.explicit_label(),
+            GroupItem::Labeled {
+                id: "vds-base1".into(),
+                label: "days left".into()
+            }
+            .explicit_label(),
             Some("days left")
         );
     }
@@ -380,7 +440,10 @@ mod tests {
         let cell = Cell::Group {
             title: Some("ihor".into()),
             main: Some(GroupItem::Id("a".into())),
-            secondary: vec![GroupItem::Labeled { id: "b".into(), label: "B".into() }],
+            secondary: vec![GroupItem::Labeled {
+                id: "b".into(),
+                label: "B".into(),
+            }],
             table: vec![GroupItem::Id("c".into())],
         };
         assert_eq!(cell.source_names(), vec!["a", "b", "c"]);
@@ -419,7 +482,10 @@ mod tests {
         let toml = "[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"\", table = [\"cpu\"] }]]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("empty title"), "error should mention empty title: {err}");
+        assert!(
+            err.to_string().contains("empty title"),
+            "error should mention empty title: {err}"
+        );
     }
 
     #[test]
@@ -443,38 +509,56 @@ mod tests {
     fn group_cell_unknown_source_in_main_rejected() {
         let cfg: Config = toml::from_str(&group_layout_toml("main = \"nope\"")).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("nope"), "error should name the unknown source: {err}");
+        assert!(
+            err.to_string().contains("nope"),
+            "error should name the unknown source: {err}"
+        );
     }
 
     #[test]
     fn group_cell_unknown_source_in_secondary_rejected() {
         let cfg: Config = toml::from_str(&group_layout_toml("secondary = [\"nope\"]")).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("nope"), "error should name the unknown source: {err}");
+        assert!(
+            err.to_string().contains("nope"),
+            "error should name the unknown source: {err}"
+        );
     }
 
     #[test]
     fn group_cell_unknown_source_in_table_rejected() {
         let cfg: Config = toml::from_str(&group_layout_toml("table = [\"nope\"]")).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("nope"), "error should name the unknown source: {err}");
+        assert!(
+            err.to_string().contains("nope"),
+            "error should name the unknown source: {err}"
+        );
     }
 
-    fn lookup_from(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
-        move |name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_string())
+    fn lookup_from(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
     }
 
     #[test]
     fn env_var_overrides_config_file_value() {
         let mut cfg: Config = toml::from_str("listen = \"127.0.0.1:8420\"").unwrap();
-        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_LISTEN", "0.0.0.0:9000")])).unwrap();
+        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_LISTEN", "0.0.0.0:9000")]))
+            .unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:9000");
     }
 
     #[test]
     fn env_var_overrides_default() {
         let mut cfg = Config::default();
-        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_HISTORY_POINTS", "100")])).unwrap();
+        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_HISTORY_POINTS", "100")]))
+            .unwrap();
         assert_eq!(cfg.history_points, 100);
     }
 
@@ -488,9 +572,15 @@ mod tests {
     #[test]
     fn unparseable_env_override_rejected() {
         let mut cfg = Config::default();
-        let err = apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_INTERVAL", "not-a-duration")]))
-            .unwrap_err();
-        assert!(err.to_string().contains("BARDUCK_INTERVAL"), "error should name the variable: {err}");
+        let err = apply_env_overrides_from(
+            &mut cfg,
+            lookup_from(&[("BARDUCK_INTERVAL", "not-a-duration")]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("BARDUCK_INTERVAL"),
+            "error should name the variable: {err}"
+        );
     }
 
     #[test]
@@ -515,7 +605,10 @@ mod tests {
         // `show_in` is a real enum now, so an invalid value is rejected at
         // deserialization rather than by a separate runtime check.
         let err = toml::from_str::<Config>(&source_toml("show_in = \"cli\"")).unwrap_err();
-        assert!(err.to_string().contains("cli"), "error should name the invalid value: {err}");
+        assert!(
+            err.to_string().contains("cli"),
+            "error should name the invalid value: {err}"
+        );
     }
 
     #[test]
@@ -539,7 +632,10 @@ mod tests {
         let cfg: Config = toml::from_str(toml).unwrap();
         let items = vec![GroupItem::Id("a".into()), GroupItem::Id("b".into())];
         let visible = visible_items(&cfg, &items, View::Tui);
-        assert_eq!(visible.iter().map(|i| i.id()).collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(
+            visible.iter().map(|i| i.id()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
     }
 
     #[test]

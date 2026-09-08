@@ -42,7 +42,9 @@ pub struct SourceHealth {
 /// single most recent successful fetch (for staleness) — neither scans the
 /// source's full log history.
 pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth> {
-    let logs = db.logs(Some(source), i64::from(cfg.failure_threshold)).await?;
+    let logs = db
+        .logs(Some(source), i64::from(cfg.failure_threshold))
+        .await?;
     #[allow(clippy::cast_possible_truncation)] // counts are small
     let failures = logs.iter().take_while(|l| !l.ok).count() as u32;
 
@@ -95,8 +97,11 @@ mod tests {
     fn source(name: &str, interval: Option<Duration>, cron: Option<&str>) -> SourceCfg {
         toml::from_str(&format!(
             "name = \"{name}\"\ntype = \"script\"\ncommand = \"echo 0\"\n{}{}",
-            interval.map(|d| format!("interval = \"{}\"\n", humantime::format_duration(d))).unwrap_or_default(),
-            cron.map(|c| format!("cron = \"{c}\"\n")).unwrap_or_default(),
+            interval
+                .map(|d| format!("interval = \"{}\"\n", humantime::format_duration(d)))
+                .unwrap_or_default(),
+            cron.map(|c| format!("cron = \"{c}\"\n"))
+                .unwrap_or_default(),
         ))
         .unwrap()
     }
@@ -122,7 +127,11 @@ mod tests {
     #[test]
     fn cron_source_with_an_old_success_is_not_stale() {
         let s = source("backup", None, Some("0 0 3 * * *"));
-        assert!(!is_stale(365.0 * 24.0 * 60.0 * 60.0, Some(&s), Duration::from_mins(5)));
+        assert!(!is_stale(
+            365.0 * 24.0 * 60.0 * 60.0,
+            Some(&s),
+            Duration::from_mins(5)
+        ));
     }
 
     #[test]

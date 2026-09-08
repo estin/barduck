@@ -102,7 +102,14 @@ impl WriteCmd {
     /// taking the advisory lock only for this one statement.
     fn run(self, db: &Db, conn: &Connection) {
         let (result, reply) = match self {
-            WriteCmd::InsertReading { source, value, unit, ts_epoch, ts, reply } => (
+            WriteCmd::InsertReading {
+                source,
+                value,
+                unit,
+                ts_epoch,
+                ts,
+                reply,
+            } => (
                 db.with_lock(|| {
                     conn.execute(
                         "INSERT INTO readings (id, source, value, unit, ts_epoch, ts)
@@ -113,7 +120,16 @@ impl WriteCmd {
                 }),
                 reply,
             ),
-            WriteCmd::InsertLog { source, ts_epoch, ts, ok, duration_ms, error, value, reply } => (
+            WriteCmd::InsertLog {
+                source,
+                ts_epoch,
+                ts,
+                ok,
+                duration_ms,
+                error,
+                value,
+                reply,
+            } => (
                 db.with_lock(|| {
                     conn.execute(
                         "INSERT INTO fetch_logs VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -123,7 +139,13 @@ impl WriteCmd {
                 }),
                 reply,
             ),
-            WriteCmd::InsertHealthEvent { source, ts_epoch, ts, status, reply } => (
+            WriteCmd::InsertHealthEvent {
+                source,
+                ts_epoch,
+                ts,
+                status,
+                reply,
+            } => (
                 db.with_lock(|| {
                     conn.execute(
                         "INSERT INTO health_events VALUES (?, ?, ?, ?)",
@@ -133,11 +155,23 @@ impl WriteCmd {
                 }),
                 reply,
             ),
-            WriteCmd::PurgeOlderThan { cutoff_epoch, reply } => (
+            WriteCmd::PurgeOlderThan {
+                cutoff_epoch,
+                reply,
+            } => (
                 db.with_lock(|| {
-                    conn.execute("DELETE FROM readings WHERE ts_epoch < ?", params![cutoff_epoch])?;
-                    conn.execute("DELETE FROM fetch_logs WHERE ts_epoch < ?", params![cutoff_epoch])?;
-                    conn.execute("DELETE FROM health_events WHERE ts_epoch < ?", params![cutoff_epoch])?;
+                    conn.execute(
+                        "DELETE FROM readings WHERE ts_epoch < ?",
+                        params![cutoff_epoch],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM fetch_logs WHERE ts_epoch < ?",
+                        params![cutoff_epoch],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM health_events WHERE ts_epoch < ?",
+                        params![cutoff_epoch],
+                    )?;
                     Ok(())
                 }),
                 reply,
@@ -249,11 +283,19 @@ fn create_schema(conn: &Connection) -> Result<()> {
 fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WriteCmd>();
     tokio::task::spawn_blocking(move || {
-        let db = Db { path, ro: false, writer: None };
+        let db = Db {
+            path,
+            ro: false,
+            writer: None,
+        };
         // The initial open races the same "read-only open sees a torn write"
         // hazard as any other operation, so it takes the lock too — briefly,
         // same as every write that follows.
-        let conn = match db.acquire().and_then(|guard| { let c = db.connect(); drop(guard); c }) {
+        let conn = match db.acquire().and_then(|guard| {
+            let c = db.connect();
+            drop(guard);
+            c
+        }) {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!("db writer: failed to open connection: {e:#}");
@@ -272,8 +314,13 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
             // data-collection — collector resilience). The caller still gets
             // an error either way: `run`'s reply sender is dropped mid-panic,
             // which resolves its `oneshot::Receiver` await to an error.
-            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.run(&db, &conn))) {
-                tracing::error!("db writer: write command panicked: {}", panic_message(&panic));
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.run(&db, &conn)))
+            {
+                tracing::error!(
+                    "db writer: write command panicked: {}",
+                    panic_message(&panic)
+                );
             }
         }
     });
@@ -438,7 +485,12 @@ impl Db {
         f()
     }
 
-    pub async fn insert_reading(&self, source: &str, value: &str, unit: Option<&str>) -> Result<()> {
+    pub async fn insert_reading(
+        &self,
+        source: &str,
+        value: &str,
+        unit: Option<&str>,
+    ) -> Result<()> {
         let (ts_epoch, ts) = now();
         if let Some(writer) = &self.writer {
             let (reply, rx) = oneshot::channel();
@@ -450,7 +502,9 @@ impl Db {
                 ts,
                 reply,
             };
-            writer.send(cmd).map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
+            writer
+                .send(cmd)
+                .map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
             return rx.await.context("db writer task dropped the reply")?;
         }
         let (_guard, conn) = self.connect_async().await?;
@@ -482,7 +536,9 @@ impl Db {
                 value: value.map(str::to_string),
                 reply,
             };
-            writer.send(cmd).map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
+            writer
+                .send(cmd)
+                .map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
             return rx.await.context("db writer task dropped the reply")?;
         }
         let (_guard, conn) = self.connect_async().await?;
@@ -513,7 +569,9 @@ impl Db {
                 status: status.to_string(),
                 reply,
             };
-            writer.send(cmd).map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
+            writer
+                .send(cmd)
+                .map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
             return rx.await.context("db writer task dropped the reply")?;
         }
         let (_guard, conn) = self.connect_async().await?;
@@ -571,7 +629,9 @@ impl Db {
         to: Option<f64>,
         limit: Option<i64>,
     ) -> Result<Vec<ReadingRow>> {
-        let limit = limit.unwrap_or(DEFAULT_HISTORY_LIMIT).clamp(1, MAX_HISTORY_LIMIT);
+        let limit = limit
+            .unwrap_or(DEFAULT_HISTORY_LIMIT)
+            .clamp(1, MAX_HISTORY_LIMIT);
         let (_guard, conn) = self.connect_async().await?;
         let mut stmt = conn.prepare(
             "SELECT source, value, unit, ts_epoch, ts FROM (
@@ -655,14 +715,26 @@ impl Db {
         if let Some(writer) = &self.writer {
             let (reply, rx) = oneshot::channel();
             writer
-                .send(WriteCmd::PurgeOlderThan { cutoff_epoch, reply })
+                .send(WriteCmd::PurgeOlderThan {
+                    cutoff_epoch,
+                    reply,
+                })
                 .map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
             return rx.await.context("db writer task dropped the reply")?;
         }
         let (_guard, conn) = self.connect_async().await?;
-        conn.execute("DELETE FROM readings WHERE ts_epoch < ?", params![cutoff_epoch])?;
-        conn.execute("DELETE FROM fetch_logs WHERE ts_epoch < ?", params![cutoff_epoch])?;
-        conn.execute("DELETE FROM health_events WHERE ts_epoch < ?", params![cutoff_epoch])?;
+        conn.execute(
+            "DELETE FROM readings WHERE ts_epoch < ?",
+            params![cutoff_epoch],
+        )?;
+        conn.execute(
+            "DELETE FROM fetch_logs WHERE ts_epoch < ?",
+            params![cutoff_epoch],
+        )?;
+        conn.execute(
+            "DELETE FROM health_events WHERE ts_epoch < ?",
+            params![cutoff_epoch],
+        )?;
         Ok(())
     }
 }

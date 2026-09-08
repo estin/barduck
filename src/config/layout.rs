@@ -62,8 +62,14 @@ pub enum TuiWidth {
 #[serde(untagged)]
 pub enum Cell {
     Source(String),
-    Pane { id: String, title: Option<String> },
-    Space { kind: String, colspan: Option<usize> },
+    Pane {
+        id: String,
+        title: Option<String>,
+    },
+    Space {
+        kind: String,
+        colspan: Option<usize>,
+    },
     Text {
         #[serde(default)]
         title: Option<String>,
@@ -96,7 +102,12 @@ impl Cell {
     pub fn source_names(&self) -> Vec<&str> {
         match self {
             Cell::Source(name) | Cell::Pane { id: name, .. } => vec![name],
-            Cell::Group { main, secondary, table, .. } => main
+            Cell::Group {
+                main,
+                secondary,
+                table,
+                ..
+            } => main
                 .iter()
                 .chain(secondary)
                 .chain(table)

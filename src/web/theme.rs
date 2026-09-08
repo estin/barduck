@@ -17,7 +17,11 @@ pub(crate) const THEME_COOKIE: &str = "bd_theme";
 /// `prefers-color-scheme` media query (`assets/styles.css`) decide, so a
 /// first-time visitor still gets their OS preference.
 pub(super) fn theme_class(cx: &Cx) -> &'static str {
-    match cookies(cx).get(THEME_COOKIE).as_ref().map(topcoat::cookie::Cookie::value) {
+    match cookies(cx)
+        .get(THEME_COOKIE)
+        .as_ref()
+        .map(topcoat::cookie::Cookie::value)
+    {
         Some("dark") => "dark",
         Some("light") => "light",
         _ => "",
