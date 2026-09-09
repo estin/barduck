@@ -81,7 +81,6 @@ enum WriteCmd {
         source: String,
         ts_epoch: f64,
         ts: String,
-        ok: bool,
         duration_ms: i64,
         error: Option<String>,
         value: Option<String>,
@@ -130,7 +129,6 @@ impl WriteCmd {
                 source,
                 ts_epoch,
                 ts,
-                ok,
                 duration_ms,
                 error,
                 value,
@@ -138,9 +136,9 @@ impl WriteCmd {
             } => (
                 db.with_lock(|| {
                     conn.execute(
-                        "INSERT INTO fetch_logs (id, source, ts_epoch, ts, ok, duration_ms, error, value)
-                         VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?, ?)",
-                        params![source, ts_epoch, ts, ok, duration_ms, error, value],
+                        "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                         VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?)",
+                        params![source, ts_epoch, ts, duration_ms, error, value],
                     )?;
                     Ok(())
                 }),
@@ -229,7 +227,6 @@ pub struct LogRow {
     pub source: String,
     pub ts_epoch: f64,
     pub ts: String,
-    pub ok: bool,
     pub duration_ms: i64,
     pub error: Option<String>,
     pub value: Option<String>,
@@ -286,8 +283,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
             source      VARCHAR NOT NULL,
             ts_epoch    DOUBLE NOT NULL,
             ts          VARCHAR NOT NULL,
-            ok          BOOLEAN NOT NULL,
             duration_ms BIGINT  NOT NULL,
+            -- Outcome is derived from whether `error` is set, not stored
+            -- separately (spec: data-collection — fetch attempts logged): a
+            -- failed attempt always carries error detail, a successful one
+            -- never does.
             error       VARCHAR,
             value       VARCHAR
         );
@@ -558,7 +558,6 @@ impl Db {
     pub async fn insert_log(
         &self,
         source: &str,
-        ok: bool,
         duration_ms: i64,
         error: Option<&str>,
         value: Option<&str>,
@@ -570,7 +569,6 @@ impl Db {
                 source: source.to_string(),
                 ts_epoch,
                 ts,
-                ok,
                 duration_ms,
                 error: error.map(str::to_string),
                 value: value.map(str::to_string),
@@ -583,9 +581,9 @@ impl Db {
         }
         let (_guard, conn) = self.connect_async().await?;
         conn.execute(
-            "INSERT INTO fetch_logs (id, source, ts_epoch, ts, ok, duration_ms, error, value)
-             VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?, ?)",
-            params![source, ts_epoch, ts, ok, duration_ms, error, value],
+            "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+             VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?)",
+            params![source, ts_epoch, ts, duration_ms, error, value],
         )?;
         Ok(())
     }
@@ -707,7 +705,7 @@ impl Db {
         // count in `health::compute`) rely on this being true newest-first
         // order, not an arbitrary tied order.
         let mut stmt = conn.prepare(
-            "SELECT source, ts_epoch, ts, ok, duration_ms, error, value FROM fetch_logs
+            "SELECT source, ts_epoch, ts, duration_ms, error, value FROM fetch_logs
              WHERE (?::VARCHAR IS NULL OR source = ?::VARCHAR)
              ORDER BY ts_epoch DESC, id DESC LIMIT ?",
         )?;
@@ -717,10 +715,9 @@ impl Db {
                     source: r.get(0)?,
                     ts_epoch: r.get(1)?,
                     ts: r.get(2)?,
-                    ok: r.get(3)?,
-                    duration_ms: r.get(4)?,
-                    error: r.get(5)?,
-                    value: r.get(6)?,
+                    duration_ms: r.get(3)?,
+                    error: r.get(4)?,
+                    value: r.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -729,12 +726,15 @@ impl Db {
 
     /// Most recent fetch log for `source`, if any (spec: data-collection —
     /// consecutive failures flip to failing). Used by [`crate::health::compute`]
-    /// instead of scanning the source's entire log history.
+    /// instead of scanning the source's entire log history. A successful
+    /// attempt is one with no error detail (spec: data-collection — fetch
+    /// attempts logged), so this filters on `error IS NULL` rather than a
+    /// separately stored outcome flag.
     pub async fn last_success(&self, source: &str) -> Result<Option<LogRow>> {
         let (_guard, conn) = self.connect_async().await?;
         let mut stmt = conn.prepare(
-            "SELECT source, ts_epoch, ts, ok, duration_ms, error, value FROM fetch_logs
-             WHERE source = ? AND ok
+            "SELECT source, ts_epoch, ts, duration_ms, error, value FROM fetch_logs
+             WHERE source = ? AND error IS NULL
              ORDER BY ts_epoch DESC, id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![source])?;
@@ -745,10 +745,38 @@ impl Db {
                     source: r.get(0)?,
                     ts_epoch: r.get(1)?,
                     ts: r.get(2)?,
-                    ok: r.get(3)?,
-                    duration_ms: r.get(4)?,
-                    error: r.get(5)?,
-                    value: r.get(6)?,
+                    duration_ms: r.get(3)?,
+                    error: r.get(4)?,
+                    value: r.get(5)?,
+                })
+            })
+            .transpose()?)
+    }
+
+    /// Most recent fetch log for `source` regardless of outcome, if any
+    /// (spec: data-collection — Per-source schedules: daemon startup resumes
+    /// from the last run). Outcome is derived from `error` presence (a
+    /// successful attempt carries no error detail), mirroring
+    /// [`Db::last_success`] but without its `error IS NULL` filter. Same
+    /// `ts_epoch DESC, id DESC` ordering so same-millisecond ties resolve
+    /// deterministically to the higher-id row.
+    pub async fn last_attempt(&self, source: &str) -> Result<Option<LogRow>> {
+        let (_guard, conn) = self.connect_async().await?;
+        let mut stmt = conn.prepare(
+            "SELECT source, ts_epoch, ts, duration_ms, error, value FROM fetch_logs
+             WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![source])?;
+        Ok(rows
+            .next()?
+            .map(|r| {
+                Ok::<_, duckdb::Error>(LogRow {
+                    source: r.get(0)?,
+                    ts_epoch: r.get(1)?,
+                    ts: r.get(2)?,
+                    duration_ms: r.get(3)?,
+                    error: r.get(4)?,
+                    value: r.get(5)?,
                 })
             })
             .transpose()?)
@@ -821,10 +849,10 @@ mod tests {
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
         db.with_conn(|conn| {
             conn.execute_batch(
-                "INSERT INTO fetch_logs (id, source, ts_epoch, ts, ok, duration_ms, error, value)
-                 VALUES (nextval('fetch_logs_id_seq'), 'a', 1000.0, 't', true, 1, NULL, 'first');
-                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, ok, duration_ms, error, value)
-                 VALUES (nextval('fetch_logs_id_seq'), 'a', 1000.0, 't', true, 1, NULL, 'second');",
+                "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'a', 1000.0, 't', 1, NULL, 'first');
+                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'a', 1000.0, 't', 1, NULL, 'second');",
             )?;
             Ok(())
         })
@@ -841,6 +869,32 @@ mod tests {
 
         let last = db.last_success("a").await.unwrap().unwrap();
         assert_eq!(last.value.as_deref(), Some("second"));
+    }
+
+    /// `last_attempt` returns the newest entry whatever its outcome, unlike
+    /// `last_success` (spec: data-collection — Per-source schedules: daemon
+    /// startup resumes from the last run).
+    #[tokio::test]
+    async fn last_attempt_returns_newest_row_regardless_of_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        assert!(db.last_attempt("missing").await.unwrap().is_none());
+
+        db.insert_log("s", 1, None, Some("ok")).await.unwrap();
+        let first = db.last_attempt("s").await.unwrap().unwrap();
+        assert!(first.error.is_none());
+
+        db.insert_log("s", 1, Some("boom"), None).await.unwrap();
+        let second = db.last_attempt("s").await.unwrap().unwrap();
+        assert_eq!(second.error.as_deref(), Some("boom"));
+
+        // A later success wins again, and `last_success` still skips failures.
+        db.insert_log("s", 1, None, Some("ok2")).await.unwrap();
+        let third = db.last_attempt("s").await.unwrap().unwrap();
+        assert!(third.error.is_none());
+        assert_eq!(third.value.as_deref(), Some("ok2"));
+        let success = db.last_success("s").await.unwrap().unwrap();
+        assert_eq!(success.value.as_deref(), Some("ok2"));
     }
 
     #[tokio::test]

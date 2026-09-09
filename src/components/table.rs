@@ -36,7 +36,7 @@ pub async fn table(#[default] mut attrs: Attributes, #[default] child: View) -> 
         <div class="w-full overflow-x-auto">
             <table
                 class=(class!(
-                    "w-full caption-bottom border-collapse text-sm",
+                    "w-full caption-bottom border-collapse text-xs",
                     attrs.remove("class"),
                 ))
                 (attrs)
@@ -114,7 +114,7 @@ pub async fn table_head(#[default] mut attrs: Attributes, #[default] child: View
     view! {
         <th
             class=(class!(
-                "h-10 px-3 text-left align-middle font-medium whitespace-nowrap \
+                "h-8 px-2 text-left align-middle font-medium whitespace-nowrap \
                  text-muted-foreground",
                 attrs.remove("class"),
             ))
@@ -131,7 +131,7 @@ pub async fn table_cell(#[default] mut attrs: Attributes, #[default] child: View
     view! {
         <td
             class=(class!(
-                "p-3 align-middle whitespace-nowrap",
+                "px-2 py-1 align-middle whitespace-nowrap",
                 attrs.remove("class"),
             ))
             (attrs)

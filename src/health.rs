@@ -46,7 +46,7 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
         .logs(Some(source), i64::from(cfg.failure_threshold))
         .await?;
     #[allow(clippy::cast_possible_truncation)] // counts are small
-    let failures = logs.iter().take_while(|l| !l.ok).count() as u32;
+    let failures = logs.iter().take_while(|l| l.error.is_some()).count() as u32;
 
     let last_success = db.last_success(source).await?;
     let last_success_ts = last_success.as_ref().map(|l| l.ts.clone());

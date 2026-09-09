@@ -166,7 +166,6 @@ async fn collection_writes_readings_logs_and_health_and_survives_restart() {
     let logs = db.logs(None, 100).await.unwrap();
     assert_eq!(logs.len(), 4);
     let dead = logs.iter().find(|l| l.source == "dead").unwrap();
-    assert!(!dead.ok);
     assert!(dead.error.is_some());
 
     // One failure with threshold 1 → failing.
@@ -319,10 +318,15 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
         page.contains(">Balance</span>"),
         "custom pane title expected"
     );
-    // Log link on the time-ago text.
+    // Log link on the time-ago text, opening in the current tab (spec:
+    // web-ui — per-source log view linked from panels).
     assert!(
-        page.contains(r#"href="/logs/balance" target="_blank""#),
+        page.contains(r#"href="/logs/balance""#),
         "per-source log link expected"
+    );
+    assert!(
+        !page.contains(r#"target="_blank""#),
+        "log link must not open in a new tab"
     );
 }
 
@@ -441,18 +445,22 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
         "group card/rows should carry no background color"
     );
     // Each row's label (not the "updated ago" text) links to its own
-    // source's log view, and carries no color of its own.
+    // source's log view, in the current tab, and carries no color of its own.
     assert!(
-        html.contains(r#"<a href="/logs/days-left" target="_blank" class="text-xs tracking-wide opacity-70 hover:opacity-100 hover:underline">days left</a>"#),
+        html.contains(r#"<a href="/logs/days-left" class="text-xs tracking-wide opacity-70 hover:opacity-100 hover:underline">days left</a>"#),
         "days-left label should link to its log view, uncolored"
     );
     assert!(
-        html.contains(r#"href="/logs/balance" target="_blank""#),
+        html.contains(r#"href="/logs/balance""#),
         "balance row log link expected"
     );
     assert!(
-        html.contains(r#"href="/logs/note" target="_blank""#),
+        html.contains(r#"href="/logs/note""#),
         "note row log link expected"
+    );
+    assert!(
+        !html.contains(r#"target="_blank""#),
+        "log links must not open in a new tab"
     );
     // These readings were all just collected, so no row is lagging — no
     // "updated ago" text should appear anywhere in the group card.
@@ -1360,6 +1368,20 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
         page.contains(r#"<html class="">"#),
         "no theme cookie yet: no explicit class rendered"
     );
+    // Header and footer stay pinned while the panel grid scrolls beneath
+    // them (spec: web-ui — dashboard header and footer stay pinned while
+    // scrolling): both use sticky positioning with an opaque background.
+    let header_start = page.find(r#"class="sticky top-0"#).expect("sticky header wrapper expected");
+    let banner_idx = page.find("bd-offline-banner").expect("offline banner expected");
+    let h1_idx = page.find("bd-theme-toggle").expect("header content expected");
+    assert!(
+        header_start < banner_idx && banner_idx < h1_idx,
+        "the offline banner and the h1 header must share the same sticky wrapper"
+    );
+    assert!(
+        page.contains(r#"class="sticky bottom-0"#),
+        "sticky footer expected"
+    );
 
     // Setting the theme cookie server-side changes what the server renders on
     // the very next request, with no client-side bootstrap script involved —
@@ -1667,7 +1689,6 @@ async fn setup_command_gates_fetch_and_recovers() {
     // Failed setup logged with prefix, no reading fetched, health failing.
     let logs = db.logs(Some("gated"), 10).await.unwrap();
     assert_eq!(logs.len(), 1);
-    assert!(!logs[0].ok);
     let err = logs[0].error.as_deref().unwrap();
     assert!(err.starts_with("setup:"), "unexpected error: {err}");
     assert!(
@@ -1825,7 +1846,7 @@ retry_interval = "100ms"
         logs.len()
     );
     assert!(
-        logs.iter().all(|l| !l.ok),
+        logs.iter().all(|l| l.error.is_some()),
         "every attempt should have failed"
     );
 }
@@ -1872,12 +1893,12 @@ retry_interval = "100ms"
         logs.len()
     );
     assert_eq!(
-        logs.iter().filter(|l| l.ok).count(),
+        logs.iter().filter(|l| l.error.is_none()).count(),
         1,
         "expected exactly one successful attempt"
     );
     assert_eq!(
-        logs.iter().filter(|l| !l.ok).count(),
+        logs.iter().filter(|l| l.error.is_some()).count(),
         1,
         "expected exactly one failed attempt"
     );
@@ -1917,7 +1938,7 @@ cron = "* * * * * *"
         logs.len()
     );
     assert!(
-        logs.iter().all(|l| !l.ok),
+        logs.iter().all(|l| l.error.is_some()),
         "every attempt should have failed"
     );
 }
@@ -2063,4 +2084,98 @@ async fn default_value_type_leaves_typed_columns_null() {
         )
         .unwrap();
     assert_eq!(row, ("hello".to_string(), None, None, None));
+}
+
+/// The log view shows a relative timestamp (not the raw stored one), colors
+/// the VALUE cell by the source's threshold band, and offers a back link
+/// (spec: web-ui — per-source log view linked from panels; log view relative
+/// timestamps and threshold coloring).
+#[tokio::test]
+async fn log_view_shows_relative_time_threshold_color_and_back_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{}"
+
+[[sources]]
+name = "cpu"
+type = "script"
+command = "echo 92"
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[layouts]]
+title = "Overview"
+rows = [["cpu"]]
+"#,
+        db_path.display()
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    let raw_ts = db.logs(Some("cpu"), 1).await.unwrap()[0].ts.clone();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/logs/cpu", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+
+    assert!(
+        html.contains(r#"<a href="/""#) && html.contains("Back to dashboard"),
+        "log view should link back to the dashboard"
+    );
+    assert!(
+        html.contains("ago") || html.contains("just now"),
+        "TIME cell should show relative time"
+    );
+    assert!(
+        html.contains(&format!("title=\"{raw_ts}\"")),
+        "TIME cell should carry the full raw timestamp as a hover tooltip"
+    );
+    assert!(
+        html.contains("color:var(--status-red-text)"),
+        "VALUE cell should carry the red threshold color"
+    );
+    // Live updates (spec: web-ui — log view live-refreshes without a full
+    // page reload): the table is served by the `log_rows` shard, wired the
+    // same way the dashboard wires `panels_grid` — a tick signal, a runtime
+    // script to drive it, and the shard's reactive-scope marker in the page.
+    assert!(
+        html.contains("data-bd-tick"),
+        "log view should declare the same kind of tick signal the dashboard uses"
+    );
+    assert!(
+        html.contains("/assets/bd-runtime.js"),
+        "log view should load the runtime script the tick signal needs"
+    );
+    assert!(
+        html.contains("::topcoat::scope::"),
+        "log table should be a shard with a reactive scope"
+    );
+    // Shared page chrome (spec: web-ui — header and footer stay pinned
+    // across pages): the log view renders through the same `page_chrome`
+    // the dashboard uses, so it gets the same header and footer.
+    assert!(
+        html.contains(r#"id="bd-theme-toggle""#),
+        "log view should share the dashboard's theme toggle"
+    );
+    assert!(
+        html.contains(r#"class="sticky top-0"#),
+        "log view should share the dashboard's sticky header"
+    );
+    assert!(
+        html.contains(r#"class="sticky bottom-0"#),
+        "log view should share the dashboard's sticky footer"
+    );
 }

@@ -163,12 +163,11 @@ pub async fn print_logs(
         return Ok(());
     }
     header("recent fetch logs");
-    println!("{:<24} {:<7} {:>9}  TIMESTAMP  ERROR", "SOURCE", "OK", "MS");
+    println!("{:<24} {:>9}  TIMESTAMP  ERROR", "SOURCE", "MS");
     for l in rows {
         println!(
-            "{:<24} {:<7} {:>9}  {}  {}",
+            "{:<24} {:>9}  {}  {}",
             l.source,
-            l.ok,
             l.duration_ms,
             l.ts,
             l.error.unwrap_or_default()

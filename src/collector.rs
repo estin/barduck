@@ -25,11 +25,12 @@ enum Schedule {
 impl Schedule {
     /// Built once per source at collector startup; the cron string was
     /// already validated at config load, so parsing here cannot fail. An
-    /// interval-scheduled source's first tick is due immediately unless its
-    /// last recorded success is still fresh, in which case it's deferred
-    /// until the remaining freshness window elapses instead of firing
-    /// unconditionally (spec: data-collection — Per-source schedules: daemon
-    /// startup scheduled by freshness).
+    /// interval-scheduled source's first tick resumes from its most recent
+    /// fetch log entry (any outcome): a fresh success defers until the
+    /// remaining `interval` elapses, a fresh failure defers until the
+    /// remaining `retry_interval` elapses, and an overdue (or absent) last
+    /// run is due immediately (spec: data-collection — Per-source
+    /// schedules: daemon startup resumes from the last run).
     async fn new(db: &Db, src: &SourceCfg) -> Result<Self> {
         if let Some(expr) = &src.cron {
             #[allow(clippy::expect_used)]
@@ -40,10 +41,12 @@ impl Schedule {
             Ok(Schedule::Cron(Box::new(cron)))
         } else {
             let effective_interval = src.effective_interval();
-            let next = first_interval_tick(db, &src.name, effective_interval).await?;
+            let retry_interval = src.effective_retry_interval();
+            let next =
+                first_interval_tick(db, &src.name, effective_interval, retry_interval).await?;
             Ok(Schedule::Interval {
                 effective_interval,
-                retry_interval: src.effective_retry_interval(),
+                retry_interval,
                 next,
             })
         }
@@ -97,28 +100,35 @@ fn next_cron_delay(cron: &Cron, now: chrono::DateTime<chrono::Utc>) -> std::time
         .unwrap_or(std::time::Duration::from_mins(1))
 }
 
-/// An interval-scheduled source's first tick after collector startup: due
-/// immediately if it has never succeeded, or its last success is already at
-/// least `interval` old; otherwise deferred until the remaining freshness
-/// window elapses (spec: data-collection — Per-source schedules: daemon
-/// startup scheduled by freshness, not unconditional).
+/// An interval-scheduled source's first tick after collector startup,
+/// resumed from its most recent fetch log entry: due immediately if it has
+/// never run; otherwise deferred until the remaining window elapses —
+/// `interval` after a success, `retry_interval` after a failure (error
+/// detail present) — or due immediately when already overdue (spec:
+/// data-collection — Per-source schedules: daemon startup resumes from the
+/// last run).
 async fn first_interval_tick(
     db: &Db,
     source: &str,
     interval: std::time::Duration,
+    retry_interval: std::time::Duration,
 ) -> Result<tokio::time::Instant> {
-    let Some(last) = db.last_success(source).await? else {
+    let Some(last) = db.last_attempt(source).await? else {
         return Ok(tokio::time::Instant::now());
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs_f64();
     let age = now - last.ts_epoch;
-    let interval_secs = interval.as_secs_f64();
-    Ok(if age >= interval_secs {
+    let wait_secs = if last.error.is_none() {
+        interval.as_secs_f64()
+    } else {
+        retry_interval.as_secs_f64()
+    };
+    Ok(if age >= wait_secs {
         tokio::time::Instant::now()
     } else {
-        tokio::time::Instant::now() + std::time::Duration::from_secs_f64(interval_secs - age)
+        tokio::time::Instant::now() + std::time::Duration::from_secs_f64(wait_secs - age)
     })
 }
 
@@ -304,8 +314,7 @@ pub async fn fetch_once(
                 }
                 match &stored {
                     Ok(()) => {
-                        if let Err(e) = db.insert_log(&src.name, true, ms, None, Some(value)).await
-                        {
+                        if let Err(e) = db.insert_log(&src.name, ms, None, Some(value)).await {
                             tracing::error!("insert log `{}`: {e:#}", src.name);
                         }
                         true
@@ -363,7 +372,7 @@ pub async fn fetch_once(
 }
 
 async fn record_failure(db: &Db, name: &str, ms: i64, error: &str) {
-    if let Err(e) = db.insert_log(name, false, ms, Some(error), None).await {
+    if let Err(e) = db.insert_log(name, ms, Some(error), None).await {
         tracing::error!("insert log `{name}`: {e:#}");
     }
 }
@@ -469,7 +478,7 @@ mod tests {
         );
         let logs = db.logs(Some("bad"), 10).await.unwrap();
         assert_eq!(logs.len(), 1);
-        assert!(!logs[0].ok);
+        assert!(logs[0].error.is_some());
         assert!(
             logs[0]
                 .error
@@ -480,21 +489,26 @@ mod tests {
         );
     }
 
-    /// (spec: data-collection — Per-source schedules: daemon startup
-    /// scheduled by freshness, not unconditional)
+    /// (spec: data-collection — Per-source schedules: daemon startup resumes
+    /// from the last run)
     #[tokio::test]
     async fn first_tick_is_immediate_when_source_never_succeeded() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
         let before = tokio::time::Instant::now();
 
-        let next = first_interval_tick(&db, "cpu", std::time::Duration::from_secs(30))
-            .await
-            .unwrap();
+        let next = first_interval_tick(
+            &db,
+            "cpu",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
 
         assert!(
             next.saturating_duration_since(before) < std::time::Duration::from_millis(300),
-            "a source with no prior success must be due immediately"
+            "a source with no prior run must be due immediately"
         );
     }
 
@@ -502,12 +516,17 @@ mod tests {
     async fn first_tick_is_deferred_when_last_success_is_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("cpu", true, 1, None, Some("42")).await.unwrap();
+        db.insert_log("cpu", 1, None, Some("42")).await.unwrap();
 
         let before = tokio::time::Instant::now();
-        let next = first_interval_tick(&db, "cpu", std::time::Duration::from_secs(3))
-            .await
-            .unwrap();
+        let next = first_interval_tick(
+            &db,
+            "cpu",
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
 
         let wait = next.saturating_duration_since(before);
         assert!(
@@ -520,17 +539,79 @@ mod tests {
     async fn first_tick_is_immediate_when_last_success_is_older_than_interval() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("cpu", true, 1, None, Some("42")).await.unwrap();
+        db.insert_log("cpu", 1, None, Some("42")).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let before = tokio::time::Instant::now();
-        let next = first_interval_tick(&db, "cpu", std::time::Duration::from_millis(50))
-            .await
-            .unwrap();
+        let next = first_interval_tick(
+            &db,
+            "cpu",
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
 
         assert!(
             next.saturating_duration_since(before) < std::time::Duration::from_millis(300),
             "a source whose last success is already older than its interval must be due immediately"
+        );
+    }
+
+    /// A fresh failure resumes on `retry_interval`, not the full interval
+    /// (spec: data-collection — Per-source schedules: daemon startup resumes
+    /// from the last run).
+    #[tokio::test]
+    async fn first_tick_defers_to_retry_interval_when_last_attempt_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_log("cpu", 1, Some("timeout"), None)
+            .await
+            .unwrap();
+
+        let before = tokio::time::Instant::now();
+        let next = first_interval_tick(
+            &db,
+            "cpu",
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+
+        let wait = next.saturating_duration_since(before);
+        assert!(
+            wait > std::time::Duration::from_millis(2500),
+            "a freshly failed source should wait out its retry interval, got {wait:?}"
+        );
+        assert!(
+            wait < std::time::Duration::from_secs(30),
+            "a freshly failed source must not wait the full interval, got {wait:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_tick_is_immediate_when_last_failure_is_older_than_retry_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_log("cpu", 1, Some("timeout"), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let before = tokio::time::Instant::now();
+        let next = first_interval_tick(
+            &db,
+            "cpu",
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            next.saturating_duration_since(before) < std::time::Duration::from_millis(300),
+            "a source whose last failure is already older than its retry interval must be due immediately"
         );
     }
 
@@ -541,7 +622,7 @@ mod tests {
     async fn schedule_new_ignores_freshness_for_cron_sources() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("backup", true, 1, None, Some("ok"))
+        db.insert_log("backup", 1, None, Some("ok"))
             .await
             .unwrap();
         let src = cron_source("backup", "0 0 3 * * *");

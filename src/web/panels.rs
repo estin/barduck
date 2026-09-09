@@ -239,7 +239,7 @@ fn border_style_for_color(color: Level) -> &'static str {
 /// pane, which has no border or background of its own. `None` renders as no
 /// override — the row's value inherits the default text color instead of a
 /// forced green.
-fn text_style_for_color(color: Option<Level>) -> &'static str {
+pub(super) fn text_style_for_color(color: Option<Level>) -> &'static str {
     match color {
         Some(Level::Red) => "color:var(--status-red-text)",
         Some(Level::Yellow) => "color:var(--status-yellow-text)",
@@ -523,7 +523,6 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                         <span>(main.status.as_str())</span>
                                         <a
                                             href=(format!("/logs/{}", main.source))
-                                            target="_blank"
                                             class="normal-case opacity-60 hover:opacity-100 hover:underline"
                                         >
                                             (format!("updated {}", main.updated_ago()))
@@ -560,7 +559,6 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                                 }
                                                 <a
                                                     href=(format!("/logs/{}", main.source))
-                                                    target="_blank"
                                                     class="opacity-60 hover:opacity-100 hover:underline"
                                                 >
                                                     (format!("updated {}", main.updated_ago()))
@@ -580,7 +578,6 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                             for p in &slot.secondary {
                                                 <a
                                                     href=(format!("/logs/{}", p.source))
-                                                    target="_blank"
                                                     class="text-sm font-semibold hover:underline"
                                                     style=(p.group_row_style())
                                                 >
@@ -594,7 +591,6 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                             <div class="flex justify-between items-center gap-2">
                                                 <a
                                                     href=(format!("/logs/{}", p.source))
-                                                    target="_blank"
                                                     class="text-xs tracking-wide opacity-70 hover:opacity-100 hover:underline"
                                                 >
                                                     (p.name.clone())
