@@ -23,16 +23,17 @@ enum Schedule {
 }
 
 impl Schedule {
-    /// Built once per source at collector startup; the cron string was
+    /// Built once per query source at collector startup; the cron string was
     /// already validated at config load, so parsing here cannot fail. An
-    /// interval-scheduled source's first tick resumes from its most recent
+    /// interval-scheduled query's first tick resumes from its most recent
     /// fetch log entry (any outcome): a fresh success defers until the
     /// remaining `interval` elapses, a fresh failure defers until the
     /// remaining `retry_interval` elapses, and an overdue (or absent) last
     /// run is due immediately (spec: data-collection — Per-source
-    /// schedules: daemon startup resumes from the last run).
+    /// schedules: daemon startup resumes from the last run). Stream sources
+    /// never reach this constructor — they are ingested continuously.
     async fn new(db: &Db, src: &SourceCfg) -> Result<Self> {
-        if let Some(expr) = &src.cron {
+        if let Some(expr) = src.cron() {
             #[allow(clippy::expect_used)]
             // validated at config load (spec: source-configuration — cron schedule)
             let cron: Cron = expr
@@ -43,7 +44,7 @@ impl Schedule {
             let effective_interval = src.effective_interval();
             let retry_interval = src.effective_retry_interval();
             let next =
-                first_interval_tick(db, &src.name, effective_interval, retry_interval).await?;
+                first_interval_tick(db, src.name(), effective_interval, retry_interval).await?;
             Ok(Schedule::Interval {
                 effective_interval,
                 retry_interval,
@@ -142,7 +143,7 @@ pub fn spawn_all(db: &Db, cfg: &Config) {
         let src = src.clone();
         let cfg = cfg.clone();
         tokio::spawn(async move {
-            let name = src.name.clone();
+            let name = src.name().to_string();
             if let Err(e) = loop_source(db, src, cfg, None).await {
                 tracing::error!("collector for `{name}` stopped: {e:#}");
             }
@@ -170,7 +171,7 @@ pub fn spawn_graceful(
             let cfg = cfg.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                let name = src.name.clone();
+                let name = src.name().to_string();
                 if let Err(e) = loop_source(db, src, cfg, Some(shutdown)).await {
                     tracing::error!("collector for `{name}` stopped: {e:#}");
                 }
@@ -188,12 +189,25 @@ async fn loop_source(
     let kind = source::build(&src)?;
     // Re-derive the last known status so restarts don't duplicate transitions.
     let mut last_status = db
-        .last_health(&src.name)
+        .last_health(src.name())
         .await?
         .unwrap_or_else(|| "healthy".into());
     // A declared setup command runs once before the first fetch; on failure it
-    // is retried on this source's schedule tick instead of fetching.
-    let mut setup_done = src.setup.is_none();
+    // is retried on this source's schedule tick instead of fetching. Stream
+    // sources retry setup on `retry_interval` instead of opening the stream.
+    let mut setup_done = src.setup().is_none();
+
+    if matches!(kind, source::SourceKind::Stream { .. }) {
+        return loop_stream(
+            db,
+            src,
+            cfg,
+            &mut last_status,
+            &mut setup_done,
+            &mut shutdown,
+        )
+        .await;
+    }
 
     let mut schedule = Schedule::new(&db, &src).await?;
     loop {
@@ -224,10 +238,244 @@ async fn loop_source(
     }
 }
 
-/// One collection round over every source, honoring setup gates; used by
-/// tests and one-shot runs.
+/// Continuous ingest for one stream source (spec: data-collection — Stream
+/// collection): setup first (retried on `retry_interval` while failing),
+/// then open → ingest lines → on exit, log the outcome and reopen after
+/// `retry_interval`. Shutdown stops reopening after the current wait and
+/// kills the child instead of orphaning it.
+async fn loop_stream(
+    db: Db,
+    src: SourceCfg,
+    cfg: Config,
+    last_status: &mut String,
+    setup_done: &mut bool,
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
+    let retry = src.effective_retry_interval();
+    loop {
+        if !*setup_done {
+            if !try_setup(&db, &src, &cfg).await {
+                if sleep_or_stopped(shutdown, retry).await {
+                    return Ok(());
+                }
+                continue;
+            }
+            *setup_done = true;
+        }
+        if is_stopped(shutdown.as_ref()) {
+            return Ok(());
+        }
+        ingest_stream_run(&db, &src, &cfg, last_status, shutdown).await;
+        if sleep_or_stopped(shutdown, retry).await {
+            return Ok(());
+        }
+    }
+}
+
+/// The latest broadcast shutdown value, without consuming anything.
+/// `None` (one-shot callers) never reports shutdown.
+fn is_stopped(shutdown: Option<&tokio::sync::watch::Receiver<bool>>) -> bool {
+    shutdown.is_some_and(|sd| *sd.borrow())
+}
+
+/// Sleeps `wait` unless shutdown arrives first; returns true when the
+/// caller should stop. `None` always sleeps the full wait.
+async fn sleep_or_stopped(
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    wait: std::time::Duration,
+) -> bool {
+    let Some(sd) = shutdown else {
+        tokio::time::sleep(wait).await;
+        return false;
+    };
+    if *sd.borrow() {
+        return true;
+    }
+    tokio::select! {
+        () = tokio::time::sleep(wait) => false,
+        res = sd.changed() => res.is_err() || *sd.borrow(),
+    }
+}
+
+/// One open → ingest → exit cycle for a stream source: every well-formed
+/// `jsonl` line becomes a reading, malformed lines are logged as failures
+/// without killing the stream, and the process exit is logged before
+/// returning to [`loop_stream`] for the reopen wait.
+async fn ingest_stream_run(
+    db: &Db,
+    src: &SourceCfg,
+    cfg: &Config,
+    last_status: &mut String,
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let name = src.name().to_string();
+    let start = Instant::now();
+    let mut proc = match source::StreamProc::spawn(src.command(), &cfg.config_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            record_failure(db, &name, 0, &format!("stream spawn: {e:#}")).await;
+            refresh_health(db, cfg, &name, last_status).await;
+            return;
+        }
+    };
+    #[allow(clippy::cast_possible_truncation)] // durations fit easily
+    let elapsed_ms = || start.elapsed().as_millis() as i64;
+    loop {
+        let line = match shutdown {
+            Some(sd) => {
+                tokio::select! {
+                    line = proc.next_line() => line,
+                    res = sd.changed() => {
+                        if res.is_err() || *sd.borrow() {
+                            proc.shutdown().await;
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+            None => proc.next_line().await,
+        };
+        match line {
+            Ok(Some(text)) => {
+                ingest_stream_line(db, cfg, src, last_status, &text).await;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                record_failure(db, &name, elapsed_ms(), &format!("stream read: {e:#}")).await;
+                refresh_health(db, cfg, &name, last_status).await;
+                break;
+            }
+        }
+    }
+    match proc.wait_for_exit().await {
+        Ok(status) if status.success() => {
+            if let Err(e) = db.insert_log(&name, elapsed_ms(), None, None).await {
+                tracing::error!("insert log `{name}`: {e:#}");
+            }
+            refresh_health(db, cfg, &name, last_status).await;
+        }
+        Ok(status) => {
+            record_failure(db, &name, elapsed_ms(), &format!("stream exited: {status}")).await;
+            refresh_health(db, cfg, &name, last_status).await;
+        }
+        Err(e) => {
+            record_failure(db, &name, elapsed_ms(), &format!("stream wait: {e:#}")).await;
+            refresh_health(db, cfg, &name, last_status).await;
+        }
+    }
+}
+
+/// Ingests one stream line: parses it as plain-or-`jsonl`, converts and
+/// stores the value, applies a valid threshold override, and refreshes
+/// health. Malformed rows and conversion failures are logged as failures
+/// with no reading, without disturbing the running stream.
+async fn ingest_stream_line(
+    db: &Db,
+    cfg: &Config,
+    src: &SourceCfg,
+    last_status: &mut String,
+    text: &str,
+) {
+    let name = src.name();
+    let start = Instant::now();
+    #[allow(clippy::cast_possible_truncation)] // durations fit easily
+    let elapsed_ms = || start.elapsed().as_millis() as i64;
+    let (arr_epoch, arr_ts) = crate::db::now();
+    let parsed = match source::parse_output(name, text, (arr_epoch, arr_ts)) {
+        Ok(p) => p,
+        Err(e) => {
+            record_failure(db, name, elapsed_ms(), &format!("{e:#}")).await;
+            refresh_health(db, cfg, name, last_status).await;
+            return;
+        }
+    };
+    store_parsed_value(db, cfg, src, last_status, &parsed, elapsed_ms()).await;
+}
+
+/// Converts, stores, and logs one already-parsed value (shared by
+/// [`fetch_once`] and [`ingest_stream_line`]); applies a valid threshold
+/// override and refreshes health. Returns whether the round trip counts
+/// as successful for scheduling purposes.
+async fn store_parsed_value(
+    db: &Db,
+    cfg: &Config,
+    src: &SourceCfg,
+    last_status: &mut String,
+    parsed: &source::ParsedOutput,
+    ms: i64,
+) -> bool {
+    let name = src.name();
+    match source::convert_value_type(&parsed.value, src.effective_value_type()) {
+        Ok((value_bigint, value_double, value_json)) => {
+            let stored = db
+                .insert_reading_at(
+                    name,
+                    &parsed.value,
+                    src.unit(),
+                    value_bigint,
+                    value_double,
+                    value_json.as_deref(),
+                    parsed.ts_epoch,
+                    &parsed.ts,
+                )
+                .await;
+            if let Err(e) = &stored {
+                tracing::error!("insert reading `{name}`: {e:#}");
+            }
+            match &stored {
+                Ok(()) => {
+                    if let Err(e) = db.insert_log(name, ms, None, Some(&parsed.value)).await {
+                        tracing::error!("insert log `{name}`: {e:#}");
+                    }
+                    if let Some(bands) = &parsed.threshold
+                        && let Err(e) = db.set_thresholds(name, bands).await
+                    {
+                        tracing::error!("set thresholds `{name}`: {e:#}");
+                    }
+                    refresh_health(db, cfg, name, last_status).await;
+                    true
+                }
+                Err(e) => {
+                    record_failure(db, name, ms, &format!("fetched but failed to store: {e:#}"))
+                        .await;
+                    refresh_health(db, cfg, name, last_status).await;
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            record_failure(db, name, ms, &format!("{e:#}")).await;
+            refresh_health(db, cfg, name, last_status).await;
+            false
+        }
+    }
+}
+
+/// Recomputes health and records a transition event when the status
+/// changed, so restarts and steady state share one code path.
+async fn refresh_health(db: &Db, cfg: &Config, name: &str, last_status: &mut String) {
+    match health::compute(db, cfg, name).await {
+        Ok(h) => {
+            if h.status.as_str() != *last_status {
+                if let Err(e) = db.insert_health_event(name, h.status.as_str()).await {
+                    tracing::error!("insert health event `{name}`: {e:#}");
+                }
+                *last_status = h.status.as_str().to_string();
+            }
+        }
+        Err(e) => tracing::error!("health compute `{name}`: {e:#}"),
+    }
+}
+
+/// One collection round over every query source, honoring setup gates;
+/// used by tests and one-shot runs. Stream sources are skipped: they are
+/// continuous processes, not per-tick fetches.
 pub async fn collect_once(db: &Db, cfg: &Config) {
     for src in &cfg.sources {
+        if src.is_stream() {
+            continue;
+        }
         let Ok(kind) = source::build(src) else {
             continue;
         };
@@ -235,7 +483,7 @@ pub async fn collect_once(db: &Db, cfg: &Config) {
             continue;
         }
         let mut last_status = db
-            .last_health(&src.name)
+            .last_health(src.name())
             .await
             .unwrap_or(None)
             .unwrap_or_else(|| "healthy".into());
@@ -246,30 +494,31 @@ pub async fn collect_once(db: &Db, cfg: &Config) {
 /// Runs a source's setup command. Returns true when setup is satisfied
 /// (success or not declared); failures are logged and reported as false.
 async fn try_setup(db: &Db, src: &SourceCfg, cfg: &Config) -> bool {
-    let Some(cmd) = src.setup.as_deref() else {
+    let Some(cmd) = src.setup() else {
         return true;
     };
     let start = Instant::now();
-    let outcome = timeout(src.timeout, source::run_shell(cmd, &cfg.config_dir)).await;
+    let outcome = timeout(src.timeout(), source::run_shell(cmd, &cfg.config_dir)).await;
     #[allow(clippy::cast_possible_truncation)] // durations fit easily
     let ms = start.elapsed().as_millis() as i64;
+    let name = src.name();
     match outcome {
         Ok(Ok(_)) => {
-            tracing::info!("setup for `{}` succeeded", src.name);
+            tracing::info!("setup for `{name}` succeeded");
             true
         }
         Ok(Err(e)) => {
-            record_failure(db, &src.name, ms, &format!("setup: {e:#}")).await;
+            record_failure(db, name, ms, &format!("setup: {e:#}")).await;
             false
         }
         Err(_) => {
             record_failure(
                 db,
-                &src.name,
+                name,
                 ms,
                 &format!(
                     "setup: timed out after {}",
-                    humantime::format_duration(src.timeout)
+                    humantime::format_duration(src.timeout())
                 ),
             )
             .await;
@@ -293,82 +542,42 @@ pub async fn fetch_once(
     last_status: &mut String,
 ) -> bool {
     let start = Instant::now();
-    let outcome = tokio::time::timeout(src.timeout, kind.fetch(&cfg.config_dir)).await;
+    let outcome = tokio::time::timeout(src.timeout(), kind.fetch(&cfg.config_dir)).await;
     #[allow(clippy::cast_possible_truncation)] // durations fit easily
     let ms = start.elapsed().as_millis() as i64;
-    let success = match &outcome {
-        Ok(Ok(value)) => match source::convert_value_type(value, src.effective_value_type()) {
-            Ok((value_bigint, value_double, value_json)) => {
-                let stored = db
-                    .insert_reading(
-                        &src.name,
-                        value,
-                        src.unit.as_deref(),
-                        value_bigint,
-                        value_double,
-                        value_json.as_deref(),
-                    )
-                    .await;
-                if let Err(e) = &stored {
-                    tracing::error!("insert reading `{}`: {e:#}", src.name);
-                }
-                match &stored {
-                    Ok(()) => {
-                        if let Err(e) = db.insert_log(&src.name, ms, None, Some(value)).await {
-                            tracing::error!("insert log `{}`: {e:#}", src.name);
-                        }
-                        true
-                    }
-                    Err(e) => {
-                        record_failure(
-                            db,
-                            &src.name,
-                            ms,
-                            &format!("fetched but failed to store: {e:#}"),
-                        )
-                        .await;
-                        false
-                    }
+    let name = src.name();
+    match &outcome {
+        Ok(Ok(output)) => {
+            let (arr_epoch, arr_ts) = crate::db::now();
+            match source::parse_output(name, output, (arr_epoch, arr_ts)) {
+                Ok(parsed) => store_parsed_value(db, cfg, src, last_status, &parsed, ms).await,
+                Err(e) => {
+                    record_failure(db, name, ms, &format!("{e:#}")).await;
+                    refresh_health(db, cfg, name, last_status).await;
+                    false
                 }
             }
-            Err(e) => {
-                record_failure(db, &src.name, ms, &format!("{e:#}")).await;
-                false
-            }
-        },
+        }
         Ok(Err(e)) => {
-            record_failure(db, &src.name, ms, &format!("{e:#}")).await;
+            record_failure(db, name, ms, &format!("{e:#}")).await;
+            refresh_health(db, cfg, name, last_status).await;
             false
         }
         Err(_) => {
             record_failure(
                 db,
-                &src.name,
+                name,
                 ms,
                 &format!(
                     "timed out after {}",
-                    humantime::format_duration(src.timeout)
+                    humantime::format_duration(src.timeout())
                 ),
             )
             .await;
+            refresh_health(db, cfg, name, last_status).await;
             false
         }
-    };
-
-    // Record health transitions.
-    match health::compute(db, cfg, &src.name).await {
-        Ok(h) => {
-            if h.status.as_str() != *last_status {
-                if let Err(e) = db.insert_health_event(&src.name, h.status.as_str()).await {
-                    tracing::error!("insert health event `{}`: {e:#}", src.name);
-                }
-                *last_status = h.status.as_str().to_string();
-            }
-        }
-        Err(e) => tracing::error!("health compute `{}`: {e:#}", src.name),
     }
-
-    success
 }
 
 async fn record_failure(db: &Db, name: &str, ms: i64, error: &str) {
@@ -406,17 +615,17 @@ mod tests {
 
     fn cron_source(name: &str, expr: &str) -> SourceCfg {
         toml::from_str(&format!(
-            "name = \"{name}\"\ntype = \"script\"\ncommand = \"echo 0\"\ncron = \"{expr}\"\n"
+            "name = \"{name}\"\ntype = \"query\"\ncommand = \"echo 0\"\ncron = \"{expr}\"\n"
         ))
         .unwrap()
     }
 
-    fn script_source(name: &str, command: &str, value_type: Option<&str>) -> SourceCfg {
+    fn query_source(name: &str, command: &str, value_type: Option<&str>) -> SourceCfg {
         let vt = value_type
             .map(|v| format!("value_type = \"{v}\"\n"))
             .unwrap_or_default();
         toml::from_str(&format!(
-            "name = \"{name}\"\ntype = \"script\"\ncommand = \"{command}\"\n{vt}"
+            "name = \"{name}\"\ntype = \"query\"\ncommand = \"{command}\"\n{vt}"
         ))
         .unwrap()
     }
@@ -435,7 +644,7 @@ mod tests {
             ("db", "echo 98.6", "double"),
             ("js", "echo true", "json"),
         ] {
-            let src = script_source(name, command, Some(value_type));
+            let src = query_source(name, command, Some(value_type));
             let kind = source::build(&src).unwrap();
             let mut status = "healthy".to_string();
             let ok = fetch_once(&db, &cfg, &src, &kind, &mut status).await;
@@ -465,7 +674,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
         let cfg = Config::default();
-        let src = script_source("bad", "echo not-a-number", Some("bigint"));
+        let src = query_source("bad", "echo not-a-number", Some("bigint"));
         let kind = source::build(&src).unwrap();
         let mut status = "healthy".to_string();
 
@@ -622,13 +831,110 @@ mod tests {
     async fn schedule_new_ignores_freshness_for_cron_sources() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("backup", 1, None, Some("ok"))
-            .await
-            .unwrap();
+        db.insert_log("backup", 1, None, Some("ok")).await.unwrap();
         let src = cron_source("backup", "0 0 3 * * *");
 
         let schedule = Schedule::new(&db, &src).await.unwrap();
 
         assert!(matches!(schedule, Schedule::Cron(_)));
+    }
+
+    /// A `query` printing a `jsonl` row stores the extracted value with the
+    /// row timestamp and persists the row's thresholds (spec:
+    /// source-configuration — Generic query source type, JSONL row schema).
+    #[tokio::test]
+    async fn fetch_once_applies_jsonl_row_structurally() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = Config::default();
+        let src: SourceCfg = toml::from_str(
+            "name = \"b\"\ntype = \"query\"\ncommand = \"echo '{\\\"value\\\":\\\"7\\\",\\\"ts\\\":1000.5,\\\"threshold\\\":[{\\\"bound\\\":1.0,\\\"level\\\":\\\"green\\\"},{\\\"bound\\\":10.0,\\\"level\\\":\\\"red\\\"}]}'\"\n",
+        )
+        .unwrap();
+        let kind = source::build(&src).unwrap();
+        let mut status = "healthy".to_string();
+
+        assert!(fetch_once(&db, &cfg, &src, &kind, &mut status).await);
+
+        let rows = db.history("b", None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, "7");
+        assert!((rows[0].ts_epoch - 1000.5).abs() < 0.001);
+        let bands = db.effective_thresholds("b", &[]).await.unwrap();
+        assert_eq!(bands.len(), 2);
+    }
+
+    /// A `query` printing an invalid row logs a failure with no reading
+    /// (spec: source-configuration — JSONL row schema).
+    #[tokio::test]
+    async fn fetch_once_logs_invalid_row_as_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = Config::default();
+        let src: SourceCfg = toml::from_str(
+            "name = \"b\"\ntype = \"query\"\ncommand = \"echo '{\\\"value\\\":42}'\"\n",
+        )
+        .unwrap();
+        let kind = source::build(&src).unwrap();
+        let mut status = "healthy".to_string();
+
+        assert!(!fetch_once(&db, &cfg, &src, &kind, &mut status).await);
+        assert!(db.latest_values().await.unwrap().is_empty());
+        let logs = db.logs(Some("b"), 10).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].error.is_some());
+    }
+
+    /// A valid stream line becomes a reading; a malformed line becomes a
+    /// failure without disturbing the stream (spec: data-collection —
+    /// Stream collection).
+    #[tokio::test]
+    async fn ingest_stream_line_records_rows_and_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = Config::default();
+        let src: SourceCfg = toml::from_str(
+            "name = \"s\"\ntype = \"stream\"\ncommand = \"true\"\nexpected_interval = \"30s\"\n",
+        )
+        .unwrap();
+        let mut status = "healthy".to_string();
+
+        ingest_stream_line(&db, &cfg, &src, &mut status, r#"{"value":"1"}"#).await;
+        ingest_stream_line(&db, &cfg, &src, &mut status, "not json at all").await;
+        ingest_stream_line(&db, &cfg, &src, &mut status, r#"{"value":"2"}"#).await;
+
+        let rows = db.history("s", None, None, None).await.unwrap();
+        // "not json at all" is plain text, so it is a third reading, not a
+        // failure: only JSON objects with a `value` key go structural.
+        assert_eq!(rows.len(), 3);
+        let logs = db.logs(Some("s"), 10).await.unwrap();
+        assert_eq!(logs.len(), 3);
+        assert!(logs.iter().all(|l| l.error.is_none()));
+    }
+
+    /// A structurally-invalid stream line is logged as failed with no
+    /// reading (spec: data-collection — Stream collection).
+    #[tokio::test]
+    async fn ingest_stream_line_logs_bad_rows_as_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = Config::default();
+        let src: SourceCfg = toml::from_str(
+            "name = \"s\"\ntype = \"stream\"\ncommand = \"true\"\nexpected_interval = \"30s\"\n",
+        )
+        .unwrap();
+        let mut status = "healthy".to_string();
+
+        ingest_stream_line(&db, &cfg, &src, &mut status, r#"{"value":"1"}"#).await;
+        ingest_stream_line(&db, &cfg, &src, &mut status, r#"{"value":42}"#).await;
+
+        let rows = db.history("s", None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let logs = db.logs(Some("s"), 10).await.unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(
+            logs[0].error.is_some(),
+            "newest (the bad row) should have failed"
+        );
     }
 }

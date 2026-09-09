@@ -33,6 +33,12 @@ pub struct SourceHealth {
     pub status: Health,
     pub consecutive_failures: u32,
     pub last_success_ts: Option<String>,
+    /// Effective threshold bands: the latest `jsonl` override when one was
+    /// stored, otherwise the source's declared bands (spec:
+    /// source-configuration — JSONL row schema). Renderers color with
+    /// these so overrides apply everywhere without extra plumbing.
+    #[serde(default)]
+    pub thresholds: Vec<crate::config::Threshold>,
 }
 
 /// Derives live health for one source from its recent fetch logs and the age
@@ -55,7 +61,7 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs_f64();
     let last_ok_age = last_success.map_or(f64::INFINITY, |l| now - l.ts_epoch);
-    let source_cfg = cfg.sources.iter().find(|s| s.name == source);
+    let source_cfg = cfg.sources.iter().find(|s| s.name() == source);
 
     let status = if failures >= cfg.failure_threshold {
         Health::Failing
@@ -65,11 +71,15 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
         Health::Healthy
     };
 
+    let declared: &[crate::config::Threshold] = source_cfg.map_or(&[], |s| s.thresholds());
+    let thresholds = db.effective_thresholds(source, declared).await?;
+
     Ok(SourceHealth {
         source: source.to_string(),
         status,
         consecutive_failures: failures,
         last_success_ts,
+        thresholds,
     })
 }
 
@@ -77,12 +87,20 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
 /// (spec: data-collection — Health status derived from fetch outcomes): a
 /// cron source has no fixed period to derive a window from, so it's stale
 /// only until its first success (`last_ok_age` infinite); an interval source
-/// is stale once it has missed its second expected call. `fallback_interval`
-/// covers a source name not found in `cfg.sources` (shouldn't happen for a
-/// validated config, but callers pass one regardless).
+/// is stale once it has missed its second expected call; a stream source is
+/// stale whenever no value has arrived within its `expected_interval`
+/// (each ingested line counts as a success, so `last_ok_age` measures
+/// silence). `fallback_interval` covers a source name not found in
+/// `cfg.sources` (shouldn't happen for a validated config, but callers pass
+/// one regardless).
 fn is_stale(last_ok_age: f64, source: Option<&SourceCfg>, fallback_interval: Duration) -> bool {
     let interval = match source {
-        Some(s) if s.cron.is_some() => return last_ok_age.is_infinite(),
+        Some(s) if s.cron().is_some() => return last_ok_age.is_infinite(),
+        Some(s) if s.is_stream() => {
+            // No doubling: a stream emits continuously, so any silence past
+            // one full expected interval already means missed values.
+            return last_ok_age > s.effective_interval().as_secs_f64();
+        }
         Some(s) => s.effective_interval(),
         None => fallback_interval,
     };
@@ -96,7 +114,7 @@ mod tests {
 
     fn source(name: &str, interval: Option<Duration>, cron: Option<&str>) -> SourceCfg {
         toml::from_str(&format!(
-            "name = \"{name}\"\ntype = \"script\"\ncommand = \"echo 0\"\n{}{}",
+            "name = \"{name}\"\ntype = \"query\"\ncommand = \"echo 0\"\n{}{}",
             interval
                 .map(|d| format!("interval = \"{}\"\n", humantime::format_duration(d)))
                 .unwrap_or_default(),
@@ -138,5 +156,26 @@ mod tests {
     fn unknown_source_falls_back_to_the_given_interval() {
         assert!(is_stale(11.0 * 60.0, None, Duration::from_mins(5)));
         assert!(!is_stale(6.0 * 60.0, None, Duration::from_mins(5)));
+    }
+
+    fn stream(name: &str) -> SourceCfg {
+        toml::from_str(&format!(
+            "name = \"{name}\"\ntype = \"stream\"\ncommand = \"tail -f /dev/null\"\nexpected_interval = \"1m\"\n"
+        ))
+        .unwrap()
+    }
+
+    /// (spec: data-collection — Health status derived from fetch outcomes)
+    #[test]
+    fn stream_silence_past_expected_interval_is_stale() {
+        let s = stream("ticks");
+        assert!(is_stale(61.0, Some(&s), Duration::from_mins(5)));
+    }
+
+    /// (spec: data-collection — Health status derived from fetch outcomes)
+    #[test]
+    fn stream_value_within_expected_interval_is_not_stale() {
+        let s = stream("ticks");
+        assert!(!is_stale(30.0, Some(&s), Duration::from_mins(5)));
     }
 }

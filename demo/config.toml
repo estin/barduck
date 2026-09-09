@@ -1,9 +1,7 @@
 # Demo config for barduck.
 # All paths below (database_path, source/setup commands) resolve relative to
-# this file's directory — the app chdirs here at startup regardless of where
-# it was launched from. Build once from the repo root, then run from anywhere:
+# this file's directory. Build once from the repo root, then run from anywhere:
 #   cargo build --release
-#   (cd demo && python3 mock_server.py) &
 #   ./target/release/barduck --config demo/config.toml daemon
 
 database_path = "dashboard.duckdb"
@@ -16,7 +14,7 @@ failure_threshold = 2
 [[sources]]
 name = "disk-root"
 title = "Root filesystem"
-type = "script"
+type = "query"
 command = "df / --output=pcent | tail -1 | tr -d ' %'"
 unit = "%"
 interval = "5s"
@@ -29,7 +27,7 @@ thresholds = [
 
 [[sources]]
 name = "disk-home"
-type = "script"
+type = "query"
 command = "df /home --output=pcent | tail -1 | tr -d ' %'"
 unit = "%"
 interval = "5s"
@@ -45,7 +43,7 @@ show_history = false
 
 [[sources]]
 name = "domain-expiry"
-type = "script"
+type = "query"
 # Days until a fixed date — stand-in for `whois` parsing.
 command = "echo $(( ($(date -d 2027-05-01 +%s) - $(date +%s)) / 86400 ))"
 unit = "days"
@@ -55,21 +53,20 @@ interval = "30s"
 # remove the file it checks for and restart to see a failing setup recover.
 [[sources]]
 name = "bank-balance"
-type = "http"
+type = "query"
 setup = "test -f dashboard.duckdb"
-url = "http://127.0.0.1:8431/bank"
-selector = "balance"
+command = "echo 1480.42"
 unit = "USD"
 interval = "5s"
 
 [[sources]]
 name = "bank-balance-thresholds"
-type = "http"
-url = "http://127.0.0.1:8431/bank"
-selector = "balance"
+type = "query"
+# A `jsonl` row: the value plus replacement threshold bands (more money is
+# greener — the opposite direction from the disk bands above).
+command = "echo '{\"value\":\"1480.42\",\"threshold\":[{\"bound\":1000.0,\"level\":\"red\"},{\"bound\":1480.0,\"level\":\"yellow\"},{\"bound\":100000.0,\"level\":\"green\"}]}'"
 unit = "USD"
 interval = "5s"
-# red -> yellow -> green the other way: more money is better
 thresholds = [
     { bound = 1000.0, level = "red" },
     { bound = 1480.0, level = "yellow" },
@@ -78,31 +75,29 @@ thresholds = [
 
 [[sources]]
 name = "weekly-report"
-type = "http"
-url = "http://127.0.0.1:8431/report"
-selector = "report"
+type = "query"
+command = "printf '# Weekly report\\n\\nHours logged: **%.1f h**\\n\\n- [x] incident review\\n- [ ] on-call handover\\n' 36.5"
 format = "markdown"
 interval = "30s"
 
 [[sources]]
 name = "load-average"
-type = "script"
+type = "query"
 # Relative to this config file's directory (demo/), not the launch directory.
 command = "sh scripts/load-average.sh"
 interval = "10s"
 
 [[sources]]
 name = "status-json"
-type = "script"
+type = "query"
 command = "echo '{\"load\": 0.42, \"cores\": 8}'"
 format = "json"
 interval = "30s"
 
 [[sources]]
 name = "work-hours"
-type = "http"
-url = "http://127.0.0.1:8431/work"
-selector = "hours_this_week"
+type = "query"
+command = "echo 36.5"
 unit = "h"
 interval = "10s"
 
@@ -112,8 +107,8 @@ interval = "10s"
 # troubleshooting; it's still fetched on its schedule either way.
 [[sources]]
 name = "dead-service"
-type = "http"
-url = "http://127.0.0.1:9/nope"
+type = "query"
+command = "sh -c 'exit 1'"
 interval = "5s"
 show_in = "tui"
 
@@ -121,12 +116,21 @@ show_in = "tui"
 # Demonstrates automatic recovery without restarting the daemon.
 [[sources]]
 name = "tunneled-service"
-type = "http"
+type = "query"
 setup = "test -f /tmp/bd-tunnel-up"
-url = "http://127.0.0.1:8431/bank"
-selector = "balance"
+command = "echo 1480.42"
 unit = "USD"
 interval = "5s"
+
+# A stream source: a long-running command emitting one `jsonl` row per line.
+# Emits a single value, then stays silent for 5 minutes — watch it turn
+# amber (`stale`) once silence exceeds `expected_interval`.
+[[sources]]
+name = "quiet-stream"
+type = "stream"
+command = "echo '{\"value\":\"1\"}'; sleep 300"
+expected_interval = "20s"
+unit = "ticks"
 
 # Grid layouts: each row is a list of cells. A panel's title defaults to its
 # source's `title` (see `disk-root` above), or its raw name if it declares
@@ -185,5 +189,5 @@ rows = [
 - [On-call](https://wiki.example.com/oncall)
 """ },
     ],
-    ["status-json", "load-average", "dead-service"],
+    ["status-json", "load-average", "quiet-stream", "dead-service"],
 ]

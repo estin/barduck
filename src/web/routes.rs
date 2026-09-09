@@ -279,7 +279,7 @@ path_param!(source_name: String);
 pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
     let _ = tick; // refresh trigger only; data always re-read from the DB
     let st = app_context::<AppState>(cx);
-    let Some(src) = st.cfg.sources.iter().find(|s| s.name == source) else {
+    let Some(_src) = st.cfg.sources.iter().find(|s| s.name() == source) else {
         return Err(topcoat::Error::from(topcoat::router::error::bad_request(
             format!("unknown source `{source}`"),
         )));
@@ -289,9 +289,9 @@ pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
     // timestamps and threshold coloring): every row shares the same source,
     // so its live health only needs computing once, the same fallback
     // `build_panel` uses for a lookup failure.
-    let status = health::compute(&st.db, &st.cfg, &source)
-        .await
-        .map_or(health::Health::Stale, |h| h.status);
+    let health = health::compute(&st.db, &st.cfg, &source).await;
+    let status = health.as_ref().map_or(health::Health::Stale, |h| h.status);
+    let bands: &[config::Threshold] = health.as_ref().map_or(&[], |h| &h.thresholds);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
@@ -318,7 +318,7 @@ pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
                             attrs: attributes! {
                                 class="font-mono"
                                 style=(text_style_for_color(config::accent_color(
-                                    l.value.as_deref().and_then(|v| config::level_for(&src.thresholds, v)),
+                                    l.value.as_deref().and_then(|v| config::level_for(bands, v)),
                                     status,
                                 )))
                             },
@@ -357,7 +357,7 @@ pub async fn source_logs(cx: &Cx) -> Result {
             )));
         }
     };
-    if !st.cfg.sources.iter().any(|s| s.name == source) {
+    if !st.cfg.sources.iter().any(|s| s.name() == source) {
         return Err(topcoat::Error::from(topcoat::router::error::bad_request(
             format!("unknown source `{source}`"),
         )));

@@ -268,23 +268,27 @@ async fn build_panel(
     name: &str,
     title_override: Option<&str>,
 ) -> Panel {
-    let src = st.cfg.sources.iter().find(|s| s.name == name);
+    let src = st.cfg.sources.iter().find(|s| s.name() == name);
     let label = title_override
         .or_else(|| src.and_then(config::SourceCfg::display_title))
         .unwrap_or(name);
     let row = latest.iter().find(|r| r.source == name);
-    let status = health::compute(&st.db, &st.cfg, name)
-        .await
-        .map_or(Health::Stale, |h| h.status);
+    let health = health::compute(&st.db, &st.cfg, name).await;
+    let status = health.as_ref().map_or(Health::Stale, |h| h.status);
+    // Effective bands (declared, or the latest `jsonl` override) ride on
+    // the health payload so overrides color every surface without extra
+    // plumbing (spec: source-configuration — JSONL row schema).
+    let bands: &[config::Threshold] = health.as_ref().map_or(&[], |h| &h.thresholds);
     let level = match row {
-        Some(r) => src
-            .filter(|s| !s.thresholds.is_empty())
-            .and_then(|s| config::level_for(&s.thresholds, &r.value)),
+        Some(r) => (!bands.is_empty())
+            .then(|| config::level_for(bands, &r.value))
+            .flatten(),
         None => None,
     };
-    let history = match src.filter(|s| !s.thresholds.is_empty() && s.show_history.unwrap_or(true)) {
+    let show_bar = !bands.is_empty() && src.is_some_and(|s| s.show_history().unwrap_or(true));
+    let history = match src.filter(|_| show_bar) {
         Some(s) => {
-            let n = s.history_points.unwrap_or(st.cfg.history_points);
+            let n = s.history_points().unwrap_or(st.cfg.history_points);
             let recent = st
                 .db
                 .history(name, None, None, Some(i64::from(n)))
@@ -292,7 +296,7 @@ async fn build_panel(
                 .unwrap_or_default();
             let mut segments: Vec<Option<Level>> = recent
                 .iter()
-                .map(|r| config::level_for(&s.thresholds, &r.value))
+                .map(|r| config::level_for(bands, &r.value))
                 .collect();
             let mut padded = vec![None; (n as usize).saturating_sub(segments.len())];
             padded.append(&mut segments);
@@ -307,7 +311,7 @@ async fn build_panel(
         unit: row.and_then(|r| r.unit.clone()).unwrap_or_default(),
         status,
         level,
-        format: src.and_then(|s| s.format).unwrap_or_default(),
+        format: src.and_then(config::SourceCfg::format).unwrap_or_default(),
         ts_epoch: row.map_or(0.0, |r| r.ts_epoch),
         history,
     }

@@ -1,10 +1,5 @@
-# data-collection Specification
+## MODIFIED Requirements
 
-## Purpose
-
-Runs source fetches on schedule and keeps every attempt logged and health-checked, so users can trust both current values and the system's own reliability.
-
-## Requirements
 ### Requirement: Per-source schedules
 Each query source SHALL be fetched according to its configured schedule: either a fixed interval or a cron expression. Schedules are independent per source. An interval-scheduled query source whose fetch fails SHALL retry after its `retry_interval` (spec: source-configuration — Per-source fetch retry interval) instead of waiting the full `interval`; it SHALL keep retrying at `retry_interval` for as long as fetches keep failing, and resume waiting the normal `interval` as soon as a fetch succeeds. A cron-scheduled query source is unaffected by fetch outcome: it is always fetched once per cron occurrence, never retried early on failure. A stream source has no schedule and is ingested continuously (spec: data-collection — Stream collection).
 
@@ -61,20 +56,7 @@ When the collector starts (daemon startup), a query source's first fetch SHALL b
 #### Scenario: Stream source has no schedule
 - **WHEN** a `stream` source is configured alongside interval-scheduled `query` sources and the daemon (re)starts
 - **THEN** the stream is opened immediately without consulting fetch-log freshness, while each `query` source follows its own freshness-deferred first tick
-### Requirement: Stream collection
-The collector SHALL run each stream source's command as a long-lived process and ingest its stdout line by line while the process lives: every well-formed `jsonl` row (spec: source-configuration — JSONL row schema) produces one reading stamped with the row's `ts` (or arrival time) and applies the row's `threshold` override when present. When the process ends for any reason (exit, signal, spawn failure), the collector SHALL record the outcome in the fetch log and reopen the command after the source's `retry_interval`; a spawn failure or immediate exit counts as a failed attempt. Shutdown stops reopening after the current wait, mirroring interval sources.
 
-#### Scenario: Lines ingested continuously
-- **WHEN** a stream command prints one `jsonl` row every second for a minute
-- **THEN** roughly 60 readings are recorded without any schedule tick firing
-
-#### Scenario: Exited stream reopens on retry_interval
-- **WHEN** a stream command exits after printing one row and the source declares `retry_interval = "10s"`
-- **THEN** a fetch log entry records the exit and the command is reopened roughly 10 seconds later
-
-#### Scenario: Failing stream command retries
-- **WHEN** a stream command exits non-zero immediately on every start
-- **THEN** each restart is spaced by `retry_interval` and each exit is logged as failed, without affecting other sources
 ### Requirement: Fetch attempts logged
 Every fetch attempt SHALL be recorded with timestamp, duration, and error detail on failure. A fetch attempt's outcome (success or failure) SHALL be derivable from whether that entry's error detail is present, not stored as a separate field: a failed attempt SHALL always carry error detail, and a successful attempt SHALL never carry error detail. Each successfully ingested `jsonl` line from a `stream` source counts as one successful attempt; a malformed line counts as one failed attempt carrying the parse error.
 
@@ -89,6 +71,7 @@ Every fetch attempt SHALL be recorded with timestamp, duration, and error detail
 #### Scenario: Malformed stream line logged as failure
 - **WHEN** a `stream` source emits a line that is not a valid `jsonl` row
 - **THEN** no reading is recorded and a fetch log entry exists with error detail naming the parse failure, while later valid lines are still ingested
+
 ### Requirement: Health status derived from fetch outcomes
 The system SHALL maintain per-source health (healthy / failing / stale) derived from recent fetch outcomes and last-success age, using a staleness window derived from each source's own schedule rather than a single global setting.
 
@@ -125,12 +108,14 @@ For an interval-scheduled source, the staleness window is `2 × effective_interv
 #### Scenario: Stream recovers on the next value
 - **WHEN** a stale stream source emits a valid `jsonl` row
 - **THEN** the source stops reporting stale on that basis
+
 ### Requirement: Collector resilience
 One source's failure MUST NOT stop collection of other sources or crash the process.
 
 #### Scenario: Failing source does not block others
 - **WHEN** one query source hangs until timeout while others are due, or one stream source's command exits repeatedly
 - **THEN** other sources are still fetched on their schedules, and the exiting stream is reopened on its own `retry_interval` without affecting the rest
+
 ### Requirement: Setup gates first fetch
 When a source declares a `setup` command, the collector SHALL run it before the source's first fetch attempt — for a stream source, before opening the stream. Success enables normal scheduled fetching (or stream ingest) for the daemon's lifetime. Failure SHALL be recorded as a failed entry in the fetch log (with the command's error output), mark the source failing via the existing health derivation, and skip the fetch; on each subsequent schedule tick the collector SHALL retry the setup command instead of fetching until it succeeds. A stream source whose setup keeps failing SHALL retry the setup on its `retry_interval` instead of opening the stream.
 
@@ -153,3 +138,20 @@ When a source declares a `setup` command, the collector SHALL run it before the 
 #### Scenario: Stream setup gates opening
 - **WHEN** a stream source's setup command exits non-zero
 - **THEN** no stream process is opened, a failed fetch-log entry records the setup error, and the setup is retried on the source's `retry_interval`
+
+## ADDED Requirements
+
+### Requirement: Stream collection
+The collector SHALL run each stream source's command as a long-lived process and ingest its stdout line by line while the process lives: every well-formed `jsonl` row (spec: source-configuration — JSONL row schema) produces one reading stamped with the row's `ts` (or arrival time) and applies the row's `threshold` override when present. When the process ends for any reason (exit, signal, spawn failure), the collector SHALL record the outcome in the fetch log and reopen the command after the source's `retry_interval`; a spawn failure or immediate exit counts as a failed attempt. Shutdown stops reopening after the current wait, mirroring interval sources.
+
+#### Scenario: Lines ingested continuously
+- **WHEN** a stream command prints one `jsonl` row every second for a minute
+- **THEN** roughly 60 readings are recorded without any schedule tick firing
+
+#### Scenario: Exited stream reopens on retry_interval
+- **WHEN** a stream command exits after printing one row and the source declares `retry_interval = "10s"`
+- **THEN** a fetch log entry records the exit and the command is reopened roughly 10 seconds later
+
+#### Scenario: Failing stream command retries
+- **WHEN** a stream command exits non-zero immediately on every start
+- **THEN** each restart is spaced by `retry_interval` and each exit is logged as failed, without affecting other sources

@@ -14,8 +14,9 @@ mod validation;
 
 pub use layout::{Cell, LayoutCfg, TuiWidth, VALUE_FORMATS, ValueFormat};
 pub use source::{
-    GroupItem, Level, SourceCfg, SourceType, Threshold, ValueType, View, accent_color, level_for,
-    source_visible_in, status_color, visible_items, worst_color,
+    GroupItem, JsonlRow, JsonlTs, Level, SourceCfg, SourceType, Threshold, ValueType, View,
+    accent_color, level_for, parse_jsonl_row, source_visible_in, status_color, validate_thresholds,
+    visible_items, worst_color,
 };
 
 use defaults::{
@@ -61,7 +62,7 @@ pub struct Config {
     #[serde(default = "default_tui_width")]
     pub tui_width: TuiWidth,
     /// The config file's own directory: `database_path` and a relative
-    /// `script`/`setup` command resolve against this, not the process's
+    /// `query`/`stream`/`setup` command resolve against this, not the process's
     /// launch directory (spec: source-configuration — config-relative
     /// working directory). Never set from TOML — populated by [`load`];
     /// defaults to `.` for a `Config` built directly (e.g. in tests).
@@ -123,8 +124,8 @@ pub fn validate(cfg: &Config) -> Result<()> {
     }
     let mut seen = std::collections::HashSet::new();
     for s in &cfg.sources {
-        if !seen.insert(s.name.clone()) {
-            bail!("duplicate source name `{}`", s.name);
+        if !seen.insert(s.name().to_string()) {
+            bail!("duplicate source name `{}`", s.name());
         }
         validate_source(s)?;
     }
@@ -152,7 +153,7 @@ mod tests {
     use defaults::{apply_env_overrides_from, default_interval, default_retry_interval};
 
     fn source_toml(extra: &str) -> String {
-        format!("[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n{extra}\n")
+        format!("[[sources]]\nname = \"cpu\"\ntype = \"query\"\ncommand = \"echo 0\"\n{extra}\n")
     }
 
     #[test]
@@ -179,7 +180,7 @@ mod tests {
     fn show_history_false_parses() {
         let cfg: Config = toml::from_str(&source_toml("show_history = false")).unwrap();
         validate(&cfg).unwrap();
-        assert_eq!(cfg.sources[0].show_history, Some(false));
+        assert_eq!(cfg.sources[0].show_history(), Some(false));
     }
 
     #[test]
@@ -187,8 +188,8 @@ mod tests {
         let cfg: Config =
             toml::from_str(&source_toml("interval = \"5m\"\ntimeout = \"30s\"")).unwrap();
         validate(&cfg).unwrap();
-        assert_eq!(cfg.sources[0].interval, Some(Duration::from_mins(5)));
-        assert_eq!(cfg.sources[0].timeout, Duration::from_secs(30));
+        assert_eq!(cfg.sources[0].interval(), Some(Duration::from_mins(5)));
+        assert_eq!(cfg.sources[0].timeout(), Duration::from_secs(30));
     }
 
     #[test]
@@ -209,8 +210,8 @@ mod tests {
     fn cron_schedule_accepted() {
         let cfg: Config = toml::from_str(&source_toml("cron = \"0 0 3 * * *\"")).unwrap();
         validate(&cfg).unwrap();
-        assert_eq!(cfg.sources[0].cron.as_deref(), Some("0 0 3 * * *"));
-        assert_eq!(cfg.sources[0].interval, None);
+        assert_eq!(cfg.sources[0].cron(), Some("0 0 3 * * *"));
+        assert_eq!(cfg.sources[0].interval(), None);
     }
 
     #[test]
@@ -479,7 +480,7 @@ mod tests {
 
     #[test]
     fn group_cell_empty_title_rejected() {
-        let toml = "[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"\", table = [\"cpu\"] }]]\n";
+        let toml = "[[sources]]\nname = \"cpu\"\ntype = \"query\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"\", table = [\"cpu\"] }]]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let err = validate(&cfg).unwrap_err();
         assert!(
@@ -490,7 +491,7 @@ mod tests {
 
     #[test]
     fn group_cell_without_title_accepted() {
-        let toml = "[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ secondary = [\"cpu\"] }]]\n";
+        let toml = "[[sources]]\nname = \"cpu\"\ntype = \"query\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ secondary = [\"cpu\"] }]]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         validate(&cfg).unwrap();
     }
@@ -587,7 +588,7 @@ mod tests {
     fn value_type_defaults_to_string_when_unset() {
         let cfg: Config = toml::from_str(&source_toml("")).unwrap();
         validate(&cfg).unwrap();
-        assert_eq!(cfg.sources[0].value_type, None);
+        assert_eq!(cfg.sources[0].value_type(), None);
         assert_eq!(cfg.sources[0].effective_value_type(), ValueType::String);
     }
 
@@ -607,8 +608,7 @@ mod tests {
 
     #[test]
     fn value_type_invalid_value_rejected() {
-        let err =
-            toml::from_str::<Config>(&source_toml("value_type = \"decimal\"")).unwrap_err();
+        let err = toml::from_str::<Config>(&source_toml("value_type = \"decimal\"")).unwrap_err();
         assert!(
             err.to_string().contains("decimal"),
             "error should name the invalid value: {err}"
@@ -619,7 +619,7 @@ mod tests {
     fn show_in_defaults_to_visible_everywhere() {
         let cfg: Config = toml::from_str(&source_toml("")).unwrap();
         validate(&cfg).unwrap();
-        assert_eq!(cfg.sources[0].show_in, None);
+        assert_eq!(cfg.sources[0].show_in(), None);
         assert!(cfg.sources[0].visible_in(View::Tui));
         assert!(cfg.sources[0].visible_in(View::Web));
     }
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn visible_items_omits_hidden_members() {
-        let toml = "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[sources]]\nname = \"b\"\ntype = \"script\"\ncommand = \"echo 0\"\n";
+        let toml = "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[sources]]\nname = \"b\"\ntype = \"query\"\ncommand = \"echo 0\"\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         let items = vec![GroupItem::Id("a".into()), GroupItem::Id("b".into())];
         let visible = visible_items(&cfg, &items, View::Tui);
@@ -675,5 +675,79 @@ mod tests {
         let cfg: Config = toml::from_str(&source_toml("show_in = \"web\"")).unwrap();
         let items = vec![GroupItem::Id("cpu".into())];
         assert!(visible_items(&cfg, &items, View::Tui).is_empty());
+    }
+
+    fn stream_toml(extra: &str) -> String {
+        format!(
+            "[[sources]]\nname = \"ticks\"\ntype = \"stream\"\ncommand = \"tail -f /dev/null\"\nexpected_interval = \"20s\"\n{extra}\n"
+        )
+    }
+
+    /// (spec: source-configuration — Stream source type)
+    #[test]
+    fn stream_source_accepted_with_expected_interval() {
+        let cfg: Config = toml::from_str(&stream_toml("")).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(
+            cfg.sources[0].expected_interval(),
+            Some(Duration::from_secs(20))
+        );
+        assert!(cfg.sources[0].is_stream());
+        assert_eq!(cfg.sources[0].cron(), None);
+        assert_eq!(cfg.sources[0].interval(), None);
+    }
+
+    /// (spec: source-configuration — Stream source type)
+    #[test]
+    fn stream_source_missing_expected_interval_rejected() {
+        let toml =
+            "[[sources]]\nname = \"ticks\"\ntype = \"stream\"\ncommand = \"tail -f /dev/null\"\n";
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("expected_interval"),
+            "error should name the missing field: {err}"
+        );
+    }
+
+    /// (spec: source-configuration — Stream source type)
+    #[test]
+    fn stream_source_with_interval_rejected() {
+        let err = toml::from_str::<Config>(&stream_toml("interval = \"5m\"")).unwrap_err();
+        assert!(
+            err.to_string().contains("interval"),
+            "error should name the cross-type field: {err}"
+        );
+    }
+
+    /// (spec: source-configuration — Per-type source fields)
+    #[test]
+    fn removed_http_type_rejected() {
+        let toml = "[[sources]]\nname = \"bank\"\ntype = \"http\"\nurl = \"http://x/\"\n";
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("http"),
+            "error should name the unknown type: {err}"
+        );
+    }
+
+    /// (spec: source-configuration — Per-type source fields)
+    #[test]
+    fn renamed_script_type_rejected() {
+        let toml = "[[sources]]\nname = \"cpu\"\ntype = \"script\"\ncommand = \"echo 0\"\n";
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("script"),
+            "error should name the unknown type: {err}"
+        );
+    }
+
+    /// (spec: source-configuration — Per-type source fields)
+    #[test]
+    fn query_source_with_expected_interval_rejected() {
+        let err = toml::from_str::<Config>(&source_toml("expected_interval = \"1m\"")).unwrap_err();
+        assert!(
+            err.to_string().contains("expected_interval"),
+            "error should name the cross-type field: {err}"
+        );
     }
 }

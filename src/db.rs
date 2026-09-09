@@ -1,5 +1,6 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
 
+use crate::config::Threshold;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use duckdb::{Connection, params};
@@ -97,11 +98,20 @@ enum WriteCmd {
         cutoff_epoch: f64,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Replaces the effective threshold bands for one source (spec:
+    /// source-configuration — JSONL row schema): a single row per source,
+    /// rewritten on every override.
+    SetThresholds {
+        source: String,
+        bands_json: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 impl WriteCmd {
     /// Executes this command against the writer's persistent connection,
     /// taking the advisory lock only for this one statement.
+    #[allow(clippy::too_many_lines)]
     fn run(self, db: &Db, conn: &Connection) {
         let (result, reply) = match self {
             WriteCmd::InsertReading {
@@ -182,6 +192,24 @@ impl WriteCmd {
                 }),
                 reply,
             ),
+            WriteCmd::SetThresholds {
+                source,
+                bands_json,
+                reply,
+            } => (
+                db.with_lock(|| {
+                    conn.execute(
+                        "DELETE FROM source_thresholds WHERE source = ?",
+                        params![source],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO source_thresholds (source, bands_json) VALUES (?, ?)",
+                        params![source, bands_json],
+                    )?;
+                    Ok(())
+                }),
+                reply,
+            ),
         };
         // A read-only connection opened by another process (direct-mode
         // CLI/TUI, `Db::open_ro`) can only see what's checkpointed into the
@@ -193,9 +221,8 @@ impl WriteCmd {
         // here, before the reply, means a caller's successful `.await`
         // durably guarantees visibility, not just a race with it; writes
         // are minutes apart, so the extra fsync is free at this scale.
-        let result = result.and_then(|()| {
-            db.with_lock(|| conn.execute_batch("CHECKPOINT").map_err(Into::into))
-        });
+        let result = result
+            .and_then(|()| db.with_lock(|| conn.execute_batch("CHECKPOINT").map_err(Into::into)));
         let _ = reply.send(result);
     }
 
@@ -207,7 +234,8 @@ impl WriteCmd {
             WriteCmd::InsertReading { reply, .. }
             | WriteCmd::InsertLog { reply, .. }
             | WriteCmd::InsertHealthEvent { reply, .. }
-            | WriteCmd::PurgeOlderThan { reply, .. } => reply,
+            | WriteCmd::PurgeOlderThan { reply, .. }
+            | WriteCmd::SetThresholds { reply, .. } => reply,
         };
         let _ = reply.send(Err(anyhow::anyhow!("db writer unavailable: {err:#}")));
     }
@@ -248,7 +276,7 @@ pub struct HealthEventRow {
 pub const DEFAULT_HISTORY_LIMIT: i64 = 1000;
 pub const MAX_HISTORY_LIMIT: i64 = 10_000;
 
-fn now() -> (f64, String) {
+pub(crate) fn now() -> (f64, String) {
     let t: DateTime<Utc> = Utc::now();
     (t.timestamp_millis() as f64 / 1000.0, t.to_rfc3339())
 }
@@ -297,6 +325,15 @@ fn create_schema(conn: &Connection) -> Result<()> {
             ts_epoch DOUBLE NOT NULL,
             ts       VARCHAR NOT NULL,
             status   VARCHAR NOT NULL
+        );
+        -- Effective threshold bands per source, replaced wholesale by
+        -- `jsonl` row overrides (spec: source-configuration — JSONL row
+        -- schema). One row per source by construction (rewritten, not
+        -- appended); renderers fall back to declared bands when absent.
+        -- Never purged by retention: these are current config, not history.
+        CREATE TABLE IF NOT EXISTS source_thresholds (
+            source     VARCHAR NOT NULL,
+            bands_json VARCHAR NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_readings_source_ts ON readings(source, ts_epoch);
         CREATE INDEX IF NOT EXISTS idx_fetch_logs_source_ts ON fetch_logs(source, ts_epoch);
@@ -392,15 +429,16 @@ impl Db {
         })
     }
 
-    /// Drops every table (readings, fetch logs, health events) and recreates
-    /// an empty schema. Callers are responsible for confirming with the user
-    /// first — this is irreversible.
+    /// Drops every table (readings, fetch logs, health events, threshold
+    /// overrides) and recreates an empty schema. Callers are responsible
+    /// for confirming with the user first — this is irreversible.
     pub fn reset(&self) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS readings;
                 DROP TABLE IF EXISTS fetch_logs;
                 DROP TABLE IF EXISTS health_events;
+                DROP TABLE IF EXISTS source_thresholds;
                 DROP SEQUENCE IF EXISTS readings_id_seq;
                 DROP SEQUENCE IF EXISTS fetch_logs_id_seq;
                 DROP SEQUENCE IF EXISTS health_events_id_seq;",
@@ -529,6 +567,35 @@ impl Db {
         value_json: Option<&str>,
     ) -> Result<()> {
         let (ts_epoch, ts) = now();
+        self.insert_reading_at(
+            source,
+            value,
+            unit,
+            value_bigint,
+            value_double,
+            value_json,
+            ts_epoch,
+            &ts,
+        )
+        .await
+    }
+
+    /// Same as [`Db::insert_reading`], but stamps the caller-supplied
+    /// timestamp instead of the arrival time (spec: data-storage — Readings
+    /// persisted with provenance): used for `jsonl` rows carrying a valid
+    /// `ts`. Callers pass arrival time when the row carries none.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_reading_at(
+        &self,
+        source: &str,
+        value: &str,
+        unit: Option<&str>,
+        value_bigint: Option<i64>,
+        value_double: Option<f64>,
+        value_json: Option<&str>,
+        ts_epoch: f64,
+        ts: &str,
+    ) -> Result<()> {
         if let Some(writer) = &self.writer {
             let (reply, rx) = oneshot::channel();
             let cmd = WriteCmd::InsertReading {
@@ -539,7 +606,7 @@ impl Db {
                 value_double,
                 value_json: value_json.map(str::to_string),
                 ts_epoch,
-                ts,
+                ts: ts.to_string(),
                 reply,
             };
             writer
@@ -586,6 +653,55 @@ impl Db {
             params![source, ts_epoch, ts, duration_ms, error, value],
         )?;
         Ok(())
+    }
+
+    /// Replaces the effective threshold bands for `source` with `bands`
+    /// (spec: source-configuration — JSONL row schema). Renderers read them
+    /// back via [`Db::effective_thresholds`], falling back to declared bands
+    /// when no override was ever stored.
+    pub async fn set_thresholds(&self, source: &str, bands: &[Threshold]) -> Result<()> {
+        let bands_json = serde_json::to_string(bands).context("serializing threshold bands")?;
+        if let Some(writer) = &self.writer {
+            let (reply, rx) = oneshot::channel();
+            writer
+                .send(WriteCmd::SetThresholds {
+                    source: source.to_string(),
+                    bands_json,
+                    reply,
+                })
+                .map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
+            return rx.await.context("db writer task dropped the reply")?;
+        }
+        let (_guard, conn) = self.connect_async().await?;
+        conn.execute(
+            "DELETE FROM source_thresholds WHERE source = ?",
+            params![source],
+        )?;
+        conn.execute(
+            "INSERT INTO source_thresholds (source, bands_json) VALUES (?, ?)",
+            params![source, bands_json],
+        )?;
+        Ok(())
+    }
+
+    /// Effective threshold bands for `source`: the latest `jsonl` override
+    /// when one was stored, otherwise `declared` (the config bands).
+    /// A stored value that no longer parses (shouldn't happen — writers
+    /// serialize it) falls back to `declared` rather than failing the render.
+    pub async fn effective_thresholds(
+        &self,
+        source: &str,
+        declared: &[Threshold],
+    ) -> Result<Vec<Threshold>> {
+        let (_guard, conn) = self.connect_async().await?;
+        let mut stmt =
+            conn.prepare("SELECT bands_json FROM source_thresholds WHERE source = ? LIMIT 1")?;
+        let mut rows = stmt.query(params![source])?;
+        let Some(row) = rows.next()? else {
+            return Ok(declared.to_vec());
+        };
+        let raw: String = row.get(0)?;
+        Ok(serde_json::from_str(&raw).unwrap_or_else(|_| declared.to_vec()))
     }
 
     pub async fn last_health(&self, source: &str) -> Result<Option<String>> {
@@ -835,7 +951,11 @@ mod tests {
 
         let reader = Db::open_ro(&path).unwrap();
         let latest = reader.latest_values().await.unwrap();
-        assert_eq!(latest.len(), 1, "read-only reader should already see the write");
+        assert_eq!(
+            latest.len(),
+            1,
+            "read-only reader should already see the write"
+        );
         assert_eq!(latest[0].value, "42");
     }
 
@@ -931,7 +1051,10 @@ mod tests {
             })
             .unwrap();
         for col in ["value_bigint", "value_double", "value_json"] {
-            assert!(cols.contains(&col.to_string()), "missing column {col}: {cols:?}");
+            assert!(
+                cols.contains(&col.to_string()),
+                "missing column {col}: {cols:?}"
+            );
         }
     }
 
@@ -948,9 +1071,16 @@ mod tests {
         db.insert_reading("db", "1.5", None, None, Some(1.5), None)
             .await
             .unwrap();
-        db.insert_reading("js", "{\"ok\":true}", None, None, None, Some("{\"ok\":true}"))
-            .await
-            .unwrap();
+        db.insert_reading(
+            "js",
+            "{\"ok\":true}",
+            None,
+            None,
+            None,
+            Some("{\"ok\":true}"),
+        )
+        .await
+        .unwrap();
         db.insert_reading("plain", "hello", None, None, None, None)
             .await
             .unwrap();
@@ -989,5 +1119,61 @@ mod tests {
     fn panic_message_falls_back_for_other_payloads() {
         let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
         assert_eq!(panic_message(&*payload), "<non-string panic payload>");
+    }
+
+    /// Overrides replace bands wholesale and fall back to declared bands
+    /// when absent; `reset` clears them (spec: source-configuration —
+    /// JSONL row schema).
+    #[tokio::test]
+    async fn threshold_overrides_round_trip_and_reset_clears() {
+        use crate::config::{Level, Threshold};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let declared = vec![
+            Threshold {
+                bound: 1.0,
+                level: Level::Green,
+            },
+            Threshold {
+                bound: 2.0,
+                level: Level::Red,
+            },
+        ];
+        assert_eq!(
+            db.effective_thresholds("s", &declared).await.unwrap(),
+            declared
+        );
+        let over = vec![
+            Threshold {
+                bound: 10.0,
+                level: Level::Red,
+            },
+            Threshold {
+                bound: 20.0,
+                level: Level::Green,
+            },
+        ];
+        db.set_thresholds("s", &over).await.unwrap();
+        assert_eq!(db.effective_thresholds("s", &declared).await.unwrap(), over);
+        db.reset().unwrap();
+        assert_eq!(
+            db.effective_thresholds("s", &declared).await.unwrap(),
+            declared
+        );
+    }
+
+    /// Explicit timestamps land on the reading (spec: data-storage —
+    /// Readings persisted with provenance).
+    #[tokio::test]
+    async fn insert_reading_at_stamps_caller_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_reading_at("s", "v", None, None, None, None, 1000.5, "then")
+            .await
+            .unwrap();
+        let rows = db.history("s", None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].ts_epoch - 1000.5).abs() < 0.001);
+        assert_eq!(rows[0].ts, "then");
     }
 }

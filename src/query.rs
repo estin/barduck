@@ -68,7 +68,7 @@ impl Backend {
             Backend::Direct(db) => {
                 let mut out = Vec::new();
                 for s in &cfg.sources {
-                    out.push(health::compute(db, cfg, &s.name).await?);
+                    out.push(health::compute(db, cfg, s.name()).await?);
                 }
                 Ok(out)
             }

@@ -1,8 +1,8 @@
 # barduck demo
 
 A runnable demo of the dashboard: one Rust binary that collects values from
-config-defined sources on a schedule, stores them in DuckDB, and shows them via
-web UI (live-updating), CLI, TUI, and a JSON HTTP API.
+config-defined shell commands on a schedule (or continuously), stores them in
+DuckDB, and shows them via web UI (live-updating), CLI, TUI, and a JSON HTTP API.
 
 ## Run it
 
@@ -12,10 +12,7 @@ Build from the repository root; once built, the daemon can be launched with
 you happen to be.
 
 ```sh
-# 1. Start the mock upstream APIs
-(cd demo && python3 mock_server.py) &
-
-# 2. Build, bundle assets, and start the daemon (collector + web UI + HTTP API)
+# Build, bundle assets, and start the daemon (collector + web UI + HTTP API)
 just run daemon --config demo/config.toml
 ```
 
@@ -56,9 +53,12 @@ Then:
 
 ## What to watch
 
-- **Live web values** — panels update every ~5s without a page reload
-  (topcoat shard re-rendering server-side; values change because the mock
-  upstream drifts).
+- **Live web values** — panels update every few seconds without a page reload
+  (topcoat shard re-rendering server-side; `disk-root` and `load-average`
+  vary naturally, the rest re-fetch on schedule).
+- **JSONL rows** — `bank-balance-thresholds` is a `query` source whose command
+  prints a `jsonl` row carrying both the value and replacement threshold
+  bands; watch the panel take the row's bands instead of its declared ones.
 - **Threshold colors** — `disk-root` goes green → yellow → red as `/` fills;
   `bank-balance-thresholds` uses the opposite direction (more USD is greener).
 - **Grid layouts** — two layouts with multiple rows, a spacer, a colspan-2 gap
@@ -90,7 +90,7 @@ Then:
   entry, no schedule, no health, no log view, no summary-strip chip. Its
   markdown renders as HTML in the web UI, same as any markdown-format
   source's value; the TUI shows it as-is.
-- **Failing source** — `dead-service` points at a closed port; after 2
+- **Failing source** — `dead-service` runs `exit 1`; after 2
   consecutive failures its panel turns red and `health` reports `failing`,
   with a plain "failing" label alongside the color even though it declares no
   threshold bands. Other sources keep collecting on schedule.
@@ -104,10 +104,9 @@ Then:
 - **Config-relative commands** — `load-average` runs `scripts/load-average.sh`
   via a relative path; it resolves against `demo/` (this config file's
   directory) no matter where the daemon was launched from.
-- **Stale source** — stop the mock server (`kill %1`); a source turns amber
-  (`stale`) once it has missed its second expected call, so `bank-balance`
-  (`interval = "5s"`) turns stale after ~10s and `work-hours`
-  (`interval = "10s"`) after ~20s.
+- **Stale stream** — `quiet-stream` emits a single value, then stays silent;
+  it turns amber (`stale`) once silence exceeds its `expected_interval`
+  (`"20s"`), while its process keeps running.
 - **Restart persistence** — Ctrl-C the daemon, restart it: history is still
   there.
 
@@ -122,12 +121,12 @@ duckdb demo/dashboard.duckdb \
 curl -s localhost:18420/api/sources/bank-balance/history | head
 ```
 
-Tables: `readings`, `fetch_logs`, `health_events`.
+Tables: `readings`, `fetch_logs`, `health_events`, `source_thresholds`.
 
 ## How it fits together
 
 ```
-config.toml ──► sources (http / bash) ──► scheduler (tokio, per-source tasks)
+config.toml ──► sources (query / stream) ──► scheduler (tokio, per-source tasks)
                      │                          │
                      │                          ▼
                      │                 fetch_logs / readings / health_events
@@ -139,8 +138,9 @@ config.toml ──► sources (http / bash) ──► scheduler (tokio, per-sour
              CLI / TUI ────────────────────────┘   (--daemon routes over the API)
 ```
 
-- Sources are declared in TOML — generic `http` (URL + dotted JSON selector) and
-  `bash` (command stdout) types; no code changes to add a data point.
+- Sources are declared in TOML — `query` (an oneshot shell command per
+  schedule tick, plain or `jsonl` stdout) and `stream` (a long-running shell
+  command emitting one `jsonl` row per line) types; no code changes to add a data point.
 - Layouts are config too: `[[layouts]]` lists source names per panel; TUI and
   web render the same definition.
 - One binary, four surfaces. Planning docs live in `openspec/`.

@@ -1,7 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::io::{Read, Write};
-
 use barduck::{
     AppState, build_router_with_bundle, collect_once, config, db::Db, health, query::Backend,
 };
@@ -58,36 +56,10 @@ fn test_asset_bundle() -> Option<topcoat::asset::AssetBundle> {
         .clone()
 }
 
-fn test_server() -> (String, std::thread::JoinHandle<()>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let handle = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { break };
-            let mut buf = [0u8; 1024];
-            let _ = s.read(&mut buf);
-            let body = r#"{"balance": 123.45}"#;
-            s.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .ok();
-        }
-    });
-    (addr, handle)
-}
-
-/// Builds a config with: a script source (echo), an http source (test server),
-/// and a failing http source (closed port). `failure_threshold = 1` so one
-/// failure flips health to failing.
-fn test_config(
-    db_path: &std::path::Path,
-    http_addr: &str,
-    marker: &std::path::Path,
-) -> config::Config {
+/// Builds a config with: a query source (echo), a query source exercising
+/// the `jsonl` row path, and a failing query source (non-zero exit).
+/// `failure_threshold = 1` so one failure flips health to failing.
+fn test_config(db_path: &std::path::Path, marker: &std::path::Path) -> config::Config {
     let toml = format!(
         r#"
 database_path = "{db}"
@@ -95,24 +67,23 @@ failure_threshold = 1
 
 [[sources]]
 name = "echo"
-type = "script"
+type = "query"
 command = "echo 42"
 unit = "x"
 
 [[sources]]
 name = "balance"
-type = "http"
-url = "http://{http}/"
-selector = "balance"
+type = "query"
+command = "echo '{{\"value\":\"123.45\"}}'"
 
 [[sources]]
 name = "dead"
-type = "http"
-url = "http://127.0.0.1:9/nope"
+type = "query"
+command = "sh -c 'exit 1'"
 
 [[sources]]
 name = "gated"
-type = "script"
+type = "query"
 setup = "test -f {marker}"
 command = "echo gated"
 
@@ -125,7 +96,6 @@ rows = [
 "#,
         db = db_path.display(),
         marker = marker.display(),
-        http = http_addr
     );
     let cfg: config::Config = toml::from_str(&toml).unwrap();
     if let Err(e) = config::validate(&cfg) {
@@ -138,10 +108,8 @@ rows = [
 async fn collection_writes_readings_logs_and_health_and_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.duckdb");
-    let (addr, _server) = test_server();
-
     // Port 0 of the OS is closed for most purposes; pick a definitely-closed one.
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
 
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
@@ -199,8 +167,7 @@ async fn start_daemon(cfg: &config::Config, db: &Db) -> String {
 async fn daemon_api_parity_with_direct_mode_and_error_handling() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
 
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
@@ -253,8 +220,7 @@ fn daemon_base(b: &Backend) -> String {
 async fn web_ui_renders_layout_panels_with_status_styles() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
 
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
@@ -340,7 +306,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "days-left"
-type = "script"
+type = "query"
 command = "echo 5"
 unit = "d"
 thresholds = [
@@ -351,7 +317,7 @@ thresholds = [
 
 [[sources]]
 name = "balance"
-type = "script"
+type = "query"
 command = "echo 90"
 unit = "USD"
 thresholds = [
@@ -362,7 +328,7 @@ thresholds = [
 
 [[sources]]
 name = "note"
-type = "script"
+type = "query"
 command = "echo hi"
 
 [[layouts]]
@@ -489,7 +455,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "cpu"
-type = "script"
+type = "query"
 command = "echo 0"
 history_points = 3
 thresholds = [
@@ -500,7 +466,7 @@ thresholds = [
 
 [[sources]]
 name = "sparse"
-type = "script"
+type = "query"
 command = "echo 0"
 history_points = 5
 thresholds = [
@@ -511,7 +477,7 @@ thresholds = [
 
 [[sources]]
 name = "plain"
-type = "script"
+type = "query"
 command = "echo 0"
 
 [[layouts]]
@@ -551,11 +517,15 @@ async fn web_ui_history_bar_reflects_recent_readings() {
     let db = Db::open_rw(&db_path).unwrap();
     // cpu: exactly 3 readings for history_points = 3 -> green, yellow, red, no padding.
     for v in ["40", "70", "95"] {
-        db.insert_reading("cpu", v, None, None, None, None).await.unwrap();
+        db.insert_reading("cpu", v, None, None, None, None)
+            .await
+            .unwrap();
     }
     // sparse: only 2 of 5 history_points -> 3 neutral padding segments, then green, red.
     for v in ["40", "95"] {
-        db.insert_reading("sparse", v, None, None, None, None).await.unwrap();
+        db.insert_reading("sparse", v, None, None, None, None)
+            .await
+            .unwrap();
     }
     db.insert_reading("plain", "hello", None, None, None, None)
         .await
@@ -606,9 +576,7 @@ async fn web_ui_history_bar_reflects_recent_readings() {
         5,
         "sparse bar should be padded to 5 segments"
     );
-    let neutral_count = sparse
-        .matches("background-color:var(--border)")
-        .count();
+    let neutral_count = sparse.matches("background-color:var(--border)").count();
     assert_eq!(
         neutral_count, 3,
         "3 padding segments expected for 2 readings out of 5 history_points"
@@ -627,8 +595,7 @@ async fn web_ui_history_bar_reflects_recent_readings() {
 async fn web_ui_unbanded_failing_source_colors_red_with_plain_label() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
 
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
@@ -671,7 +638,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "shown"
-type = "script"
+type = "query"
 command = "echo 40"
 thresholds = [
   {{ bound = 60.0, level = "green" }},
@@ -681,7 +648,7 @@ thresholds = [
 
 [[sources]]
 name = "hidden"
-type = "script"
+type = "query"
 command = "echo 40"
 show_history = false
 thresholds = [
@@ -744,7 +711,7 @@ failure_threshold = 1
 
 [[sources]]
 name = "days-left"
-type = "script"
+type = "query"
 command = "echo 5"
 unit = "d"
 thresholds = [
@@ -755,8 +722,8 @@ thresholds = [
 
 [[sources]]
 name = "flaky"
-type = "http"
-url = "http://127.0.0.1:9/nope"
+type = "query"
+command = "sh -c 'exit 1'"
 
 [[layouts]]
 title = "VDS"
@@ -823,7 +790,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "cpu-load"
-type = "script"
+type = "query"
 command = "echo 70"
 unit = "%"
 thresholds = [
@@ -898,7 +865,7 @@ failure_threshold = 1
 
 [[sources]]
 name = "cpu-load"
-type = "script"
+type = "query"
 command = "echo 42"
 unit = "%"
 thresholds = [
@@ -909,7 +876,7 @@ thresholds = [
 
 [[sources]]
 name = "mem-warn"
-type = "script"
+type = "query"
 command = "echo 70"
 unit = "%"
 thresholds = [
@@ -920,12 +887,12 @@ thresholds = [
 
 [[sources]]
 name = "flaky"
-type = "http"
-url = "http://127.0.0.1:9/nope"
+type = "query"
+command = "sh -c 'exit 1'"
 
 [[sources]]
 name = "days-left"
-type = "script"
+type = "query"
 command = "echo 90"
 unit = "d"
 thresholds = [
@@ -1039,12 +1006,12 @@ database_path = "{db}"
 
 [[sources]]
 name = "visible"
-type = "script"
+type = "query"
 command = "echo 1"
 
 [[sources]]
 name = "tui-only"
-type = "script"
+type = "query"
 command = "echo 2"
 show_in = "tui"
 
@@ -1115,13 +1082,13 @@ database_path = "{db}"
 
 [[sources]]
 name = "cpu"
-type = "script"
+type = "query"
 command = "echo 42"
 unit = "%"
 
 [[sources]]
 name = "tui-only"
-type = "script"
+type = "query"
 command = "echo 2"
 show_in = "tui"
 
@@ -1188,7 +1155,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "cpu"
-type = "script"
+type = "query"
 command = "echo 0"
 history_points = 0
 "#,
@@ -1207,8 +1174,7 @@ history_points = 0
 async fn ping_endpoint_returns_server_time() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
     let db = Db::open_rw(&db_path).unwrap();
     let base = start_daemon(&cfg, &db).await;
 
@@ -1226,8 +1192,7 @@ async fn ping_endpoint_returns_server_time() {
 async fn dashboard_includes_connection_indicator() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
 
@@ -1265,8 +1230,7 @@ async fn dashboard_includes_connection_indicator() {
 async fn dashboard_includes_offline_banner_and_dim_toggle() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
 
@@ -1326,8 +1290,7 @@ async fn dashboard_includes_offline_banner_and_dim_toggle() {
 async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
 
@@ -1371,9 +1334,15 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
     // Header and footer stay pinned while the panel grid scrolls beneath
     // them (spec: web-ui — dashboard header and footer stay pinned while
     // scrolling): both use sticky positioning with an opaque background.
-    let header_start = page.find(r#"class="sticky top-0"#).expect("sticky header wrapper expected");
-    let banner_idx = page.find("bd-offline-banner").expect("offline banner expected");
-    let h1_idx = page.find("bd-theme-toggle").expect("header content expected");
+    let header_start = page
+        .find(r#"class="sticky top-0"#)
+        .expect("sticky header wrapper expected");
+    let banner_idx = page
+        .find("bd-offline-banner")
+        .expect("offline banner expected");
+    let h1_idx = page
+        .find("bd-theme-toggle")
+        .expect("header content expected");
     assert!(
         header_start < banner_idx && banner_idx < h1_idx,
         "the offline banner and the h1 header must share the same sticky wrapper"
@@ -1440,7 +1409,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "cpu"
-type = "script"
+type = "query"
 command = "echo 0"
 
 [[layouts]]
@@ -1538,7 +1507,9 @@ rows = [
     // banner) — both legitimately reference `--status-red-*` on every page
     // regardless of content, which a bare/page-wide check would wrongly
     // trip on here.
-    let banner_start = html.find(r#"id="bd-offline-banner""#).expect("offline banner expected");
+    let banner_start = html
+        .find(r#"id="bd-offline-banner""#)
+        .expect("offline banner expected");
     let banner_end = html[banner_start..]
         .find("</div>")
         .map_or(html.len(), |e| banner_start + e + "</div>".len());
@@ -1598,8 +1569,7 @@ rows = [
 async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
 
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
@@ -1648,8 +1618,7 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
 async fn web_ui_summary_chip_href_matches_panel_id() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
-    let cfg = test_config(&db_path, &addr, &dir.path().join("marker.absent"));
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
 
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
@@ -1678,10 +1647,9 @@ async fn web_ui_summary_chip_href_matches_panel_id() {
 async fn setup_command_gates_fetch_and_recovers() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let (addr, _server) = test_server();
     // Marker does not exist yet: setup must fail.
     let marker = dir.path().join("tunnel.up");
-    let cfg = test_config(&db_path, &addr, &marker);
+    let cfg = test_config(&db_path, &marker);
 
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
@@ -1715,7 +1683,7 @@ async fn setup_command_gates_fetch_and_recovers() {
 }
 
 /// Spawns the real binary (chdir behavior lives in `main()`, not the library)
-/// to prove `database_path` and a relative `script` command resolve against the
+/// to prove `database_path` and a relative `query` command resolve against the
 /// config file's own directory, not wherever the process was launched from
 /// (spec: source-configuration — config-relative working directory).
 #[tokio::test]
@@ -1738,7 +1706,7 @@ listen = "127.0.0.1:0"
 
 [[sources]]
 name = "script-source"
-type = "script"
+type = "query"
 command = "sh script.sh"
 interval = "1s"
 "#,
@@ -1789,7 +1757,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "ticker"
-type = "script"
+type = "query"
 command = "echo tick"
 cron = "* * * * * *"
 "#,
@@ -1824,7 +1792,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "flaky"
-type = "script"
+type = "query"
 command = "sh -c 'exit 1'"
 interval = "10s"
 retry_interval = "100ms"
@@ -1837,12 +1805,22 @@ retry_interval = "100ms"
     let db = Db::open_rw(&db_path).unwrap();
     barduck::collector::spawn_all(&db, &cfg);
 
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-
-    let logs = db.logs(Some("flaky"), 100).await.unwrap();
+    // Deadline-based rather than a fixed sleep: heavily loaded machines can
+    // take a few hundred ms per attempt (process spawn + contended DB), so
+    // wait until the attempts land instead of asserting a fixed count after
+    // a fixed window. The 10s `interval` would still give ~1 attempt here,
+    // so reaching 3 proves retries run at `retry_interval`.
+    let mut logs = Vec::new();
+    for _ in 0..100 {
+        logs = db.logs(Some("flaky"), 100).await.unwrap();
+        if logs.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
         logs.len() >= 3,
-        "expected several retry attempts within 700ms at a 100ms retry_interval (10s interval would give ~1), got {}",
+        "expected several retry attempts at a 100ms retry_interval (10s interval would give ~1), got {}",
         logs.len()
     );
     assert!(
@@ -1866,7 +1844,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "recovers"
-type = "script"
+type = "query"
 command = "sh -c 'test -f {marker} && echo ok || (touch {marker}; exit 1)'"
 interval = "2s"
 retry_interval = "100ms"
@@ -1917,7 +1895,7 @@ database_path = "{db}"
 
 [[sources]]
 name = "flaky-ticker"
-type = "script"
+type = "query"
 command = "sh -c 'exit 1'"
 cron = "* * * * * *"
 "#,
@@ -1957,12 +1935,12 @@ database_path = "{db}"
 
 [[sources]]
 name = "cpu"
-type = "script"
+type = "query"
 command = "echo 42"
 
 [[sources]]
 name = "notes"
-type = "script"
+type = "query"
 command = "echo '# Heading'"
 format = "markdown"
 "#,
@@ -2039,22 +2017,23 @@ format = "markdown"
 async fn typed_source_stores_matching_typed_column_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let toml = "[[sources]]\nname = \"count\"\ntype = \"script\"\ncommand = \"echo 7\"\nvalue_type = \"bigint\"\n\n\
-                [[sources]]\nname = \"flag\"\ntype = \"script\"\ncommand = \"echo true\"\nvalue_type = \"json\"\n";
+    let toml = "[[sources]]\nname = \"count\"\ntype = \"query\"\ncommand = \"echo 7\"\nvalue_type = \"bigint\"\n\n\
+                [[sources]]\nname = \"flag\"\ntype = \"query\"\ncommand = \"echo true\"\nvalue_type = \"json\"\n";
     let cfg: config::Config = toml::from_str(toml).unwrap();
 
     let db = Db::open_rw(&db_path).unwrap();
     collect_once(&db, &cfg).await;
 
     let conn = duckdb::Connection::open(&db_path).unwrap();
-    let row = |source: &str| -> (String, Option<i64>, Option<f64>, Option<String>) {
-        conn.query_row(
+    let row =
+        |source: &str| -> (String, Option<i64>, Option<f64>, Option<String>) {
+            conn.query_row(
             "SELECT value, value_bigint, value_double, value_json FROM readings WHERE source = ?",
             duckdb::params![source],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?)),
         )
         .unwrap()
-    };
+        };
     assert_eq!(row("count"), ("7".to_string(), Some(7), None, None));
     assert_eq!(
         row("flag"),
@@ -2069,7 +2048,7 @@ async fn typed_source_stores_matching_typed_column_end_to_end() {
 async fn default_value_type_leaves_typed_columns_null() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
-    let toml = "[[sources]]\nname = \"plain\"\ntype = \"script\"\ncommand = \"echo hello\"\n";
+    let toml = "[[sources]]\nname = \"plain\"\ntype = \"query\"\ncommand = \"echo hello\"\n";
     let cfg: config::Config = toml::from_str(toml).unwrap();
 
     let db = Db::open_rw(&db_path).unwrap();
@@ -2100,7 +2079,7 @@ database_path = "{}"
 
 [[sources]]
 name = "cpu"
-type = "script"
+type = "query"
 command = "echo 92"
 thresholds = [
   {{ bound = 60.0, level = "green" }},

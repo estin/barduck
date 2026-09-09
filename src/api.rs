@@ -83,7 +83,7 @@ struct RangeQuery {
 pub async fn history(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
     let source = path_param::<SourceName>(cx)?.clone();
-    let known = st.cfg.sources.iter().any(|s| s.name == source);
+    let known = st.cfg.sources.iter().any(|s| s.name() == source);
     if !known {
         return Ok(json_err(
             StatusCode::NOT_FOUND,
@@ -106,7 +106,7 @@ pub async fn health_all(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
     let mut out = Vec::new();
     for s in &st.cfg.sources {
-        match health::compute(&st.db, &st.cfg, &s.name).await {
+        match health::compute(&st.db, &st.cfg, s.name()).await {
             Ok(h) => out.push(h),
             Err(e) => {
                 return Ok(json_err(

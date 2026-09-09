@@ -113,13 +113,20 @@ fn build_panel(
     title_override: Option<&str>,
 ) -> Panel {
     let row = latest.iter().find(|r| r.source == name);
-    let src = cfg.sources.iter().find(|s| s.name == name);
+    let src = cfg.sources.iter().find(|s| s.name() == name);
     let label = title_override
         .or_else(|| src.and_then(crate::config::SourceCfg::display_title))
         .unwrap_or(name);
+    // Effective bands ride on the health payload (declared, or the latest
+    // `jsonl` override) so the sync renderer needs no DB access itself.
+    let bands: &[crate::config::Threshold] = healths
+        .iter()
+        .find(|h| h.source == name)
+        .map_or(&[], |h| &h.thresholds);
     let level = row.and_then(|r| {
-        src.filter(|s| !s.thresholds.is_empty())
-            .and_then(|s| crate::config::level_for(&s.thresholds, &r.value))
+        (!bands.is_empty())
+            .then(|| crate::config::level_for(bands, &r.value))
+            .flatten()
     });
     Panel {
         name: label.to_string(),
@@ -1365,7 +1372,7 @@ mod tests {
     #[test]
     fn hidden_source_cell_renders_as_space() {
         let cfg = cfg_from(
-            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
+            "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
         );
         let slot = only_slot(&cfg);
         assert!(
@@ -1383,7 +1390,7 @@ mod tests {
     fn visible_source_cell_renders_normally() {
         for show_in in ["tui", "all"] {
             let cfg = cfg_from(&format!(
-                "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"{show_in}\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n"
+                "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\nshow_in = \"{show_in}\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n"
             ));
             let slot = only_slot(&cfg);
             assert!(
@@ -1392,7 +1399,7 @@ mod tests {
             );
         }
         let cfg = cfg_from(
-            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
+            "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
         );
         assert!(
             only_slot(&cfg).main.is_some(),
@@ -1406,7 +1413,7 @@ mod tests {
     #[test]
     fn hidden_pane_member_is_omitted() {
         let cfg = cfg_from(
-            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[sources]]\nname = \"b\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"grp\", secondary = [\"a\", \"b\"] }]]\n",
+            "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[sources]]\nname = \"b\"\ntype = \"query\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"grp\", secondary = [\"a\", \"b\"] }]]\n",
         );
         let slot = only_slot(&cfg);
         assert_eq!(
@@ -1422,7 +1429,7 @@ mod tests {
     #[test]
     fn pane_with_every_member_hidden_renders_as_space() {
         let cfg = cfg_from(
-            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"grp\", secondary = [\"a\"] }]]\n",
+            "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"grp\", secondary = [\"a\"] }]]\n",
         );
         let slot = only_slot(&cfg);
         assert!(
@@ -1439,10 +1446,10 @@ mod tests {
     #[test]
     fn hiding_a_source_does_not_change_grid_geometry() {
         let visible = cfg_from(
-            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\", { kind = \"space\", colspan = 2 }]]\n",
+            "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\", { kind = \"space\", colspan = 2 }]]\n",
         );
         let hidden = cfg_from(
-            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\", { kind = \"space\", colspan = 2 }]]\n",
+            "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\", { kind = \"space\", colspan = 2 }]]\n",
         );
         let mut visible_state = UiState {
             error: None,
@@ -1479,7 +1486,7 @@ mod tests {
     #[test]
     fn same_layout_renders_differently_per_view() {
         let cfg = cfg_from(
-            "[[sources]]\nname = \"a\"\ntype = \"script\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
+            "[[sources]]\nname = \"a\"\ntype = \"query\"\ncommand = \"echo 0\"\nshow_in = \"web\"\n\n[[layouts]]\ntitle = \"L\"\nrows = [[\"a\"]]\n",
         );
         let slot = only_slot(&cfg);
         assert!(

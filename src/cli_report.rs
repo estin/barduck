@@ -22,8 +22,8 @@ fn filter_named<T: Named>(rows: Vec<T>, sources: &[String]) -> Vec<T> {
 fn is_text_source(cfg: &Config, name: &str) -> bool {
     cfg.sources
         .iter()
-        .find(|s| s.name == name)
-        .and_then(|s| s.format)
+        .find(|s| s.name() == name)
+        .and_then(crate::config::SourceCfg::format)
         == Some(crate::config::ValueFormat::Markdown)
 }
 
