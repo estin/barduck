@@ -99,6 +99,7 @@ pub async fn print_logs(
     limit: i64,
     sources: &[String],
     json: bool,
+    out: &mut dyn std::io::Write,
 ) -> Result<()> {
     let mut rows = backend.logs(sources, limit).await?;
     // Units live in config, not in fetch logs: resolve per row so log
@@ -113,24 +114,27 @@ pub async fn print_logs(
             .map(str::to_string);
     }
     if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
         return Ok(());
     }
     header("recent fetch logs");
-    println!(
-        "{:<24} {:<40} {:<6} {:>9}  TIMESTAMP  ERROR",
-        "SOURCE", "VALUE", "UNIT", "MS"
-    );
+    writeln!(
+        out,
+        "{:<24} {:<40} {:<6} {:<6} {:>9}  TIMESTAMP  ERROR",
+        "SOURCE", "VALUE", "UNIT", "ORIGIN", "MS"
+    )?;
     for l in rows {
-        println!(
-            "{:<24} {:<40} {:<6} {:>9}  {}  {}",
+        writeln!(
+            out,
+            "{:<24} {:<40} {:<6} {:<6} {:>9}  {}  {}",
             l.source,
             short_value(l.value.as_deref().unwrap_or("—")),
             l.unit.as_deref().unwrap_or_default(),
+            l.origin,
             l.duration_ms,
             l.ts,
             l.error.unwrap_or_default()
-        );
+        )?;
     }
     Ok(())
 }
@@ -229,6 +233,37 @@ mod tests {
         assert_eq!(filter_named(rows.clone(), &[]).len(), 2);
         let filtered = filter_named(rows, &["b".into()]);
         assert_eq!(filtered.len(), 1);
+
         assert_eq!(filtered[0].source, "b");
+    }
+
+    /// `logs` renders one row per attempt with its origin (spec: cli —
+    /// Query commands).
+    #[tokio::test]
+    async fn logs_table_shows_push_and_poll_origins() {
+        use crate::db::{Db, Origin};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.duckdb");
+        let toml = format!(
+            "database_path = \"{db}\"\n[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\n",
+            db = db_path.display(),
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let db = Db::open_rw(&db_path).unwrap();
+        db.insert_log("s", 1, None, Some("a"), Origin::Poll)
+            .await
+            .unwrap();
+        db.insert_log("s", 1, None, Some("b"), Origin::Push)
+            .await
+            .unwrap();
+        let backend = Backend::new(&cfg, false).unwrap();
+        let mut buf = Vec::new();
+        print_logs(&backend, &cfg, 10, &[], false, &mut buf)
+            .await
+            .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("ORIGIN"), "header names the column:\n{text}");
+        assert!(text.contains("poll"), "scheduled row shows poll:\n{text}");
+        assert!(text.contains("push"), "ingested row shows push:\n{text}");
     }
 }

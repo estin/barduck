@@ -1,10 +1,11 @@
 use crate::{
     config::{Config, SourceCfg},
-    db::Db,
+    db::{Db, Origin},
     health, source,
 };
 use anyhow::Result;
 use croner::Cron;
+use std::collections::HashMap;
 use std::time::Instant;
 use tokio::time::timeout;
 
@@ -133,6 +134,36 @@ async fn first_interval_tick(
     })
 }
 
+/// Schedule-reset wiring between the HTTP ingest handler and collector
+/// tasks (spec: data-collection — Ingested values reset interval
+/// schedules): one channel per interval-scheduled query source. Cron and
+/// stream sources are excluded — ingest stores and logs for them but never
+/// moves their schedule.
+pub struct ResetHub {
+    pub txs: HashMap<String, tokio::sync::mpsc::UnboundedSender<()>>,
+    pub rxs: HashMap<String, tokio::sync::mpsc::UnboundedReceiver<()>>,
+}
+
+/// Builds the [`ResetHub`] for a config. Fails on a source whose kind
+/// cannot be built, mirroring what its collector task would report at
+/// startup.
+pub fn reset_channels(cfg: &Config) -> Result<ResetHub> {
+    let mut hub = ResetHub {
+        txs: HashMap::new(),
+        rxs: HashMap::new(),
+    };
+    for src in &cfg.sources {
+        let is_interval_query = src.cron().is_none()
+            && !matches!(source::build(src)?, source::SourceKind::Stream { .. });
+        if is_interval_query {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            hub.txs.insert(src.name().to_string(), tx);
+            hub.rxs.insert(src.name().to_string(), rx);
+        }
+    }
+    Ok(hub)
+}
+
 /// Spawns one independent task per source so a hanging fetch cannot block
 /// others (spec: data-collection — failure isolation). Fire-and-forget, with
 /// no cooperative shutdown — used by tests and one-shot callers. The daemon
@@ -144,7 +175,7 @@ pub fn spawn_all(db: &Db, cfg: &Config) {
         let cfg = cfg.clone();
         tokio::spawn(async move {
             let name = src.name().to_string();
-            if let Err(e) = loop_source(db, src, cfg, None).await {
+            if let Err(e) = loop_source(db, src, cfg, None, None).await {
                 tracing::error!("collector for `{name}` stopped: {e:#}");
             }
         });
@@ -156,13 +187,16 @@ pub fn spawn_all(db: &Db, cfg: &Config) {
 /// hard-killed by process exit mid-fetch/mid-write (spec: data-collection —
 /// daemon shutdown lets in-flight collection finish). Returns the tasks'
 /// handles so the daemon can await them after the HTTP server's own graceful
-/// shutdown completes.
+/// shutdown completes. Consumes the [`ResetHub`]'s receivers, one per
+/// interval-scheduled query source.
 #[must_use]
 pub fn spawn_graceful(
     db: &Db,
     cfg: &Config,
     shutdown: &tokio::sync::watch::Receiver<bool>,
+    hub: ResetHub,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut rxs = hub.rxs;
     cfg.sources
         .iter()
         .map(|src| {
@@ -170,9 +204,10 @@ pub fn spawn_graceful(
             let src = src.clone();
             let cfg = cfg.clone();
             let shutdown = shutdown.clone();
+            let reset = rxs.remove(src.name());
             tokio::spawn(async move {
                 let name = src.name().to_string();
-                if let Err(e) = loop_source(db, src, cfg, Some(shutdown)).await {
+                if let Err(e) = loop_source(db, src, cfg, Some(shutdown), reset).await {
                     tracing::error!("collector for `{name}` stopped: {e:#}");
                 }
             })
@@ -185,6 +220,7 @@ async fn loop_source(
     src: SourceCfg,
     cfg: Config,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    mut reset: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
 ) -> Result<()> {
     let kind = source::build(&src)?;
     // Re-derive the last known status so restarts don't duplicate transitions.
@@ -222,6 +258,24 @@ async fn loop_source(
                         if res.is_err() || *sd.borrow() {
                             return Ok(());
                         }
+                        continue;
+                    }
+                    // An ingested value resets the interval wait to the
+                    // success path (spec: data-collection — Ingested values
+                    // reset interval schedules). `advance` is a no-op for
+                    // cron, and stream sources never reach this loop, so
+                    // routing a reset to them is harmless. A dropped sender
+                    // (handler gone) fires once, then the loop re-arms on
+                    // the still-open receiver — shutdown still wins on the
+                    // next iteration since `changed` stays pending.
+                    () = async {
+                        if let Some(rx) = reset.as_mut() {
+                            rx.recv().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        schedule.advance(false);
                         continue;
                     }
                 }
@@ -350,7 +404,10 @@ async fn ingest_stream_run(
     }
     match proc.wait_for_exit().await {
         Ok(status) if status.success() => {
-            if let Err(e) = db.insert_log(&name, elapsed_ms(), None, None).await {
+            if let Err(e) = db
+                .insert_log(&name, elapsed_ms(), None, None, Origin::Poll)
+                .await
+            {
                 tracing::error!("insert log `{name}`: {e:#}");
             }
             refresh_health(db, cfg, &name, last_status).await;
@@ -390,20 +447,30 @@ async fn ingest_stream_line(
             return;
         }
     };
-    store_parsed_value(db, cfg, src, last_status, &parsed, elapsed_ms()).await;
+    store_parsed_value(
+        db,
+        cfg,
+        src,
+        Some(last_status),
+        &parsed,
+        elapsed_ms(),
+        Origin::Poll,
+    )
+    .await;
 }
 
 /// Converts, stores, and logs one already-parsed value (shared by
 /// [`fetch_once`] and [`ingest_stream_line`]); applies a valid threshold
 /// override and refreshes health. Returns whether the round trip counts
 /// as successful for scheduling purposes.
-async fn store_parsed_value(
+pub(crate) async fn store_parsed_value(
     db: &Db,
     cfg: &Config,
     src: &SourceCfg,
-    last_status: &mut String,
+    last_status: Option<&mut String>,
     parsed: &source::ParsedOutput,
     ms: i64,
+    origin: Origin,
 ) -> bool {
     let name = src.name();
     match source::convert_value_type(&parsed.value, src.effective_value_type()) {
@@ -425,26 +492,29 @@ async fn store_parsed_value(
             }
             match &stored {
                 Ok(()) => {
-                    if let Err(e) = db.insert_log(name, ms, None, Some(&parsed.value)).await {
+                    if let Err(e) = db
+                        .insert_log(name, ms, None, Some(&parsed.value), origin)
+                        .await
+                    {
                         tracing::error!("insert log `{name}`: {e:#}");
                     }
                     if let Some(bands) = &parsed.threshold {
                         db.set_session_bands(name, bands);
                     }
-                    refresh_health(db, cfg, name, last_status).await;
+                    refresh_health_opt(db, cfg, name, last_status).await;
                     true
                 }
                 Err(e) => {
                     record_failure(db, name, ms, &format!("fetched but failed to store: {e:#}"))
                         .await;
-                    refresh_health(db, cfg, name, last_status).await;
+                    refresh_health_opt(db, cfg, name, last_status).await;
                     false
                 }
             }
         }
         Err(e) => {
             record_failure(db, name, ms, &format!("{e:#}")).await;
-            refresh_health(db, cfg, name, last_status).await;
+            refresh_health_opt(db, cfg, name, last_status).await;
             false
         }
     }
@@ -463,6 +533,27 @@ async fn refresh_health(db: &Db, cfg: &Config, name: &str, last_status: &mut Str
             }
         }
         Err(e) => tracing::error!("health compute `{name}`: {e:#}"),
+    }
+}
+
+/// [`refresh_health`] for callers without task-local status memory (the
+/// HTTP ingest handler): re-derives the previous status from the database
+/// the way collector startup does, so transitions are still recorded once.
+pub(crate) async fn refresh_health_opt(
+    db: &Db,
+    cfg: &Config,
+    name: &str,
+    last_status: Option<&mut String>,
+) {
+    if let Some(ls) = last_status {
+        refresh_health(db, cfg, name, ls).await;
+    } else {
+        let mut prev = db
+            .last_health(name)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "healthy".into());
+        refresh_health(db, cfg, name, &mut prev).await;
     }
 }
 
@@ -548,7 +639,10 @@ pub async fn fetch_once(
         Ok(Ok(output)) => {
             let (arr_epoch, arr_ts) = crate::db::now();
             match source::parse_output(name, output, (arr_epoch, arr_ts)) {
-                Ok(parsed) => store_parsed_value(db, cfg, src, last_status, &parsed, ms).await,
+                Ok(parsed) => {
+                    store_parsed_value(db, cfg, src, Some(last_status), &parsed, ms, Origin::Poll)
+                        .await
+                }
                 Err(e) => {
                     record_failure(db, name, ms, &format!("{e:#}")).await;
                     refresh_health(db, cfg, name, last_status).await;
@@ -579,7 +673,10 @@ pub async fn fetch_once(
 }
 
 async fn record_failure(db: &Db, name: &str, ms: i64, error: &str) {
-    if let Err(e) = db.insert_log(name, ms, Some(error), None).await {
+    if let Err(e) = db
+        .insert_log(name, ms, Some(error), None, Origin::Poll)
+        .await
+    {
         tracing::error!("insert log `{name}`: {e:#}");
     }
 }
@@ -723,7 +820,9 @@ mod tests {
     async fn first_tick_is_deferred_when_last_success_is_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("cpu", 1, None, Some("42")).await.unwrap();
+        db.insert_log("cpu", 1, None, Some("42"), Origin::Poll)
+            .await
+            .unwrap();
 
         let before = tokio::time::Instant::now();
         let next = first_interval_tick(
@@ -746,7 +845,9 @@ mod tests {
     async fn first_tick_is_immediate_when_last_success_is_older_than_interval() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("cpu", 1, None, Some("42")).await.unwrap();
+        db.insert_log("cpu", 1, None, Some("42"), Origin::Poll)
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let before = tokio::time::Instant::now();
@@ -772,7 +873,7 @@ mod tests {
     async fn first_tick_defers_to_retry_interval_when_last_attempt_failed() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("cpu", 1, Some("timeout"), None)
+        db.insert_log("cpu", 1, Some("timeout"), None, Origin::Poll)
             .await
             .unwrap();
 
@@ -801,7 +902,7 @@ mod tests {
     async fn first_tick_is_immediate_when_last_failure_is_older_than_retry_interval() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("cpu", 1, Some("timeout"), None)
+        db.insert_log("cpu", 1, Some("timeout"), None, Origin::Poll)
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -829,7 +930,9 @@ mod tests {
     async fn schedule_new_ignores_freshness_for_cron_sources() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        db.insert_log("backup", 1, None, Some("ok")).await.unwrap();
+        db.insert_log("backup", 1, None, Some("ok"), Origin::Poll)
+            .await
+            .unwrap();
         let src = cron_source("backup", "0 0 3 * * *");
 
         let schedule = Schedule::new(&db, &src).await.unwrap();

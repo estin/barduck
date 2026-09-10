@@ -6,7 +6,7 @@ Shows latest values and fetch logs from the terminal in a scriptable, non-intera
 
 ## Requirements
 ### Requirement: Query commands
-The CLI SHALL provide commands to print latest values per source and recent fetch logs. The `history` and `health` subcommands are removed: per-source history and health remain available in the web UI, the TUI, and the HTTP API. Output SHALL be human-readable tables by default and JSON with `--json`.
+The CLI SHALL provide commands to print latest values per source and recent fetch logs. The `history` and `health` subcommands are removed: per-source history and health remain available in the web UI, the TUI, and the HTTP API. Output SHALL be human-readable tables by default and JSON with `--json`. The fetch-logs table SHALL include each entry's attempt origin (`push` for HTTP-ingested values, `poll` for scheduled fetches; spec: data-collection — Fetch attempts logged).
 
 #### Scenario: Latest values printed
 - **WHEN** the user runs the latest-values command
@@ -19,6 +19,10 @@ The CLI SHALL provide commands to print latest values per source and recent fetc
 #### Scenario: Removed subcommands fail
 - **WHEN** the user runs `history` or `health`
 - **THEN** the CLI exits non-zero with an unknown-subcommand error
+
+#### Scenario: Log origin rendered
+- **WHEN** the user runs the fetch-logs command over entries of both origins
+- **THEN** each row shows `push` or `poll` in its origin column
 ### Requirement: Direct mode by default
 By default CLI queries SHALL read the DuckDB database file directly; no daemon needs to be running.
 

@@ -1,12 +1,22 @@
-use crate::{AppState, health};
+use crate::{
+    AppState, collector,
+    config::{Threshold, validate_thresholds},
+    db::Origin,
+    health, source,
+};
 use serde::Deserialize;
 use topcoat::{
     Result,
     context::{Cx, app_context},
     cookie::{Cookie, Cookies, cookie, cookies, time::Duration},
     router::{
-        Body, StatusCode, content::Json, error::bad_request, path_param, request::uri,
-        response::Response, route,
+        Body, StatusCode,
+        content::Json,
+        error::bad_request,
+        path_param,
+        request::{Bytes, uri},
+        response::Response,
+        route,
     },
 };
 
@@ -173,5 +183,145 @@ pub async fn logs(cx: &Cx) -> Result<Response> {
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("{e:#}"),
         )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestBody {
+    source: String,
+    value: serde_json::Value,
+    #[serde(default)]
+    ts: Option<serde_json::Value>,
+    #[serde(default)]
+    thresholds: Option<Vec<Threshold>>,
+}
+
+/// Stores a pushed reading (spec: http-api — HTTP ingest endpoint). Reads
+/// the raw body instead of the `Json` extractor so every malformed request
+/// — wrong content type, bad JSON, missing fields — answers with the same
+/// `{"error": ...}` shape as the other endpoints rather than a framework
+/// default.
+#[route(POST "/api/ingest")]
+pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
+    let st = app_context::<AppState>(cx);
+    let start = std::time::Instant::now();
+    #[allow(clippy::cast_possible_truncation)] // handler-measured, fits easily
+    let elapsed_ms = || start.elapsed().as_millis() as i64;
+    let req: IngestBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(json_err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid ingest body: {e}"),
+            ));
+        }
+    };
+    let Some(src) = st.cfg.sources.iter().find(|s| s.name() == req.source) else {
+        return Ok(json_err(
+            StatusCode::NOT_FOUND,
+            &format!("unknown source `{}`", req.source),
+        ));
+    };
+    // Plain-text values stay as-is; JSON values are compacted to their
+    // canonical form so numbers and objects store deterministically.
+    let value = match &req.value {
+        serde_json::Value::String(s) => s.clone(),
+        v => v.to_string(),
+    };
+    if let Some(bands) = &req.thresholds
+        && let Err(e) = validate_thresholds(src.name(), bands)
+    {
+        return Ok(json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")));
+    }
+    let arrival = crate::db::now();
+    let (ts_epoch, ts) = match resolve_ingest_ts(req.ts.as_ref(), arrival, src.name()) {
+        Ok(t) => t,
+        Err(e) => return Ok(json_err(StatusCode::BAD_REQUEST, &e)),
+    };
+    // Pre-validate so a value the source's type rejects is a 400 recording
+    // nothing — `store_parsed_value` would log it as a failed attempt.
+    if let Err(e) = source::convert_value_type(&value, src.effective_value_type()) {
+        return Ok(json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")));
+    }
+    let parsed = source::ParsedOutput {
+        value: value.clone(),
+        ts_epoch,
+        ts: ts.clone(),
+        threshold: req.thresholds.clone(),
+    };
+    collector::store_parsed_value(
+        &st.db,
+        &st.cfg,
+        src,
+        None,
+        &parsed,
+        elapsed_ms(),
+        Origin::Push,
+    )
+    .await;
+    // Move the source's interval wait to the success path; cron and stream
+    // sources have no sender and are unaffected (spec: data-collection —
+    // Ingested values reset interval schedules). A closed channel only
+    // means its collector task already exited — the value is still stored.
+    if let Some(tx) = st.resets.get(src.name()) {
+        let _ = tx.send(());
+    }
+    Ok(json_ok(&serde_json::json!({
+        "source": src.name(),
+        "value": value,
+        "ts_epoch": ts_epoch,
+        "ts": ts,
+        "unit": src.unit(),
+        "origin": Origin::Push,
+    })))
+}
+
+/// Strict ingest `ts`: epoch number or RFC 3339 string; anything else is a
+/// caller error naming the problem (unlike row `ts`, which degrades to
+/// arrival time).
+fn resolve_ingest_ts(
+    raw: Option<&serde_json::Value>,
+    arrival: (f64, String),
+    source: &str,
+) -> std::result::Result<(f64, String), String> {
+    let Some(v) = raw else {
+        return Ok(arrival);
+    };
+    match v {
+        serde_json::Value::Null => Ok(arrival),
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(secs) => epoch_to_ts(secs, source),
+            None => Err(format!("ingest `ts` for `{source}` is not a finite number")),
+        },
+        serde_json::Value::String(s) => {
+            chrono::DateTime::parse_from_rfc3339(s).map_or_else(
+                |_| Err(format!("ingest `ts` for `{source}` is not RFC 3339: `{s}`")),
+                |d| {
+                    #[allow(clippy::cast_precision_loss)] // epoch millis fit exactly enough
+                    let epoch = d.timestamp_millis() as f64 / 1000.0;
+                    Ok((epoch, d.to_rfc3339()))
+                },
+            )
+        }
+        _ => Err(format!(
+            "ingest `ts` for `{source}` must be epoch seconds or RFC 3339"
+        )),
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn epoch_to_ts(secs: f64, source: &str) -> std::result::Result<(f64, String), String> {
+    if !secs.is_finite() {
+        return Err(format!("ingest `ts` for `{source}` is not a finite number"));
+    }
+    let whole = secs.trunc();
+    let nanos = ((secs - whole).abs() * 1_000_000_000.0).round() as u32;
+    match chrono::DateTime::from_timestamp(whole as i64, nanos) {
+        Some(d) => {
+            #[allow(clippy::cast_precision_loss)]
+            let epoch = d.timestamp_millis() as f64 / 1000.0;
+            Ok((epoch, d.to_rfc3339()))
+        }
+        None => Err(format!("ingest `ts` for `{source}` is out of range")),
     }
 }

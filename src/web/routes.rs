@@ -303,6 +303,7 @@ pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
                         table_head("TIME")
                         table_head("DURATION")
                         table_head("VALUE")
+                        table_head("ORIGIN")
                         table_head("ERROR")
                     )
                 )
@@ -324,6 +325,7 @@ pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
                                 },
                                 <pre class="whitespace-pre-wrap break-all m-0">(value_with_unit(l.value.as_deref(), src.unit()))</pre>
                             )
+                            table_cell(attrs: attributes! { class="font-mono" }, (l.origin.to_string()))
                             table_cell(
                                 attrs: attributes! { class="text-red-500 font-mono" },
                                 <pre class="whitespace-pre-wrap break-all m-0">(l.error.clone().unwrap_or_default())</pre>

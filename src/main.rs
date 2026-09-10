@@ -121,6 +121,7 @@ fn main() -> Result<()> {
             limit,
             &flags.source,
             flags.json,
+            &mut std::io::stdout(),
         )),
         Cmd::Reset { yes, json } => {
             if !yes

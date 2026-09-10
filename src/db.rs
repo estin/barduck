@@ -95,6 +95,7 @@ enum WriteCmd {
         duration_ms: i64,
         error: Option<String>,
         value: Option<String>,
+        origin: Origin,
         reply: oneshot::Sender<Result<()>>,
     },
     InsertHealthEvent {
@@ -144,13 +145,14 @@ impl WriteCmd {
                 duration_ms,
                 error,
                 value,
+                origin,
                 reply,
             } => (
                 db.with_lock(|| {
                     conn.execute(
-                        "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
-                         VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?)",
-                        params![source, ts_epoch, ts, duration_ms, error, value],
+                        "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value, origin)
+                         VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?, ?)",
+                        params![source, ts_epoch, ts, duration_ms, error, value, origin.as_str()],
                     )?;
                     Ok(())
                 }),
@@ -233,6 +235,47 @@ pub struct ReadingRow {
     pub ts: String,
 }
 
+/// How a fetch-log row's value arrived (spec: data-collection — Fetch
+/// attempts logged): pushed via `POST /api/ingest`, or gathered by a
+/// scheduled fetch. Serializes to its lowercase name in JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// Value gathered by a scheduled fetch; also the backfill for rows
+    /// written before the origin column existed.
+    #[default]
+    Poll,
+    /// Value pushed via `POST /api/ingest`.
+    Push,
+}
+
+impl Origin {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Poll => "poll",
+            Origin::Push => "push",
+        }
+    }
+
+    /// Lenient database read: only `push` is meaningful, anything else
+    /// (including future values) falls back to `poll`, mirroring the
+    /// `COALESCE(origin,'poll')` at every log SELECT.
+    #[must_use]
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "push" => Origin::Push,
+            _ => Origin::Poll,
+        }
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRow {
     pub source: String,
@@ -246,6 +289,10 @@ pub struct LogRow {
     /// serialized before this field existed.
     #[serde(default)]
     pub unit: Option<String>,
+    /// Always resolved via `COALESCE(origin,'poll')`, so never missing from
+    /// the database; defaults to `poll` for JSON serialized by older daemons.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,8 +352,16 @@ fn create_schema(conn: &Connection) -> Result<()> {
             -- failed attempt always carries error detail, a successful one
             -- never does.
             error       VARCHAR,
-            value       VARCHAR
+            value       VARCHAR,
+            -- How the value arrived: `push` (POST /api/ingest) or `poll`
+            -- (scheduled fetch). Absent on rows written before this column
+            -- existed; those read as `poll` via COALESCE at every SELECT.
+            origin      VARCHAR
         );
+        -- No migrator: bringing an old database forward is this statement
+        -- plus a backfill (spec: data-collection — Fetch attempts logged).
+        ALTER TABLE fetch_logs ADD COLUMN IF NOT EXISTS origin VARCHAR;
+        UPDATE fetch_logs SET origin = 'poll' WHERE origin IS NULL;
         CREATE TABLE IF NOT EXISTS health_events (
             id       BIGINT NOT NULL,
             source   VARCHAR NOT NULL,
@@ -605,12 +660,19 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Records one fetch attempt stamped with the arrival time: the row's
+    /// timestamp is when the attempt happened, even when the value it
+    /// carries arrived with its own `ts` (spec: http-api — HTTP ingest
+    /// endpoint) — attempt recency drives retry backoff and startup
+    /// freshness, so a backdated value must not present as a fresh attempt.
     pub async fn insert_log(
         &self,
         source: &str,
         duration_ms: i64,
         error: Option<&str>,
         value: Option<&str>,
+        origin: Origin,
     ) -> Result<()> {
         let (ts_epoch, ts) = now();
         if let Some(writer) = &self.writer {
@@ -622,6 +684,7 @@ impl Db {
                 duration_ms,
                 error: error.map(str::to_string),
                 value: value.map(str::to_string),
+                origin,
                 reply,
             };
             writer
@@ -631,9 +694,17 @@ impl Db {
         }
         let (_guard, conn) = self.connect_async().await?;
         conn.execute(
-            "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
-             VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?)",
-            params![source, ts_epoch, ts, duration_ms, error, value],
+            "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value, origin)
+             VALUES (nextval('fetch_logs_id_seq'), ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                source,
+                ts_epoch,
+                &ts,
+                duration_ms,
+                error,
+                value,
+                origin.as_str()
+            ],
         )?;
         Ok(())
     }
@@ -772,7 +843,7 @@ impl Db {
         // count in `health::compute`) rely on this being true newest-first
         // order, not an arbitrary tied order.
         let mut stmt = conn.prepare(
-            "SELECT source, ts_epoch, ts, duration_ms, error, value FROM fetch_logs
+            "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
              WHERE (?::VARCHAR IS NULL OR source = ?::VARCHAR)
              ORDER BY ts_epoch DESC, id DESC LIMIT ?",
         )?;
@@ -786,6 +857,7 @@ impl Db {
                     error: r.get(4)?,
                     value: r.get(5)?,
                     unit: None,
+                    origin: Origin::from_db(&r.get::<_, String>(6)?),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -818,7 +890,7 @@ impl Db {
     pub async fn last_success(&self, source: &str) -> Result<Option<LogRow>> {
         let (_guard, conn) = self.connect_async().await?;
         let mut stmt = conn.prepare(
-            "SELECT source, ts_epoch, ts, duration_ms, error, value FROM fetch_logs
+            "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
              WHERE source = ? AND error IS NULL
              ORDER BY ts_epoch DESC, id DESC LIMIT 1",
         )?;
@@ -834,6 +906,7 @@ impl Db {
                     error: r.get(4)?,
                     value: r.get(5)?,
                     unit: None,
+                    origin: Origin::from_db(&r.get::<_, String>(6)?),
                 })
             })
             .transpose()?)
@@ -849,7 +922,7 @@ impl Db {
     pub async fn last_attempt(&self, source: &str) -> Result<Option<LogRow>> {
         let (_guard, conn) = self.connect_async().await?;
         let mut stmt = conn.prepare(
-            "SELECT source, ts_epoch, ts, duration_ms, error, value FROM fetch_logs
+            "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
              WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![source])?;
@@ -864,6 +937,7 @@ impl Db {
                     error: r.get(4)?,
                     value: r.get(5)?,
                     unit: None,
+                    origin: Origin::from_db(&r.get::<_, String>(6)?),
                 })
             })
             .transpose()?)
@@ -994,6 +1068,40 @@ mod tests {
         assert_eq!(filtered[0].value.as_deref(), Some("q"));
     }
 
+    /// Pre-migration rows (no `origin` column) read as `poll` once the
+    /// database is opened, while newly written rows keep their origin
+    /// (spec: data-collection — Fetch attempts logged).
+    #[tokio::test]
+    async fn origin_backfills_poll_and_new_rows_keep_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        {
+            let conn = duckdb::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE SEQUENCE fetch_logs_id_seq;
+                 CREATE TABLE fetch_logs (
+                     id BIGINT NOT NULL, source VARCHAR NOT NULL,
+                     ts_epoch DOUBLE NOT NULL, ts VARCHAR NOT NULL,
+                     duration_ms BIGINT NOT NULL, error VARCHAR, value VARCHAR
+                 );
+                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'old', 1000.0, 't', 1, NULL, 'v');",
+            )
+            .unwrap();
+        }
+        let db = Db::open_rw(&path).unwrap();
+        let rows = db.logs(Some("old"), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].origin, Origin::Poll);
+
+        db.insert_log("old", 1, None, Some("w"), Origin::Push)
+            .await
+            .unwrap();
+        let rows = db.logs(Some("old"), 10).await.unwrap();
+        assert_eq!(rows[0].origin, Origin::Push);
+        assert_eq!(rows[1].origin, Origin::Poll);
+    }
+
     /// `last_attempt` returns the newest entry whatever its outcome, unlike
     /// `last_success` (spec: data-collection — Per-source schedules: daemon
     /// startup resumes from the last run).
@@ -1003,16 +1111,22 @@ mod tests {
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
         assert!(db.last_attempt("missing").await.unwrap().is_none());
 
-        db.insert_log("s", 1, None, Some("ok")).await.unwrap();
+        db.insert_log("s", 1, None, Some("ok"), Origin::Poll)
+            .await
+            .unwrap();
         let first = db.last_attempt("s").await.unwrap().unwrap();
         assert!(first.error.is_none());
 
-        db.insert_log("s", 1, Some("boom"), None).await.unwrap();
+        db.insert_log("s", 1, Some("boom"), None, Origin::Poll)
+            .await
+            .unwrap();
         let second = db.last_attempt("s").await.unwrap().unwrap();
         assert_eq!(second.error.as_deref(), Some("boom"));
 
         // A later success wins again, and `last_success` still skips failures.
-        db.insert_log("s", 1, None, Some("ok2")).await.unwrap();
+        db.insert_log("s", 1, None, Some("ok2"), Origin::Poll)
+            .await
+            .unwrap();
         let third = db.last_attempt("s").await.unwrap().unwrap();
         assert!(third.error.is_none());
         assert_eq!(third.value.as_deref(), Some("ok2"));

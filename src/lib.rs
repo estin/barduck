@@ -25,6 +25,10 @@ use topcoat::{
 pub struct AppState {
     pub db: Db,
     pub cfg: Arc<Config>,
+    /// Schedule-reset senders, one per interval-scheduled query source
+    /// (spec: data-collection — Ingested values reset interval schedules).
+    /// Empty in tests and one-shot callers, which never reset schedules.
+    pub resets: std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// Daemon mode: collector + HTTP server (API and web UI) in one process.
@@ -42,13 +46,16 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
         .await
         .with_context(|| format!("binding {}", cfg.listen))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut tasks = collector::spawn_graceful(&db, &cfg, &shutdown_rx);
+    let mut hub = collector::reset_channels(&cfg)?;
+    let txs = std::mem::take(&mut hub.txs);
+    let mut tasks = collector::spawn_graceful(&db, &cfg, &shutdown_rx, hub);
     if let Some(retention) = cfg.retention {
         tasks.push(spawn_retention(db.clone(), retention, shutdown_rx));
     }
     let state = AppState {
         db,
         cfg: Arc::new(cfg.clone()),
+        resets: txs,
     };
     println!(
         "barduck daemon listening on http://{} (web UI at /)",

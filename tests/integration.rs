@@ -1,7 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use barduck::{
-    AppState, build_router_with_bundle, collect_once, config, db::Db, health, query::Backend,
+    AppState, build_router_with_bundle, collect_once, collector, config,
+    db::{Db, Origin},
+    health,
+    query::Backend,
 };
 use fs2::FileExt as _;
 use std::sync::{Arc, OnceLock};
@@ -155,6 +158,7 @@ async fn start_daemon(cfg: &config::Config, db: &Db) -> String {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -209,11 +213,199 @@ async fn daemon_api_parity_with_direct_mode_and_error_handling() {
     assert!(body["error"].as_str().unwrap().contains("doesnotexist"));
 }
 
+#[tokio::test]
+async fn ingest_stores_value_and_rejects_bad_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    let base = start_daemon(&cfg, &db).await;
+    let client = reqwest::Client::new();
+    let post = |v: serde_json::Value| client.post(format!("{base}/api/ingest")).json(&v).send();
+
+    // Happy path: reading stored, success log with push origin, echo shape.
+    let resp = post(serde_json::json!({"source": "echo", "value": "7"}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let echo: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(echo["source"], "echo");
+    assert_eq!(echo["value"], "7");
+    assert_eq!(echo["origin"], "push");
+    assert_eq!(echo["unit"], "x");
+    let rows = db.logs(Some("echo"), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value.as_deref(), Some("7"));
+    assert_eq!(rows[0].origin, Origin::Push);
+
+    // Unknown source: 404 JSON, nothing recorded.
+    let resp = post(serde_json::json!({"source": "nope", "value": "1"}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("nope"));
+    assert!(db.logs(Some("nope"), 10).await.unwrap().is_empty());
+
+    // Missing value: 400, nothing recorded.
+    let resp = post(serde_json::json!({"source": "echo"})).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.get("error").is_some());
+    assert_eq!(db.logs(Some("echo"), 10).await.unwrap().len(), 1);
+
+    // Bad ts and lone-band thresholds: 400 each, nothing recorded.
+    for bad in [
+        serde_json::json!({"source": "echo", "value": "7", "ts": "not-a-time"}),
+        serde_json::json!({"source": "echo", "value": "7", "ts": [1]}),
+        serde_json::json!({"source": "echo", "value": "7",
+            "thresholds": [{"bound": 1.0, "level": "green"}]}),
+    ] {
+        let resp = post(bad).await.unwrap();
+        assert_eq!(resp.status(), 400);
+        assert_eq!(db.logs(Some("echo"), 10).await.unwrap().len(), 1);
+    }
+
+    // Explicit epoch ts is honored.
+    let resp = post(serde_json::json!({"source": "echo", "value": "8", "ts": 1000.5}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let rows = db.logs(Some("echo"), 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].value.as_deref(), Some("8"));
+}
+
+#[test]
+fn reset_channels_cover_only_interval_query_sources() {
+    let toml = r#"
+database_path = "/tmp/reset-cfg-check.duckdb"
+[[sources]]
+name = "poll_me"
+type = "query"
+command = "echo hi"
+interval = "1h"
+[[sources]]
+name = "cron_me"
+type = "query"
+command = "echo hi"
+cron = "* * * * * *"
+[[sources]]
+name = "stream_me"
+type = "stream"
+command = "cat"
+expected_interval = "30s"
+"#;
+    let cfg: config::Config = toml::from_str(toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let hub = collector::reset_channels(&cfg).unwrap();
+    assert!(hub.txs.contains_key("poll_me"));
+    assert!(!hub.txs.contains_key("cron_me"));
+    assert!(!hub.txs.contains_key("stream_me"));
+}
+
+#[tokio::test]
+async fn ingest_defers_interval_tick_and_clears_retry_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 5
+[[sources]]
+name = "flaky"
+type = "query"
+command = "echo hi"
+interval = "1h"
+retry_interval = "2s"
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+    // A fresh failure defers the first tick to retry_interval (~2s).
+    db.insert_log("flaky", 1, Some("boom"), None, Origin::Poll)
+        .await
+        .unwrap();
+
+    let mut hub = collector::reset_channels(&cfg).unwrap();
+    let txs = std::mem::take(&mut hub.txs);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tasks = collector::spawn_graceful(&db, &cfg, &shutdown_rx, hub);
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        resets: txs,
+    };
+    let router = barduck::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+    // Ingest a second into the window (letting startup settle), resetting
+    // the wait to the full hour; two seconds past the original deadline
+    // only the seeded failure and the ingest exist — no scheduled fetch
+    // fired.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/ingest"))
+        .json(&serde_json::json!({"source": "flaky", "value": "pushed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let rows = db.logs(Some("flaky"), 10).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected only the seeded failure and the ingest"
+    );
+    assert_eq!(rows[0].origin, Origin::Push);
+
+    shutdown_tx.send(true).unwrap();
+    for task in tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
 fn daemon_base(b: &Backend) -> String {
     match b {
         Backend::Daemon { base, .. } => base.clone(),
         Backend::Direct(_) => panic!("expected daemon backend"),
     }
+}
+
+#[tokio::test]
+async fn log_view_renders_push_and_poll_origins() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    db.insert_log("echo", 1, None, Some("42"), Origin::Poll)
+        .await
+        .unwrap();
+    db.insert_log("echo", 1, None, Some("43"), Origin::Push)
+        .await
+        .unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/logs/echo", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(html.contains("ORIGIN"), "origin column expected:\n{html}");
+    assert!(html.contains("poll"), "scheduled row shows poll");
+    assert!(html.contains("push"), "ingested row shows push");
 }
 
 #[tokio::test]
@@ -228,6 +420,7 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -358,6 +551,7 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -534,6 +728,7 @@ async fn web_ui_history_bar_reflects_recent_readings() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -603,6 +798,7 @@ async fn web_ui_unbanded_failing_source_colors_red_with_plain_label() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -682,6 +878,7 @@ async fn web_ui_show_history_false_hides_bar_for_banded_source() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -752,6 +949,7 @@ async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -826,6 +1024,7 @@ async fn web_ui_main_only_pane_renders_like_single_source_panel() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -933,6 +1132,7 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1048,6 +1248,7 @@ async fn web_ui_hides_a_tui_only_source_but_keeps_the_unrestricted_one() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1120,6 +1321,7 @@ async fn web_ui_omits_hidden_pane_member_and_collapses_all_hidden_pane() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1199,6 +1401,7 @@ async fn dashboard_includes_connection_indicator() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1237,6 +1440,7 @@ async fn dashboard_includes_offline_banner_and_dim_toggle() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1297,6 +1501,7 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1429,6 +1634,7 @@ rows = [
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1469,6 +1675,7 @@ rows = [
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1547,6 +1754,7 @@ rows = [
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1577,6 +1785,7 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1626,6 +1835,7 @@ async fn web_ui_summary_chip_href_matches_panel_id() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2102,6 +2312,7 @@ rows = [["cpu"]]
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2192,6 +2403,7 @@ rows = [["price"]]
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
+        resets: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

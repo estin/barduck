@@ -74,7 +74,7 @@ When a source declares threshold bands and its latest value falls in a band, the
 - **WHEN** a healthy source has bands 60→green, 85→yellow, 100→red and reports `92`
 - **THEN** its panel renders with the red style
 ### Requirement: Per-source log view linked from panels
-Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHALL open in the current tab, not a new tab. The daemon SHALL serve that page showing the source's recent fetch log entries: timestamp, duration, gathered value rendered together with the source's unit (when the source declares one), and error. The page SHALL include a link back to the dashboard. Requests for unknown sources MUST return a client error naming the unknown source.
+Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHALL open in the current tab, not a new tab. The daemon SHALL serve that page showing the source's recent fetch log entries: timestamp, duration, gathered value rendered together with the source's unit (when the source declares one), attempt origin (`push` for HTTP-ingested values, `poll` for scheduled fetches; spec: data-collection — Fetch attempts logged), and error. The page SHALL include a link back to the dashboard. Requests for unknown sources MUST return a client error naming the unknown source.
 
 #### Scenario: Log view opens from panel
 - **WHEN** the user clicks the time-ago text on the `bank-balance` panel
@@ -87,6 +87,10 @@ Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHA
 #### Scenario: Unitless value renders bare
 - **WHEN** a source declaring no unit has a log entry
 - **THEN** the entry's value cell shows the bare value, as before this change
+
+#### Scenario: Origin rendered
+- **WHEN** the log view renders entries of both origins
+- **THEN** each entry shows `push` or `poll`
 
 #### Scenario: Back link returns to the dashboard
 - **WHEN** the user clicks the back link on a source's log view
