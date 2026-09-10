@@ -2,6 +2,7 @@
 //! format shared by a `Cell::Text` panel and `SourceCfg::format`.
 
 use super::GroupItem;
+use std::collections::HashMap;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
@@ -63,6 +64,8 @@ pub enum Cell {
     Pane {
         id: String,
         title: Option<String>,
+        #[serde(default)]
+        style: Option<HashMap<String, String>>,
     },
     Space {
         kind: String,
@@ -71,15 +74,9 @@ pub enum Cell {
     Text {
         #[serde(default)]
         title: Option<String>,
-        // Deliberately `String`, not `ValueFormat`: this field lives inside
-        // an untagged enum, where a field that fails to deserialize doesn't
-        // produce a clear "invalid value" error — it just makes serde treat
-        // this whole variant as not matching and fall through to `Group`
-        // (see the untagged-ordering note above), turning "bad format" into
-        // a confusing "empty group" error instead. Validated explicitly in
-        // `validation::validate_cell` so the error names the actual value.
         format: Option<String>,
         text: String,
+        style: Option<HashMap<String, String>>,
     },
     Group {
         #[serde(default)]
@@ -89,6 +86,8 @@ pub enum Cell {
         secondary: Vec<GroupItem>,
         #[serde(default)]
         table: Vec<GroupItem>,
+        #[serde(default)]
+        style: Option<HashMap<String, String>>,
     },
 }
 
@@ -138,6 +137,8 @@ impl Cell {
 #[serde(deny_unknown_fields)]
 pub struct LayoutCfg {
     pub title: String,
+    #[serde(default)]
+    pub style: Option<HashMap<String, String>>,
     pub rows: Vec<Vec<Cell>>,
 }
 

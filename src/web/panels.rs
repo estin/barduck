@@ -1,7 +1,7 @@
 //! Panel data model and the live panel-grid shard (spec: web-ui — current
 //! values without manual reload; group panes; panel retrospective history
 //! bar; source summary strip).
-
+use std::collections::HashMap;
 use super::markdown::formatted_content;
 use crate::{
     AppState,
@@ -168,6 +168,7 @@ struct Slot {
     secondary: Vec<Panel>,
     table: Vec<Panel>,
     text: Option<TextPanel>,
+    style: Option<HashMap<String, String>>,
 }
 
 impl Slot {
@@ -248,8 +249,32 @@ pub(super) fn text_style_for_color(color: Option<Level>) -> &'static str {
     }
 }
 
+
+/// Convert an optional style override map to a CSS inline string.
+/// Each key-value pair becomes `key: value`, joined by semicolons.
+fn style_override_to_css(style: Option<&HashMap<String, String>>) -> String {
+    match style {
+        Some(map) => map
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect::<Vec<_>>()
+            .join("; "),
+        None => String::new(),
+    }
+}
+
+/// Build a CSS inline style string from base styles and optional overrides.
+/// Avoids leading/trailing semicolons when overrides are empty.
+fn style_string(base: &str, extra: &str) -> String {
+    if extra.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}; {}", base, extra)
+    }
+}
 struct Grid {
     title: String,
+    style: Option<HashMap<String, String>>,
     columns: usize,
     rows: Vec<Vec<Slot>>,
 }
@@ -333,12 +358,14 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
                 // falls through to the same empty-grid-position rendering as an
                 // explicit `space` cell (spec: web-ui — hidden sources render as
                 // space in the web dashboard).
-                let (main, secondary, table_panels, group_title, text_panel) = match cell {
+                let (main, secondary, table_panels, group_title, text_panel, cell_style) = match cell {
                     config::Cell::Group {
                         title,
                         main,
                         secondary,
                         table: cell_table,
+                        style: group_style,
+                        ..
                     } => {
                         let main = match main.as_ref().filter(|item| {
                             config::source_visible_in(&st.cfg, item.id(), config::View::Web)
@@ -360,7 +387,7 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
                                 build_panel(st, &latest, item.id(), item.explicit_label()).await,
                             );
                         }
-                        (main, secondary_panels, table_out, title.clone(), None)
+                        (main, secondary_panels, table_out, title.clone(), None, group_style.clone())
                     }
                     config::Cell::Source(name) => {
                         let main = if config::source_visible_in(&st.cfg, name, config::View::Web) {
@@ -368,21 +395,23 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
                         } else {
                             None
                         };
-                        (main, Vec::new(), Vec::new(), None, None)
+                        (main, Vec::new(), Vec::new(), None, None, None)
                     }
-                    config::Cell::Pane { id, title } => {
+                    config::Cell::Pane { id, title, style: pane_style } => {
                         let main = if config::source_visible_in(&st.cfg, id, config::View::Web) {
                             Some(build_panel(st, &latest, id, title.as_deref()).await)
                         } else {
                             None
                         };
-                        (main, Vec::new(), Vec::new(), None, None)
+                        (main, Vec::new(), Vec::new(), None, None, pane_style.clone())
                     }
-                    config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None),
+                    config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None, None),
                     config::Cell::Text {
                         title,
                         format,
                         text,
+                        style: text_style,
+                        ..
                     } => (
                         None,
                         Vec::new(),
@@ -395,6 +424,7 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
                                 .unwrap_or_default(),
                             text: text.clone(),
                         }),
+                        text_style.clone(),
                     ),
                 };
                 let span = cell.span();
@@ -406,6 +436,7 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
                     secondary,
                     table: table_panels,
                     text: text_panel,
+                    style: cell_style,
                 });
                 col += span;
             }
@@ -413,6 +444,7 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
         }
         grids.push(Grid {
             title: layout.title.clone(),
+            style: layout.style.clone(),
             columns: layout.columns(),
             rows,
         });
@@ -463,7 +495,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
         for grid in &grids {
             <h2 class="text-lg font-semibold mb-3 text-foreground">(grid.title.clone())</h2>
             <div class=(format!("grid bd-panel-grid gap-3 mb-6 grid-cols-{}", grid.columns.min(6)))
-                style=(format!("--bd-cols: {}; grid-template-columns: repeat({}, minmax(0, 1fr));", grid.columns, grid.columns))
+                style=(style_string(&format!("--bd-cols: {}; grid-template-columns: repeat({}, minmax(0, 1fr));", grid.columns, grid.columns), &style_override_to_css(grid.style.as_ref())))
             >
                 for (ri, row) in grid.rows.iter().enumerate() {
                     for slot in row {
@@ -472,7 +504,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                 attrs: attributes! {
                                     id=(format!("text-panel-{}-{}", ri, slot.col_start))
                                     class="relative bd-panel-cell"
-                                    style=(format!("grid-row: {}; grid-column: {} / span {};", ri + 1, slot.col_start, slot.span))
+                                    style=(style_string(&format!("grid-row: {}; grid-column: {} / span {}", ri + 1, slot.col_start, slot.span), &style_override_to_css(slot.style.as_ref())))
                                 },
                                 // No health/threshold color and no footer/log-link/history-bar —
                                 // there's no source behind a static-text panel (spec: web-ui —
@@ -489,14 +521,11 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                         } else if slot.secondary.is_empty() && slot.table.is_empty() && slot.main.is_some() {
                             if let Some(main) = &slot.main {
                                 card(
-                                    attrs: attributes! {
-                                        id=(format!("panel-{}", main.source))
-                                        class="relative bd-panel-cell"
-                                        style=(format!(
-                                            "{}; grid-row: {}; grid-column: {} / span {};",
-                                            main.status_style(), ri + 1, slot.col_start, slot.span
-                                        ))
-                                    },
+                                attrs: attributes! {
+                                    id=(format!("panel-{}", main.source))
+                                    class="relative bd-panel-cell"
+                                    style=(style_string(&format!("{}; grid-row: {}; grid-column: {} / span {}", main.status_style(), ri + 1, slot.col_start, slot.span), &style_override_to_css(slot.style.as_ref())))
+                                },
                                     // Title on the card's own top border, top-left, padded — the
                                     // TUI's bordered-panel title convention (spec: web-ui — panel
                                     // title rendered on the card border). `top-0 -translate-y-1/2`
@@ -539,10 +568,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                 attrs: attributes! {
                                     id=(format!("panel-{}", slot.anchor().unwrap_or_default()))
                                     class="relative bd-panel-cell"
-                                    style=(format!(
-                                        "{}; grid-row: {}; grid-column: {} / span {};",
-                                        slot.group_status_style(), ri + 1, slot.col_start, slot.span
-                                    ))
+                                    style=(style_string(&format!("{}; grid-row: {}; grid-column: {} / span {}", slot.group_status_style(), ri + 1, slot.col_start, slot.span), &style_override_to_css(slot.style.as_ref())))
                                 },
                                 // A combined card's own background is always neutral (spec:
                                 // web-ui — group panes card border reflects the worst member
@@ -623,7 +649,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                 )
                             )
                         } else {
-                            <div class="bd-panel-cell" style=(format!("grid-row: {}; grid-column: {} / span {};", ri + 1, slot.col_start, slot.span))></div>
+                            <div class="bd-panel-cell" style=(style_string(&format!("grid-row: {}; grid-column: {} / span {}", ri + 1, slot.col_start, slot.span), &style_override_to_css(slot.style.as_ref())))></div>
                         }
                     }
                 }

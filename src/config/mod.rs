@@ -311,17 +311,18 @@ mod tests {
             main: None,
             secondary: Vec::new(),
             table: vec![GroupItem::Id("a".into())],
+            style: None,
         };
         assert_eq!(cell.span(), 1);
         assert_eq!(cell.pane_title(), Some("ihor"));
     }
-
     #[test]
     fn text_cell_span_title_and_source_names() {
         let cell = Cell::Text {
             title: Some("Links".into()),
             format: Some("markdown".into()),
             text: "- [GitHub](https://github.com)".into(),
+            style: None,
         };
         assert_eq!(cell.span(), 1);
         assert_eq!(cell.pane_title(), Some("Links"));
@@ -337,6 +338,7 @@ mod tests {
             title: None,
             format: None,
             text: "note".into(),
+            style: None,
         };
         assert_eq!(cell.pane_title(), None);
     }
@@ -456,6 +458,7 @@ mod tests {
                 label: "B".into(),
             }],
             table: vec![GroupItem::Id("c".into())],
+            style: None,
         };
         assert_eq!(cell.source_names(), vec!["a", "b", "c"]);
     }
@@ -759,5 +762,25 @@ mod tests {
             err.to_string().contains("expected_interval"),
             "error should name the cross-type field: {err}"
         );
+    }
+
+    #[test]
+    fn layout_style_override_parses() {
+        let toml = "[[layouts]]\ntitle = \"L\"\nstyle = { font_family = \"monospace\", font_size = \"14px\" }\nrows = [[{ main = \"s\", style = { font_family = \"sans-serif\" } }]]\n[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\ninterval = \"10s\"\ntimeout = \"5s\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.layouts[0].style.as_ref().unwrap().get("font_family"), Some(&"monospace".to_string()));
+        assert_eq!(cfg.layouts[0].style.as_ref().unwrap().get("font_size"), Some(&"14px".to_string()));
+        if let Cell::Group { style: Some(cell_style), .. } = &cfg.layouts[0].rows[0][0] {
+            assert_eq!(cell_style.get("font_family"), Some(&"sans-serif".to_string()));
+        } else {
+            panic!("expected Group cell");
+        }
+    }
+
+    #[test]
+    fn layout_without_style_defaults_to_none() {
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ main = \"s\" }]]\n[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\ninterval = \"10s\"\ntimeout = \"5s\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.layouts[0].style.is_none());
     }
 }

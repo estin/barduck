@@ -193,6 +193,7 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                                 main,
                                 secondary,
                                 table,
+                                ..
                             } => (
                                 main.as_ref()
                                     .filter(|item| {
@@ -242,7 +243,7 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                                 None,
                                 None,
                             ),
-                            crate::config::Cell::Pane { id, title } => (
+                            crate::config::Cell::Pane { id, title, .. } => (
                                 crate::config::source_visible_in(cfg, id, View::Tui).then(|| {
                                     build_panel(cfg, &latest, &healths, id, title.as_deref())
                                 }),

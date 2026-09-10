@@ -148,6 +148,7 @@ pub(crate) fn validate_cell(
             main,
             secondary,
             table,
+            ..
         } => {
             if title.as_deref() == Some("") {
                 bail!(

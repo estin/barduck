@@ -140,8 +140,26 @@ rows = [
   - `{ table = ["src1", "src2"] }` — sources in a table view
   - `{ main = "src", secondary = ["other"], title = "Label" }` — named group with secondary sources
   - `{ kind = "space", colspan = 2 }` — empty spacer cell spanning 2 columns
+### Web UI Style Overrides
+
+Layouts and cells can have a `style` field with CSS property overrides rendered as inline styles in the web dashboard.
+
+```toml
+[[layouts]]
+title = "Monospace Dashboard"
+style = { font_family = "monospace", font_size = "14px" }
+rows = [
+  [{ main = "cpu-temp", style = { font_size = "18px" } }],
+  [{ main = "load-average", style = { font_family = "sans-serif" } }],
+]
+```
+
+- `style` on `[[layouts]]` applies CSS overrides to the entire layout grid container
+- `style` on `Cell` objects (`main`, `table`, `Pane`, `Text`, `Group`) applies per-panel CSS overrides
+- Any CSS property-value pair is supported (e.g., `font_family`, `font_size`, `background_color`, `gap`)
 
 ### Visibility
+
 
 Each source has a `show_in` field controlling which UI surfaces display it:
 - `show_in = "all"` (default) — Visible in both TUI and web UI

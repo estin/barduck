@@ -165,8 +165,26 @@ unit = "ticks"
 # A source may also declare `show_in = "tui"` or `show_in = "web"` (default
 # "all") to restrict which UI displays it — see `dead-service` above. This
 # only affects display placement; the source is still collected on schedule.
+# Layout style overrides (spec: web-ui — layout style overrides).
+# Each layout and cell can have a `style` field with CSS property overrides
+# rendered as inline styles on the panel grid and cards.
+# Examples:
+#   [[layouts]]
+#   title = "Monospace"
+#   style = { font_family = "monospace" }     # all panels in this layout use monospace
+#   rows = [
+#       [{ main = "source-name", style = { font_size = "18px" } }],  # per-cell override
+#   ]
+#
+# Supported CSS properties: any property-value pair (e.g., font_family,
+# font_size, background_color, gap). Values are strings passed through
+# as-is in the inline style attribute.
+#
+# Existing layouts without `style` fields are unaffected.
+
 [[layouts]]
 title = "Overview"
+style = { font_family = "monospace" }
 rows = [
     [
         { title = "Server", main = "disk-root", secondary = ["domain-expiry"], table = [{ id = "disk-home", label = "home" }] },
