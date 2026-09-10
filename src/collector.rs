@@ -428,10 +428,8 @@ async fn store_parsed_value(
                     if let Err(e) = db.insert_log(name, ms, None, Some(&parsed.value)).await {
                         tracing::error!("insert log `{name}`: {e:#}");
                     }
-                    if let Some(bands) = &parsed.threshold
-                        && let Err(e) = db.set_thresholds(name, bands).await
-                    {
-                        tracing::error!("set thresholds `{name}`: {e:#}");
+                    if let Some(bands) = &parsed.threshold {
+                        db.set_session_bands(name, bands);
                     }
                     refresh_health(db, cfg, name, last_status).await;
                     true
@@ -860,7 +858,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, "7");
         assert!((rows[0].ts_epoch - 1000.5).abs() < 0.001);
-        let bands = db.effective_thresholds("b", &[]).await.unwrap();
+        let bands = db.session_bands("b").unwrap();
         assert_eq!(bands.len(), 2);
     }
 

@@ -42,7 +42,17 @@ pub struct Db {
     /// its request here instead of taking the per-op `connect_async` path
     /// when this is `Some`.
     writer: Option<mpsc::UnboundedSender<WriteCmd>>,
+    /// `jsonl` threshold overrides for the current process only (spec:
+    /// source-configuration — Threshold bands): written by ingest, read by
+    /// health/renderers, forgotten when the handle is dropped. A fresh
+    /// handle (daemon start) therefore always reseeds from config bands.
+    session_bands: SessionBands,
 }
+
+/// In-memory threshold overrides keyed by source name. `std` (not Tokio)
+/// lock: holders only clone a small `Vec`, never hold across `.await`.
+pub type SessionBands =
+    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, Vec<Threshold>>>>;
 
 struct DbLock(#[allow(dead_code)] File);
 
@@ -96,14 +106,6 @@ enum WriteCmd {
     },
     PurgeOlderThan {
         cutoff_epoch: f64,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Replaces the effective threshold bands for one source (spec:
-    /// source-configuration — JSONL row schema): a single row per source,
-    /// rewritten on every override.
-    SetThresholds {
-        source: String,
-        bands_json: String,
         reply: oneshot::Sender<Result<()>>,
     },
 }
@@ -192,24 +194,6 @@ impl WriteCmd {
                 }),
                 reply,
             ),
-            WriteCmd::SetThresholds {
-                source,
-                bands_json,
-                reply,
-            } => (
-                db.with_lock(|| {
-                    conn.execute(
-                        "DELETE FROM source_thresholds WHERE source = ?",
-                        params![source],
-                    )?;
-                    conn.execute(
-                        "INSERT INTO source_thresholds (source, bands_json) VALUES (?, ?)",
-                        params![source, bands_json],
-                    )?;
-                    Ok(())
-                }),
-                reply,
-            ),
         };
         // A read-only connection opened by another process (direct-mode
         // CLI/TUI, `Db::open_ro`) can only see what's checkpointed into the
@@ -234,8 +218,7 @@ impl WriteCmd {
             WriteCmd::InsertReading { reply, .. }
             | WriteCmd::InsertLog { reply, .. }
             | WriteCmd::InsertHealthEvent { reply, .. }
-            | WriteCmd::PurgeOlderThan { reply, .. }
-            | WriteCmd::SetThresholds { reply, .. } => reply,
+            | WriteCmd::PurgeOlderThan { reply, .. } => reply,
         };
         let _ = reply.send(Err(anyhow::anyhow!("db writer unavailable: {err:#}")));
     }
@@ -326,15 +309,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
             ts       VARCHAR NOT NULL,
             status   VARCHAR NOT NULL
         );
-        -- Effective threshold bands per source, replaced wholesale by
-        -- `jsonl` row overrides (spec: source-configuration — JSONL row
-        -- schema). One row per source by construction (rewritten, not
-        -- appended); renderers fall back to declared bands when absent.
-        -- Never purged by retention: these are current config, not history.
-        CREATE TABLE IF NOT EXISTS source_thresholds (
-            source     VARCHAR NOT NULL,
-            bands_json VARCHAR NOT NULL
-        );
         CREATE INDEX IF NOT EXISTS idx_readings_source_ts ON readings(source, ts_epoch);
         CREATE INDEX IF NOT EXISTS idx_fetch_logs_source_ts ON fetch_logs(source, ts_epoch);
         CREATE INDEX IF NOT EXISTS idx_health_events_source_ts ON health_events(source, ts_epoch);",
@@ -355,6 +329,7 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
             path,
             ro: false,
             writer: None,
+            session_bands: SessionBands::default(),
         };
         // The initial open races the same "read-only open sees a torn write"
         // hazard as any other operation, so it takes the lock too — briefly,
@@ -404,6 +379,7 @@ impl Db {
             path: path.to_path_buf(),
             ro: false,
             writer: None,
+            session_bands: SessionBands::default(),
         };
         db.with_conn(create_schema)?;
         Ok(db)
@@ -426,11 +402,13 @@ impl Db {
             path: path.to_path_buf(),
             ro: true,
             writer: None,
+            session_bands: SessionBands::default(),
         })
     }
 
-    /// Drops every table (readings, fetch logs, health events, threshold
-    /// overrides) and recreates an empty schema. Callers are responsible
+    /// Drops every table (readings, fetch logs, health events — plus the
+    /// vestigial `source_thresholds` table from before overrides became
+    /// session-only) and recreates an empty schema. Callers are responsible
     /// for confirming with the user first — this is irreversible.
     pub fn reset(&self) -> Result<()> {
         self.with_conn(|conn| {
@@ -655,53 +633,21 @@ impl Db {
         Ok(())
     }
 
-    /// Replaces the effective threshold bands for `source` with `bands`
-    /// (spec: source-configuration — JSONL row schema). Renderers read them
-    /// back via [`Db::effective_thresholds`], falling back to declared bands
-    /// when no override was ever stored.
-    pub async fn set_thresholds(&self, source: &str, bands: &[Threshold]) -> Result<()> {
-        let bands_json = serde_json::to_string(bands).context("serializing threshold bands")?;
-        if let Some(writer) = &self.writer {
-            let (reply, rx) = oneshot::channel();
-            writer
-                .send(WriteCmd::SetThresholds {
-                    source: source.to_string(),
-                    bands_json,
-                    reply,
-                })
-                .map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
-            return rx.await.context("db writer task dropped the reply")?;
+    /// Replaces the effective threshold bands for `source` for the current
+    /// process only (spec: source-configuration — Threshold bands).
+    /// Forgotten when the handle is dropped; a fresh handle reseeds from
+    /// config bands.
+    pub fn set_session_bands(&self, source: &str, bands: &[Threshold]) {
+        if let Ok(mut map) = self.session_bands.write() {
+            map.insert(source.to_string(), bands.to_vec());
         }
-        let (_guard, conn) = self.connect_async().await?;
-        conn.execute(
-            "DELETE FROM source_thresholds WHERE source = ?",
-            params![source],
-        )?;
-        conn.execute(
-            "INSERT INTO source_thresholds (source, bands_json) VALUES (?, ?)",
-            params![source, bands_json],
-        )?;
-        Ok(())
     }
 
-    /// Effective threshold bands for `source`: the latest `jsonl` override
-    /// when one was stored, otherwise `declared` (the config bands).
-    /// A stored value that no longer parses (shouldn't happen — writers
-    /// serialize it) falls back to `declared` rather than failing the render.
-    pub async fn effective_thresholds(
-        &self,
-        source: &str,
-        declared: &[Threshold],
-    ) -> Result<Vec<Threshold>> {
-        let (_guard, conn) = self.connect_async().await?;
-        let mut stmt =
-            conn.prepare("SELECT bands_json FROM source_thresholds WHERE source = ? LIMIT 1")?;
-        let mut rows = stmt.query(params![source])?;
-        let Some(row) = rows.next()? else {
-            return Ok(declared.to_vec());
-        };
-        let raw: String = row.get(0)?;
-        Ok(serde_json::from_str(&raw).unwrap_or_else(|_| declared.to_vec()))
+    /// Session override bands for `source`, if a `jsonl` row replaced them
+    /// since process start. `None` means color with declared bands.
+    #[must_use]
+    pub fn session_bands(&self, source: &str) -> Option<Vec<Threshold>> {
+        self.session_bands.read().ok()?.get(source).cloned()
     }
 
     pub async fn last_health(&self, source: &str) -> Result<Option<String>> {
@@ -1121,28 +1067,17 @@ mod tests {
         assert_eq!(panic_message(&*payload), "<non-string panic payload>");
     }
 
-    /// Overrides replace bands wholesale and fall back to declared bands
-    /// when absent; `reset` clears them (spec: source-configuration —
-    /// JSONL row schema).
+    /// Session overrides are visible on the same handle and its clones,
+    /// but invisible on a fresh handle over the same file: a simulated
+    /// restart forgets them and reseeds from config (spec:
+    /// source-configuration — Threshold bands).
     #[tokio::test]
-    async fn threshold_overrides_round_trip_and_reset_clears() {
+    async fn session_bands_apply_live_and_vanish_on_new_handle() {
         use crate::config::{Level, Threshold};
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        let declared = vec![
-            Threshold {
-                bound: 1.0,
-                level: Level::Green,
-            },
-            Threshold {
-                bound: 2.0,
-                level: Level::Red,
-            },
-        ];
-        assert_eq!(
-            db.effective_thresholds("s", &declared).await.unwrap(),
-            declared
-        );
+        let path = dir.path().join("t.duckdb");
+        let db = Db::open_rw(&path).unwrap();
+        assert!(db.session_bands("s").is_none());
         let over = vec![
             Threshold {
                 bound: 10.0,
@@ -1153,13 +1088,14 @@ mod tests {
                 level: Level::Green,
             },
         ];
-        db.set_thresholds("s", &over).await.unwrap();
-        assert_eq!(db.effective_thresholds("s", &declared).await.unwrap(), over);
-        db.reset().unwrap();
-        assert_eq!(
-            db.effective_thresholds("s", &declared).await.unwrap(),
-            declared
-        );
+        db.set_session_bands("s", &over);
+        assert_eq!(db.session_bands("s").unwrap(), over);
+        // A clone shares the session (the daemon's collectors and HTTP
+        // handlers all see the same overrides).
+        assert_eq!(db.clone().session_bands("s").unwrap(), over);
+        // A fresh handle is a fresh session: overrides are forgotten.
+        let restarted = Db::open_rw(&path).unwrap();
+        assert!(restarted.session_bands("s").is_none());
     }
 
     /// Explicit timestamps land on the reading (spec: data-storage —

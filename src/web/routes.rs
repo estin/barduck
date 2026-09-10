@@ -279,7 +279,7 @@ path_param!(source_name: String);
 pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
     let _ = tick; // refresh trigger only; data always re-read from the DB
     let st = app_context::<AppState>(cx);
-    let Some(_src) = st.cfg.sources.iter().find(|s| s.name() == source) else {
+    let Some(src) = st.cfg.sources.iter().find(|s| s.name() == source) else {
         return Err(topcoat::Error::from(topcoat::router::error::bad_request(
             format!("unknown source `{source}`"),
         )));
@@ -296,47 +296,58 @@ pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
     view! {
-        table(
-            attrs: attributes! { class="bg-background rounded-xl shadow-sm" },
-            table_header(
-                table_row(
-                    table_head("TIME")
-                    table_head("DURATION")
-                    table_head("VALUE")
-                    table_head("ERROR")
+            table(
+                attrs: attributes! { class="bg-background rounded-xl shadow-sm" },
+                table_header(
+                    table_row(
+                        table_head("TIME")
+                        table_head("DURATION")
+                        table_head("VALUE")
+                        table_head("ERROR")
+                    )
+                )
+                table_body(
+                    for l in &rows {
+                        table_row(
+                            table_cell(
+                                attrs: attributes! { class="font-mono" title=(l.ts.clone()) },
+                                (age::ago(now, l.ts_epoch).unwrap_or_else(|| "—".into()))
+                            )
+                            table_cell(attrs: attributes! { class="font-mono" }, (format!("{} ms", l.duration_ms)))
+                            table_cell(
+                                attrs: attributes! {
+                                    class="font-mono"
+                                    style=(text_style_for_color(config::accent_color(
+                                        l.value.as_deref().and_then(|v| config::level_for(bands, v)),
+                                        status,
+                                    )))
+                                },
+                                <pre class="whitespace-pre-wrap break-all m-0">(value_with_unit(l.value.as_deref(), src.unit()))</pre>
+                            )
+                            table_cell(
+                                attrs: attributes! { class="text-red-500 font-mono" },
+                                <pre class="whitespace-pre-wrap break-all m-0">(l.error.clone().unwrap_or_default())</pre>
+                            )
+                        )
+                    }
+                    if rows.is_empty() {
+                        table_row(
+                            table_cell(attrs: attributes! { class="text-center text-muted-foreground" }, "No fetch attempts recorded yet.")
+                        )
+                    }
                 )
             )
-            table_body(
-                for l in &rows {
-                    table_row(
-                        table_cell(
-                            attrs: attributes! { class="font-mono" title=(l.ts.clone()) },
-                            (age::ago(now, l.ts_epoch).unwrap_or_else(|| "—".into()))
-                        )
-                        table_cell(attrs: attributes! { class="font-mono" }, (format!("{} ms", l.duration_ms)))
-                        table_cell(
-                            attrs: attributes! {
-                                class="font-mono"
-                                style=(text_style_for_color(config::accent_color(
-                                    l.value.as_deref().and_then(|v| config::level_for(bands, v)),
-                                    status,
-                                )))
-                            },
-                            <pre class="whitespace-pre-wrap break-all m-0">(l.value.clone().unwrap_or_else(|| "—".into()))</pre>
-                        )
-                        table_cell(
-                            attrs: attributes! { class="text-red-500 font-mono" },
-                            <pre class="whitespace-pre-wrap break-all m-0">(l.error.clone().unwrap_or_default())</pre>
-                        )
-                    )
-                }
-                if rows.is_empty() {
-                    table_row(
-                        table_cell(attrs: attributes! { class="text-center text-muted-foreground" }, "No fetch attempts recorded yet.")
-                    )
-                }
-            )
-        )
+    }
+}
+
+/// A log entry's value in the panel form (spec: web-ui — Per-source log
+/// view linked from panels): `"{value} {unit}"`, or the bare value when
+/// the source declares no unit or the entry carries none.
+fn value_with_unit(value: Option<&str>, unit: Option<&str>) -> String {
+    match (value, unit) {
+        (Some(v), Some(u)) if !u.is_empty() => format!("{v} {u}"),
+        (Some(v), _) => v.to_string(),
+        (None, _) => "—".into(),
     }
 }
 

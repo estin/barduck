@@ -1,4 +1,4 @@
-use crate::config::{JsonlRow, SourceCfg, Threshold, ValueType, parse_jsonl_row};
+use crate::config::{Config, JsonlRow, SourceCfg, Threshold, ValueType, parse_jsonl_row};
 use anyhow::{Context as _, Result, bail};
 use std::path::Path;
 
@@ -124,6 +124,116 @@ pub fn parse_output(source: &str, output: &str, arrival: (f64, String)) -> Resul
 async fn fetch_query(command: &str, dir: &Path) -> Result<String> {
     let out = run_shell(command, dir).await?;
     Ok(out)
+}
+
+/// One dry-run result for the `fetch` debug command (spec: cli — Source
+/// debug fetch command): the full parse pipeline output for a single
+/// command run (query) or line (stream), without touching the database.
+/// `error` is `Some` when the fetch would have failed (bad row, failed
+/// conversion); transport failures (spawn error, timeout) are `Err`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DebugRow {
+    pub value: String,
+    pub ts_epoch: f64,
+    pub ts: String,
+    pub threshold: Option<Vec<Threshold>>,
+    pub value_bigint: Option<i64>,
+    pub value_double: Option<f64>,
+    pub value_json: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Parses one output through the real pipeline (row split + value-type
+/// conversion), recording failures in [`DebugRow::error`] instead of the
+/// fetch log. Shared by the query and stream dry-runs.
+fn debug_parse(src: &SourceCfg, text: &str, arrival: (f64, String)) -> DebugRow {
+    let name = src.name();
+    let parsed = match parse_output(name, text, arrival.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return DebugRow {
+                value: String::new(),
+                ts_epoch: arrival.0,
+                ts: arrival.1,
+                threshold: None,
+                value_bigint: None,
+                value_double: None,
+                value_json: None,
+                error: Some(format!("{e:#}")),
+            };
+        }
+    };
+    match convert_value_type(&parsed.value, src.effective_value_type()) {
+        Ok((value_bigint, value_double, value_json)) => DebugRow {
+            value: parsed.value,
+            ts_epoch: parsed.ts_epoch,
+            ts: parsed.ts,
+            threshold: parsed.threshold,
+            value_bigint,
+            value_double,
+            value_json,
+            error: None,
+        },
+        Err(e) => DebugRow {
+            value: parsed.value,
+            ts_epoch: parsed.ts_epoch,
+            ts: parsed.ts,
+            threshold: None,
+            value_bigint: None,
+            value_double: None,
+            value_json: None,
+            error: Some(format!("{e:#}")),
+        },
+    }
+}
+
+/// Runs a query source's command once under its configured timeout and
+/// returns the parsed result. Writes nothing anywhere (spec: cli — Source
+/// debug fetch command).
+pub async fn debug_query(cfg: &Config, src: &SourceCfg) -> Result<DebugRow> {
+    let out = tokio::time::timeout(src.timeout(), run_shell(src.command(), &cfg.config_dir))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out after {}",
+                humantime::format_duration(src.timeout())
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    Ok(debug_parse(src, &out, crate::db::now()))
+}
+
+/// Runs a stream source's command, parses up to 5 stdout lines within the
+/// source timeout, then kills the command. Writes nothing anywhere (spec:
+/// cli — Source debug fetch command).
+pub async fn debug_stream(cfg: &Config, src: &SourceCfg) -> Result<Vec<DebugRow>> {
+    let mut proc = StreamProc::spawn(src.command(), &cfg.config_dir)?;
+    // A stream may never produce 5 lines or EOF (it can stay silent with
+    // stdout held open), so a hit deadline returns whatever arrived rather
+    // than failing: only silence from the start is a timeout error.
+    let deadline = tokio::time::sleep(src.timeout());
+    tokio::pin!(deadline);
+    let mut rows = Vec::new();
+    loop {
+        if rows.len() >= 5 {
+            break;
+        }
+        tokio::select! {
+            line = proc.next_line() => match line? {
+                Some(text) => rows.push(debug_parse(src, &text, crate::db::now())),
+                None => break,
+            },
+            () = &mut deadline => break,
+        }
+    }
+    proc.shutdown().await;
+    if rows.is_empty() {
+        bail!(
+            "no lines arrived within {}",
+            humantime::format_duration(src.timeout())
+        );
+    }
+    Ok(rows)
 }
 
 /// A running stream process with line-split stdout (spec: data-collection
@@ -352,5 +462,79 @@ mod tests {
         assert_eq!(proc.next_line().await.unwrap(), None);
         let status = proc.wait_for_exit().await.unwrap();
         assert!(status.success());
+    }
+
+    fn debug_cfg(toml_sources: &str) -> crate::config::Config {
+        toml::from_str(&format!(
+            "database_path = \"/nonexistent-debug-db/db.duckdb\"\n{toml_sources}"
+        ))
+        .unwrap()
+    }
+
+    fn find<'a>(cfg: &'a crate::config::Config, name: &str) -> &'a crate::config::SourceCfg {
+        cfg.sources.iter().find(|s| s.name() == name).unwrap()
+    }
+
+    /// A query dry-run parses plain output without touching the database
+    /// (spec: cli — Source debug fetch command).
+    #[tokio::test]
+    async fn debug_query_parses_plain_output() {
+        let cfg =
+            debug_cfg("[[sources]]\nname = \"q\"\ntype = \"query\"\ncommand = \"echo 42%\"\n");
+        let row = debug_query(&cfg, find(&cfg, "q")).await.unwrap();
+        assert_eq!(row.value, "42%");
+        assert!(row.error.is_none());
+        assert!(!std::path::Path::new("/nonexistent-debug-db/db.duckdb").exists());
+    }
+
+    /// A query dry-run applies `jsonl` structurally (spec: cli — Source
+    /// debug fetch command).
+    #[tokio::test]
+    async fn debug_query_applies_jsonl_row() {
+        let cfg = debug_cfg(
+            "[[sources]]\nname = \"q\"\ntype = \"query\"\ncommand = \"echo '{\\\"value\\\":\\\"7\\\",\\\"threshold\\\":[{\\\"bound\\\":1.0,\\\"level\\\":\\\"green\\\"},{\\\"bound\\\":10.0,\\\"level\\\":\\\"red\\\"}]}'\"\n",
+        );
+        let row = debug_query(&cfg, find(&cfg, "q")).await.unwrap();
+        assert_eq!(row.value, "7");
+        assert_eq!(row.threshold.as_ref().unwrap().len(), 2);
+        assert!(row.error.is_none());
+    }
+
+    /// A hanging command fails the dry-run at the source timeout (spec:
+    /// cli — Source debug fetch command).
+    #[tokio::test]
+    async fn debug_query_times_out() {
+        let cfg = debug_cfg(
+            "[[sources]]\nname = \"q\"\ntype = \"query\"\ncommand = \"sleep 30\"\ntimeout = \"100ms\"\n",
+        );
+        debug_query(&cfg, find(&cfg, "q")).await.unwrap_err();
+    }
+
+    /// A stream dry-run prints the first lines then kills the command,
+    /// writing nothing (spec: cli — Source debug fetch command).
+    #[tokio::test]
+    async fn debug_stream_prints_first_lines() {
+        let cfg = debug_cfg(
+            "[[sources]]\nname = \"s\"\ntype = \"stream\"\ncommand = \"printf '%s\\n' '{\\\"value\\\":\\\"a\\\"}' 'oops' '{\\\"value\\\":\\\"b\\\"}'\"\nexpected_interval = \"30s\"\n",
+        );
+        let rows = debug_stream(&cfg, find(&cfg, "s")).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].value, "a");
+        // Plain non-JSON text stays a plain value, even in streams.
+        assert_eq!(rows[1].value, "oops");
+        assert_eq!(rows[2].value, "b");
+        assert!(!std::path::Path::new("/nonexistent-debug-db/db.duckdb").exists());
+    }
+
+    /// A stream that goes silent after one line returns that line instead
+    /// of waiting out the timeout (spec: cli — Source debug fetch command).
+    #[tokio::test]
+    async fn debug_stream_returns_partial_lines_on_silence() {
+        let cfg = debug_cfg(
+            "[[sources]]\nname = \"s\"\ntype = \"stream\"\ncommand = \"echo '{\\\"value\\\":\\\"a\\\"}'; sleep 30\"\ntimeout = \"300ms\"\nexpected_interval = \"30s\"\n",
+        );
+        let rows = debug_stream(&cfg, find(&cfg, "s")).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, "a");
     }
 }

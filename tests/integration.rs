@@ -2158,3 +2158,49 @@ rows = [["cpu"]]
         "log view should share the dashboard's sticky footer"
     );
 }
+
+/// Log rows render the value together with the source's unit (spec: web-ui
+/// — Per-source log view linked from panels).
+#[tokio::test]
+async fn log_view_renders_value_with_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "price"
+type = "query"
+command = "echo 42"
+unit = "USD"
+thresholds = [
+  {{ bound = 10.0, level = "green" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[layouts]]
+title = "Overview"
+rows = [["price"]]
+"#,
+        db = db_path.display()
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/logs/price", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(
+        html.contains("42 USD"),
+        "log VALUE cell should show the value with its unit"
+    );
+}

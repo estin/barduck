@@ -62,7 +62,7 @@ When the collector starts (daemon startup), a query source's first fetch SHALL b
 - **WHEN** a `stream` source is configured alongside interval-scheduled `query` sources and the daemon (re)starts
 - **THEN** the stream is opened immediately without consulting fetch-log freshness, while each `query` source follows its own freshness-deferred first tick
 ### Requirement: Stream collection
-The collector SHALL run each stream source's command as a long-lived process and ingest its stdout line by line while the process lives: every well-formed `jsonl` row (spec: source-configuration — JSONL row schema) produces one reading stamped with the row's `ts` (or arrival time) and applies the row's `threshold` override when present. When the process ends for any reason (exit, signal, spawn failure), the collector SHALL record the outcome in the fetch log and reopen the command after the source's `retry_interval`; a spawn failure or immediate exit counts as a failed attempt. Shutdown stops reopening after the current wait, mirroring interval sources.
+The collector SHALL run each stream source's command as a long-lived process and ingest its stdout line by line while the process lives: every well-formed `jsonl` row (spec: source-configuration — JSONL row schema) produces one reading stamped with the row's `ts` (or arrival time) and applies the row's `threshold` override when present. Threshold overrides live in daemon memory only: they are forgotten when the daemon stops, and a restarted daemon colors with config-declared bands until a new row overrides them. When the process ends for any reason (exit, signal, spawn failure), the collector SHALL record the outcome in the fetch log and reopen the command after the source's `retry_interval`; a spawn failure or immediate exit counts as a failed attempt. Shutdown stops reopening after the current wait, mirroring interval sources.
 
 #### Scenario: Lines ingested continuously
 - **WHEN** a stream command prints one `jsonl` row every second for a minute
@@ -75,6 +75,10 @@ The collector SHALL run each stream source's command as a long-lived process and
 #### Scenario: Failing stream command retries
 - **WHEN** a stream command exits non-zero immediately on every start
 - **THEN** each restart is spaced by `retry_interval` and each exit is logged as failed, without affecting other sources
+
+#### Scenario: Override forgotten on restart
+- **WHEN** the daemon restarts after a stream row overrode a source's bands
+- **THEN** no fetch-log or reading replay restores the override; the source uses config bands until a new row arrives
 ### Requirement: Fetch attempts logged
 Every fetch attempt SHALL be recorded with timestamp, duration, and error detail on failure. A fetch attempt's outcome (success or failure) SHALL be derivable from whether that entry's error detail is present, not stored as a separate field: a failed attempt SHALL always carry error detail, and a successful attempt SHALL never carry error detail. Each successfully ingested `jsonl` line from a `stream` source counts as one successful attempt; a malformed line counts as one failed attempt carrying the parse error.
 

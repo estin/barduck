@@ -2,8 +2,9 @@ use crate::{
     config::{Config, VERSION},
     db::ReadingRow,
     query::Backend,
+    source::DebugRow,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 /// Client-side `--source` filter; applies to both backends uniformly.
 fn filter_named<T: Named>(rows: Vec<T>, sources: &[String]) -> Vec<T> {
@@ -189,6 +190,63 @@ pub fn parse_time(s: &str) -> Result<f64> {
         .and_hms_opt(0, 0, 0)
         .ok_or_else(|| anyhow::anyhow!("invalid date `{s}`"))?;
     Ok(midnight.and_utc().timestamp_millis() as f64 / 1000.0)
+}
+
+/// Runs one source once and prints the parsed result without touching the
+/// database (spec: cli — Source debug fetch command). Prints first, then
+/// reports failure: a transport error, or any row the real pipeline would
+/// have rejected, exits non-zero after its output.
+pub async fn print_fetch(cfg: &Config, source: &str, json: bool) -> Result<()> {
+    let Some(src) = cfg.sources.iter().find(|s| s.name() == source) else {
+        bail!("unknown source `{source}`");
+    };
+    let rows = match src {
+        crate::config::SourceCfg::Query { .. } => {
+            vec![crate::source::debug_query(cfg, src).await?]
+        }
+        crate::config::SourceCfg::Stream { .. } => crate::source::debug_stream(cfg, src).await?,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        header(&format!("debug fetch for `{source}` (no database writes)"));
+        for (i, row) in rows.iter().enumerate() {
+            if rows.len() > 1 {
+                println!("--- line {} ---", i + 1);
+            }
+            print_debug_row(row);
+        }
+    }
+    if let Some(bad) = rows.iter().find(|r| r.error.is_some()) {
+        bail!(
+            "fetch would have failed: {}",
+            bad.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    Ok(())
+}
+
+fn print_debug_row(row: &DebugRow) {
+    println!("VALUE      {}", row.value);
+    println!("TS         {}", row.ts);
+    match &row.threshold {
+        Some(bands) => println!(
+            "THRESHOLDS {}",
+            bands
+                .iter()
+                .map(|t| format!("{}→{}", t.bound, t.level.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => println!("THRESHOLDS none"),
+    }
+    println!(
+        "TYPED      bigint={:?} double={:?} json={:?}",
+        row.value_bigint, row.value_double, row.value_json
+    );
+    if let Some(e) = &row.error {
+        println!("ERROR      {e}");
+    }
 }
 
 #[cfg(test)]

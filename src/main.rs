@@ -72,6 +72,15 @@ enum Cmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Run one source once and print the parsed result without touching
+    /// the database (debug).
+    Fetch {
+        /// Which source to run.
+        source: String,
+        /// Output JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Asks the user to type "yes" on stdin; any other input (including empty)
@@ -156,6 +165,7 @@ fn main() -> Result<()> {
             println!("Database reset: {}", cfg.database_path.display());
             Ok(())
         }
+        Cmd::Fetch { source, json } => rt()?.block_on(cli_report::print_fetch(&cfg, &source, json)),
     }
 }
 

@@ -72,7 +72,12 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
     };
 
     let declared: &[crate::config::Threshold] = source_cfg.map_or(&[], |s| s.thresholds());
-    let thresholds = db.effective_thresholds(source, declared).await?;
+    // Session-only overrides (spec: source-configuration — Threshold
+    // bands): the daemon-shared map wins; anything else (direct mode,
+    // fresh process) colors with declared bands.
+    let thresholds = db
+        .session_bands(source)
+        .unwrap_or_else(|| declared.to_vec());
 
     Ok(SourceHealth {
         source: source.to_string(),
@@ -177,5 +182,32 @@ mod tests {
     fn stream_value_within_expected_interval_is_not_stale() {
         let s = stream("ticks");
         assert!(!is_stale(30.0, Some(&s), Duration::from_mins(5)));
+    }
+
+    /// Session overrides flow into the computed health payload, so every
+    /// renderer colors with them without extra plumbing (spec:
+    /// source-configuration — Threshold bands).
+    #[tokio::test]
+    async fn compute_uses_session_bands_over_declared() {
+        use crate::config::{Level, Threshold};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg: Config = toml::from_str(
+            "[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\nthresholds = [{bound = 1.0, level = \"green\"}, {bound = 2.0, level = \"red\"}]\n",
+        )
+        .unwrap();
+        let h = compute(&db, &cfg, "s").await.unwrap();
+        assert_eq!(h.thresholds.len(), 2);
+        assert_eq!(h.thresholds[0].level, Level::Green);
+        db.set_session_bands(
+            "s",
+            &[Threshold {
+                bound: 5.0,
+                level: Level::Yellow,
+            }],
+        );
+        let h = compute(&db, &cfg, "s").await.unwrap();
+        assert_eq!(h.thresholds.len(), 1);
+        assert_eq!(h.thresholds[0].level, Level::Yellow);
     }
 }
