@@ -3,6 +3,7 @@
 //! panel's content and a static-text cell's content.
 
 use crate::config::ValueFormat;
+use pulldown_cmark::Options;
 use topcoat::{
     Result,
     view::{Unescaped, component, view},
@@ -20,7 +21,7 @@ use topcoat::{
 /// `push_html` like any other text event) before rendering, and only the
 /// Markdown *syntax* (links, lists, emphasis, …) still becomes markup.
 pub(super) fn markdown_to_html(value: &str) -> Unescaped<String> {
-    let events = pulldown_cmark::Parser::new(value).map(|event| match event {
+    let events = pulldown_cmark::Parser::new_ext(value, Options::ENABLE_TABLES).map(|event| match event {
         pulldown_cmark::Event::Html(html) | pulldown_cmark::Event::InlineHtml(html) => {
             pulldown_cmark::Event::Text(html)
         }
