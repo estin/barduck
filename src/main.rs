@@ -73,6 +73,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print the skill document for LLM agents.
+    Skill,
 }
 
 /// Asks the user to type "yes" on stdin; any other input (including empty)
@@ -96,6 +98,13 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Handle skill command before loading config — no config file needed.
+    if let Cmd::Skill = cli.cmd {
+        println!("{}", include_str!("../SKILL.md"));
+        return Ok(());
+    }
+
     let config_path = std::fs::canonicalize(&cli.config)
         .with_context(|| format!("resolving config path {}", cli.config.display()))?;
     // `config::load` resolves `database_path` and records `config_dir` itself
@@ -145,6 +154,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Fetch { source, json } => rt()?.block_on(cli_report::print_fetch(&cfg, &source, json)),
+        Cmd::Skill => unreachable!(),
     }
 }
 
