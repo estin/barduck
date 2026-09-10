@@ -1,4 +1,4 @@
-//! Value-format rendering: markdown-as-HTML, pretty JSON, or plain text
+//! Value-format rendering: markdown-as-HTML or plain text
 //! (spec: web-ui — static-text panel rendering). Shared by a single-source
 //! panel's content and a static-text cell's content.
 
@@ -7,13 +7,6 @@ use topcoat::{
     Result,
     view::{Unescaped, component, view},
 };
-
-/// Pretty JSON when parseable; raw text otherwise.
-pub(super) fn json_pretty(value: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(value)
-        .and_then(|v| serde_json::to_string_pretty(&v))
-        .unwrap_or_else(|_| value.to_string())
-}
 
 /// Markdown rendered to HTML. The *Markdown* itself is trusted to become
 /// styled markup (config-authored: either a static-text cell's literal text,
@@ -40,10 +33,9 @@ pub(super) fn markdown_to_html(value: &str) -> Unescaped<String> {
 
 /// Renders `value` (with `unit` appended when non-empty, except for
 /// markdown, which never gets a unit suffix) according to `format`: markdown
-/// as HTML, JSON pretty-printed below the raw value, otherwise plain text.
-/// Shared by the single-source panel's content and the static-text cell's
-/// content, so the three-way format branch isn't copy-pasted a third time
-/// (design.md — factor format-rendering logic).
+/// as HTML, otherwise plain text. Shared by the single-source panel's
+/// content and the static-text cell's content, so the two-way format branch
+/// isn't copy-pasted a third time (design.md — factor format-rendering logic).
 #[component]
 pub(super) async fn formatted_content(format: ValueFormat, value: String, unit: String) -> Result {
     let value_and_unit = if unit.is_empty() {
@@ -54,9 +46,6 @@ pub(super) async fn formatted_content(format: ValueFormat, value: String, unit: 
     view! {
         if format == ValueFormat::Markdown {
             <div class="prose prose-sm max-w-none">(markdown_to_html(&value))</div>
-        } else if format == ValueFormat::Json {
-            <div class="text-2xl font-semibold">(value_and_unit)</div>
-            <pre class="mt-1.5 text-xs font-mono whitespace-pre-wrap break-all max-h-40 overflow-y-auto">(json_pretty(&value))</pre>
         } else {
             <div class="text-2xl font-semibold">(value_and_unit)</div>
         }

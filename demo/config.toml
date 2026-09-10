@@ -91,7 +91,7 @@ interval = "10s"
 name = "status-json"
 type = "query"
 command = "echo '{\"load\": 0.42, \"cores\": 8}'"
-format = "json"
+format = "markdown"
 interval = "30s"
 
 [[sources]]

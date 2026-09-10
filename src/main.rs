@@ -46,18 +46,6 @@ enum Cmd {
         #[arg(long)]
         no_text: bool,
     },
-    /// Reading history for one source.
-    History {
-        source: String,
-        #[arg(long)]
-        from: Option<String>,
-        #[arg(long)]
-        to: Option<String>,
-        #[command(flatten)]
-        flags: QueryArgs,
-    },
-    /// Per-source health status.
-    Health(QueryArgs),
     /// Recent fetch logs.
     Logs {
         #[arg(long, default_value_t = 50)]
@@ -71,11 +59,15 @@ enum Cmd {
         /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Output JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
     /// Run one source once and print the parsed result without touching
     /// the database (debug).
     Fetch {
         /// Which source to run.
+        #[arg(long, short = 's')]
         source: String,
         /// Output JSON instead of human-readable text.
         #[arg(long)]
@@ -123,35 +115,14 @@ fn main() -> Result<()> {
             flags.json,
             no_text,
         )),
-        Cmd::History {
-            source,
-            from,
-            to,
-            flags,
-        } => {
-            let from = from.as_deref().map(cli_report::parse_time).transpose()?;
-            let to = to.as_deref().map(cli_report::parse_time).transpose()?;
-            rt()?.block_on(cli_report::print_history(
-                &Backend::new(&cfg, flags.daemon)?,
-                &source,
-                from,
-                to,
-                flags.json,
-            ))
-        }
-        Cmd::Health(a) => rt()?.block_on(cli_report::print_health(
-            &Backend::new(&cfg, a.daemon)?,
-            &cfg,
-            &a.source,
-            a.json,
-        )),
         Cmd::Logs { limit, flags } => rt()?.block_on(cli_report::print_logs(
             &Backend::new(&cfg, flags.daemon)?,
+            &cfg,
             limit,
             &flags.source,
             flags.json,
         )),
-        Cmd::Reset { yes } => {
+        Cmd::Reset { yes, json } => {
             if !yes
                 && !confirm(&format!(
                     "This will permanently delete all data in {}.",
@@ -162,7 +133,14 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             Db::open_rw(&cfg.database_path)?.reset()?;
-            println!("Database reset: {}", cfg.database_path.display());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "reset", "database": cfg.database_path.display().to_string()})
+                );
+            } else {
+                println!("Database reset: {}", cfg.database_path.display());
+            }
             Ok(())
         }
         Cmd::Fetch { source, json } => rt()?.block_on(cli_report::print_fetch(&cfg, &source, json)),
@@ -181,4 +159,34 @@ fn multi_rt() -> Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .context("building runtime")
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// (spec: cli — Source debug fetch command)
+    #[test]
+    fn fetch_takes_source_flag_not_positional() {
+        assert!(Cli::try_parse_from(["barduck", "fetch", "--source", "cpu"]).is_ok());
+        assert!(Cli::try_parse_from(["barduck", "fetch", "-s", "cpu"]).is_ok());
+        // Missing flag and positional form both fail.
+        assert!(Cli::try_parse_from(["barduck", "fetch"]).is_err());
+        assert!(Cli::try_parse_from(["barduck", "fetch", "cpu"]).is_err());
+    }
+
+    /// (spec: cli — Query commands)
+    #[test]
+    fn removed_history_and_health_rejected() {
+        assert!(Cli::try_parse_from(["barduck", "history", "cpu"]).is_err());
+        assert!(Cli::try_parse_from(["barduck", "health"]).is_err());
+    }
+
+    /// (spec: cli — Reset reports machine-readable result)
+    #[test]
+    fn reset_accepts_json_flag() {
+        let cli = Cli::try_parse_from(["barduck", "reset", "--json", "--yes"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Reset { json: true, .. }));
+    }
 }

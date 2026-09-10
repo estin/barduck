@@ -5,7 +5,7 @@ use super::GroupItem;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
-pub const VALUE_FORMATS: &[&str] = &["text", "markdown", "json"];
+pub const VALUE_FORMATS: &[&str] = &["text", "markdown"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -13,7 +13,6 @@ pub enum ValueFormat {
     #[default]
     Text,
     Markdown,
-    Json,
 }
 
 impl ValueFormat {
@@ -21,7 +20,6 @@ impl ValueFormat {
         match s {
             "text" => Ok(Self::Text),
             "markdown" => Ok(Self::Markdown),
-            "json" => Ok(Self::Json),
             other => bail!(
                 "unknown value format `{other}` (known formats: {})",
                 VALUE_FORMATS.join(", ")

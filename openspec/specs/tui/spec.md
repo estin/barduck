@@ -5,7 +5,6 @@
 Renders source values and health in the terminal as a live dashboard, using the same config-declared layouts as the web UI.
 
 ## Requirements
-
 ### Requirement: TUI renders configured layouts
 The TUI SHALL display panels arranged according to the configured grid: each configured row renders as a horizontal strip of panels sized by their column spans relative to the layout's column count, spacer cells render as empty gaps spanning their columns, and panels show their custom pane title when one is configured. Panels show each referenced source's latest value and health status and refresh periodically.
 
@@ -20,21 +19,18 @@ The TUI SHALL display panels arranged according to the configured grid: each con
 #### Scenario: Custom title shown
 - **WHEN** a cell configures `title = "Status"` for source `status-json`
 - **THEN** the TUI panel header reads "Status"
-
 ### Requirement: TUI dual query modes
 The TUI SHALL query the database directly by default and route queries through the daemon's HTTP API when daemon mode is enabled via flag or config.
 
 #### Scenario: Daemon mode routes over HTTP
 - **WHEN** the TUI is started with daemon mode enabled
 - **THEN** its data comes from the daemon's HTTP API, not direct database access
-
 ### Requirement: Unreachable data source degrades gracefully
 When the chosen data path is unavailable (database file missing, daemon down), the TUI MUST show an error state instead of crashing.
 
 #### Scenario: Daemon down shows error panel
 - **WHEN** daemon mode is enabled but the daemon is not running
 - **THEN** the TUI displays a connection error and remains interactive
-
 ### Requirement: TUI shows app version and last update time
 The TUI SHALL show the application version in a persistent header, and each panel SHALL show the age of its latest reading, formatted as a single coarse time unit — seconds, minutes, hours, or days — rounded down to that unit's boundary, matching the web UI's formatting.
 
@@ -45,7 +41,6 @@ The TUI SHALL show the application version in a persistent header, and each pane
 #### Scenario: Age rounds down to a coarser unit
 - **WHEN** a panel's latest reading is 629 seconds old
 - **THEN** the panel shows "10m ago" instead of a raw seconds count
-
 ### Requirement: Threshold band coloring
 The TUI SHALL color a panel — border, title, and value — using a health-first priority. While a source is failing or stale, its panel renders in health's color (`failing`→red, `stale`→yellow) regardless of any threshold band — a banded source's own band reading does not override an active health problem, since a stale or failing fetch means that reading is no longer trustworthy. Only when a source is healthy does its threshold band's color (green, yellow, or red) apply; a healthy source with no threshold bands gets no accent color at all, rendering in the terminal's default color rather than a forced green. Whenever a source is failing or stale it SHALL also show a plain, uncolored status label next to the panel, alongside whatever color that status contributes.
 
@@ -68,7 +63,6 @@ The TUI SHALL color a panel — border, title, and value — using a health-firs
 #### Scenario: Health overrides a stale threshold-band reading
 - **WHEN** a threshold-banded source's last known value fell in a band, but the source is now failing or stale
 - **THEN** its panel renders in health's color (red or yellow), not the band's color, alongside the plain status label
-
 ### Requirement: Group panes show multiple labeled, independently colored values
 A layout cell using the generalized pane shape (`{ title, main?, secondary?, table? }`, spec: source-configuration — UI layouts are config-declared like sources) SHALL render as a single bordered panel titled with the cell's configured title, combining up to three sections in this order: `main`, then `secondary`, then `table`. The TUI has no history bars, so this distinction does not apply to any section.
 
@@ -131,7 +125,6 @@ The panel's own border SHALL be colored by the worst color across every member i
 #### Scenario: Unbanded failing member counts toward the worst color across sections
 - **WHEN** a cell's main section is healthy (green) and a secondary member has no threshold bands but is currently `failing`
 - **THEN** the panel's own border renders in the red style, matching the failing member
-
 ### Requirement: Hidden sources render as space in the TUI
 When a layout cell (a bare source reference or `{ id, title }` cell) names a source whose `show_in` (spec: source-configuration — Per-source view visibility) excludes `"tui"`, the TUI SHALL render that cell as an empty space of the same column span instead of the source's panel, rather than failing startup. When a generalized pane cell's `main`, `secondary`, or `table` member names a source excluded from `"tui"`, the TUI SHALL omit that member from the pane's rendering; if omitting excluded members leaves the cell with none of `main`, `secondary`, or `table` populated for the TUI, the whole cell SHALL render as space. This does not change the layout's column count or row geometry.
 
@@ -154,9 +147,8 @@ When a layout cell (a bare source reference or `{ id, title }` cell) names a sou
 #### Scenario: Same layout renders differently per view
 - **WHEN** a layout cell references a source declaring `show_in = "web"`
 - **THEN** the TUI shows an empty space for that cell while the web dashboard shows the source's panel, from the same layout config
-
 ### Requirement: Static-text panel rendering
-A layout cell that is a static-text panel (`{ title?, format?, text }`, spec: source-configuration — UI layouts are config-declared like sources) SHALL render as its own bordered panel, titled with the cell's configured `title`, or with no title when omitted. The panel's content SHALL show `text` as-is (the TUI does not interpret `markdown`/`json` formatting — a `format` of `markdown` or `json` renders the same raw text a `text`-format value would). Since there is no backing source, the panel MUST NOT show an age suffix, and its border MUST always render in the terminal's default (unaccented) style, never a health or threshold color.
+A layout cell that is a static-text panel (`{ title?, format?, text }`, spec: source-configuration — UI layouts are config-declared like sources) SHALL render as its own bordered panel, titled with the cell's configured `title`, or with no title when omitted. The panel's content SHALL show `text` as-is (the TUI does not interpret `markdown` formatting — a `format` of `markdown` renders the same raw text a `text`-format value would). Since there is no backing source, the panel MUST NOT show an age suffix, and its border MUST always render in the terminal's default (unaccented) style, never a health or threshold color.
 
 #### Scenario: Static-text panel renders titled content
 - **WHEN** a cell is `{ title = "Links", text = "github.com" }`
@@ -173,7 +165,6 @@ A layout cell that is a static-text panel (`{ title?, format?, text }`, spec: so
 #### Scenario: Static-text panel has no age suffix or accent color
 - **WHEN** a static-text panel cell is rendered
 - **THEN** its panel shows no age suffix and its border renders in the terminal's default style, never a health or threshold color
-
 ### Requirement: Configurable TUI content width
 The system SHALL support a `tui_width` config setting controlling how wide the TUI's content area (header, error banner, and panel grid) is, instead of always stretching to the full terminal width. `tui_width` MUST be either the string `"auto"` (the default) or a positive integer number of terminal columns; any other value MUST be rejected at startup. In `"auto"` mode, the content width SHALL scale with the widest row's column count at a fixed comfortable width per column. A fixed integer SHALL cap the content width at that many columns. In both modes, the content width MUST NOT exceed the terminal's actual width, and the content area SHALL be horizontally centered when narrower than the terminal.
 

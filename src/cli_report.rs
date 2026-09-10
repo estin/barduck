@@ -41,11 +41,6 @@ impl Named for crate::db::LogRow {
         &self.source
     }
 }
-impl Named for crate::health::SourceHealth {
-    fn name(&self) -> &str {
-        &self.source
-    }
-}
 
 fn header(subtitle: &str) {
     println!("barduck v{VERSION} — {subtitle}");
@@ -98,77 +93,40 @@ pub async fn print_latest(
     Ok(())
 }
 
-pub async fn print_history(
-    backend: &Backend,
-    source: &str,
-    from: Option<f64>,
-    to: Option<f64>,
-    json: bool,
-) -> Result<()> {
-    let rows = backend.history(source, from, to).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
-    }
-    header(&format!("history for `{source}`"));
-    println!("{:<24} {:>14}  {:<6} TIMESTAMP", "SOURCE", "VALUE", "UNIT");
-    for r in rows {
-        println!(
-            "{:<24} {:>14}  {:<6} {}",
-            r.source,
-            r.value,
-            r.unit.unwrap_or_default(),
-            r.ts
-        );
-    }
-    Ok(())
-}
-
-pub async fn print_health(
-    backend: &Backend,
-    cfg: &crate::config::Config,
-    sources: &[String],
-    json: bool,
-) -> Result<()> {
-    let rows = filter_named(backend.health(cfg).await?, sources);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
-    }
-    header("source health");
-    println!(
-        "{:<24} {:<10} {:>10} LAST SUCCESS",
-        "SOURCE", "STATUS", "FAILS"
-    );
-    for h in rows {
-        println!(
-            "{:<24} {:<10} {:>10} {}",
-            h.source,
-            h.status.as_str(),
-            h.consecutive_failures,
-            h.last_success_ts.unwrap_or_else(|| "never".into())
-        );
-    }
-    Ok(())
-}
-
 pub async fn print_logs(
     backend: &Backend,
+    cfg: &Config,
     limit: i64,
     sources: &[String],
     json: bool,
 ) -> Result<()> {
-    let rows = filter_named(backend.logs(limit).await?, sources);
+    let mut rows = backend.logs(sources, limit).await?;
+    // Units live in config, not in fetch logs: resolve per row so log
+    // output shows values the same way panels do (spec: cli — Query
+    // commands; web-ui — Per-source log view linked from panels).
+    for r in &mut rows {
+        r.unit = cfg
+            .sources
+            .iter()
+            .find(|s| s.name() == r.source)
+            .and_then(|s| s.unit())
+            .map(str::to_string);
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
     header("recent fetch logs");
-    println!("{:<24} {:>9}  TIMESTAMP  ERROR", "SOURCE", "MS");
+    println!(
+        "{:<24} {:<40} {:<6} {:>9}  TIMESTAMP  ERROR",
+        "SOURCE", "VALUE", "UNIT", "MS"
+    );
     for l in rows {
         println!(
-            "{:<24} {:>9}  {}  {}",
+            "{:<24} {:<40} {:<6} {:>9}  {}  {}",
             l.source,
+            short_value(l.value.as_deref().unwrap_or("—")),
+            l.unit.as_deref().unwrap_or_default(),
             l.duration_ms,
             l.ts,
             l.error.unwrap_or_default()
@@ -177,19 +135,15 @@ pub async fn print_logs(
     Ok(())
 }
 
-/// Parses RFC3339 or bare date (`2026-01-31`) into a unix epoch.
-#[allow(clippy::cast_precision_loss)] // sub-microsecond precision is irrelevant here
-pub fn parse_time(s: &str) -> Result<f64> {
-    use chrono::DateTime;
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(t.timestamp_millis() as f64 / 1000.0);
+/// One-line table form of a fetched value: newlines collapsed, long values
+/// (markdown bodies, JSON blobs) truncated. Full values stay in `--json`.
+fn short_value(value: &str) -> String {
+    let one_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > 40 {
+        format!("{}…", one_line.chars().take(39).collect::<String>())
+    } else {
+        one_line
     }
-    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|e| anyhow::anyhow!("invalid time `{s}` (use RFC3339 or YYYY-MM-DD): {e}"))?;
-    let midnight = d
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| anyhow::anyhow!("invalid date `{s}`"))?;
-    Ok(midnight.and_utc().timestamp_millis() as f64 / 1000.0)
 }
 
 /// Runs one source once and prints the parsed result without touching the

@@ -122,6 +122,8 @@ pub async fn health_all(cx: &Cx) -> Result<Response> {
 #[derive(Debug, Deserialize)]
 struct LogsQuery {
     limit: Option<i64>,
+    #[serde(default)]
+    source: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,7 +163,11 @@ pub async fn logs(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
     let q: LogsQuery = serde_urlencoded::from_str(uri(cx).query().unwrap_or(""))
         .map_err(|e| topcoat::Error::from(bad_request(format!("invalid query: {e}"))))?;
-    match st.db.logs(None, q.limit.unwrap_or(50)).await {
+    match st
+        .db
+        .logs_for_sources(&q.source, q.limit.unwrap_or(50))
+        .await
+    {
         Ok(rows) => Ok(json_ok(&rows)),
         Err(e) => Ok(json_err(
             StatusCode::INTERNAL_SERVER_ERROR,

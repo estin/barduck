@@ -42,12 +42,11 @@ Then:
 |---|---|
 | Web UI (live) | http://127.0.0.1:18420/ |
 | Latest values | `barduck --config demo/config.toml latest` |
-| Filter by source | append `-s bank-balance -s disk-root` to any query |
+| Filter by source | append `-s bank-balance -s disk-root` to `latest`/`logs` |
 | Source fetch logs | click any panel's "updated …" text → `/logs/<source>` |
-| History | `... history bank-balance` |
-| Health | `... health` |
+| Debug-fetch one source | `... fetch --source bank-balance` (no database writes) |
 | Fetch logs | `... logs --limit 10` |
-| JSON output | add `--json` to any query command |
+| JSON output | add `--json` to `latest`/`logs`/`fetch`/`reset` |
 | TUI | `... tui` (`q` quits) |
 | Query via daemon instead of the DB file | add `--daemon` |
 

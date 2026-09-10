@@ -241,6 +241,11 @@ pub struct LogRow {
     pub duration_ms: i64,
     pub error: Option<String>,
     pub value: Option<String>,
+    /// Not stored; filled from config where the row is presented, so log
+    /// output can show values the same way panels do. Defaults for rows
+    /// serialized before this field existed.
+    #[serde(default)]
+    pub unit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -780,10 +785,28 @@ impl Db {
                     duration_ms: r.get(3)?,
                     error: r.get(4)?,
                     value: r.get(5)?,
+                    unit: None,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+    /// Recent fetch logs for the given sources, newest first (spec: cli —
+    /// Filter query output by source). The filter applies inside the query
+    /// so a quiet source's rows are not crowded out by the global limit the
+    /// way fetch-then-filter would. Empty `sources` returns the newest rows
+    /// across all sources.
+    pub async fn logs_for_sources(&self, sources: &[String], limit: i64) -> Result<Vec<LogRow>> {
+        if sources.is_empty() {
+            return self.logs(None, limit).await;
+        }
+        let mut out = Vec::new();
+        for s in sources {
+            out.extend(self.logs(Some(s), limit).await?);
+        }
+        out.sort_by(|a, b| b.ts_epoch.total_cmp(&a.ts_epoch));
+        out.truncate(limit.max(0).try_into().unwrap_or(usize::MAX));
+        Ok(out)
     }
 
     /// Most recent fetch log for `source`, if any (spec: data-collection —
@@ -810,6 +833,7 @@ impl Db {
                     duration_ms: r.get(3)?,
                     error: r.get(4)?,
                     value: r.get(5)?,
+                    unit: None,
                 })
             })
             .transpose()?)
@@ -839,6 +863,7 @@ impl Db {
                     duration_ms: r.get(3)?,
                     error: r.get(4)?,
                     value: r.get(5)?,
+                    unit: None,
                 })
             })
             .transpose()?)
@@ -935,6 +960,38 @@ mod tests {
 
         let last = db.last_success("a").await.unwrap().unwrap();
         assert_eq!(last.value.as_deref(), Some("second"));
+    }
+
+    /// A quiet source's rows survive the global limit when filtered by
+    /// source: the filter applies inside the query instead of
+    /// fetch-then-filter (spec: cli — Filter query output by source).
+    #[tokio::test]
+    async fn logs_for_sources_not_crowded_out_by_global_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'quiet', 1000.0, 't', 1, NULL, 'q');
+                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'chatty', 2000.0, 't', 1, NULL, 'c1');
+                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'chatty', 3000.0, 't', 1, NULL, 'c2');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // A global limit of 2 never reaches the quiet row.
+        let global = db.logs(None, 2).await.unwrap();
+        assert!(global.iter().all(|r| r.source == "chatty"));
+
+        let filtered = db
+            .logs_for_sources(&["quiet".to_string()], 2)
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].value.as_deref(), Some("q"));
     }
 
     /// `last_attempt` returns the newest entry whatever its outcome, unlike

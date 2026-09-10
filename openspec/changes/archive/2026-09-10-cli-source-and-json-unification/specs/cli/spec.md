@@ -1,10 +1,5 @@
-# cli Specification
+## MODIFIED Requirements
 
-## Purpose
-
-Shows latest values and fetch logs from the terminal in a scriptable, non-interactive form, usable both against the database file directly and against a running daemon.
-
-## Requirements
 ### Requirement: Query commands
 The CLI SHALL provide commands to print latest values per source and recent fetch logs. The `history` and `health` subcommands are removed: per-source history and health remain available in the web UI, the TUI, and the HTTP API. Output SHALL be human-readable tables by default and JSON with `--json`.
 
@@ -19,28 +14,14 @@ The CLI SHALL provide commands to print latest values per source and recent fetc
 #### Scenario: Removed subcommands fail
 - **WHEN** the user runs `history` or `health`
 - **THEN** the CLI exits non-zero with an unknown-subcommand error
-### Requirement: Direct mode by default
-By default CLI queries SHALL read the DuckDB database file directly; no daemon needs to be running.
 
-#### Scenario: Works without daemon
-- **WHEN** no daemon is running and the user runs a query command
-- **THEN** results are read directly from the database file
-### Requirement: Daemon-backed mode
-CLI queries SHALL route through the daemon's HTTP API when daemon mode is selected via flag or config.
-
-#### Scenario: Daemon flag routes to API
-- **WHEN** the user passes the daemon-mode flag while the daemon is running
-- **THEN** query data comes from the HTTP API
-
-#### Scenario: Daemon unreachable fails clearly
-- **WHEN** daemon mode is selected but the daemon is unreachable
-- **THEN** the command exits non-zero with an error naming the connection failure
 ### Requirement: Filter query output by source
 Data commands (`latest`, `logs`) SHALL accept repeatable `--source <name>` (`-s <name>`) filters applied identically in direct and daemon modes.
 
 #### Scenario: Filter narrows output
 - **WHEN** the user runs `latest --source a --source b`
 - **THEN** only rows for sources `a` and `b` are printed
+
 ### Requirement: Source debug fetch command
 The CLI SHALL provide a `fetch` command taking exactly one source via the required `--source <name>` (`-s <name>`) flag. It runs the source's command once and prints the result without writing anything to the database: no readings, fetch logs, health events, or threshold changes. For a `query` source it runs the command once; for a `stream` source it runs the command and prints the first parsed lines (up to 5), then kills the command. Execution honors the source's configured timeout. Output SHALL show the parsed result (extracted value, resolved timestamp, applied thresholds, value-type conversion) in a human-readable form by default and as JSON with `--json`. An unknown source name MUST fail naming the source.
 
@@ -67,6 +48,16 @@ The CLI SHALL provide a `fetch` command taking exactly one source via the requir
 #### Scenario: Missing source flag rejected
 - **WHEN** the fetch command runs without `--source`
 - **THEN** it exits non-zero reporting the missing required flag
+
+### Requirement: Version shown in CLI output
+Human-readable output SHALL begin with the application version.
+
+#### Scenario: Version prefix
+- **WHEN** any command producing human-readable output runs without `--json`
+- **THEN** the first line contains `barduck v<version>`
+
+## ADDED Requirements
+
 ### Requirement: Reset reports machine-readable result
 The `reset` command SHALL accept `--json`: without it, it prints the human-readable confirmation; with it, it prints valid JSON describing the reset database instead.
 
@@ -77,9 +68,3 @@ The `reset` command SHALL accept `--json`: without it, it prints the human-reada
 #### Scenario: Reset JSON output
 - **WHEN** the user confirms the reset with `--json`
 - **THEN** output is valid JSON representing the same reset result
-### Requirement: Version shown in CLI output
-Human-readable output SHALL begin with the application version.
-
-#### Scenario: Version prefix
-- **WHEN** any command producing human-readable output runs without `--json`
-- **THEN** the first line contains `barduck v<version>`

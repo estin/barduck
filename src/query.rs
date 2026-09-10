@@ -76,11 +76,15 @@ impl Backend {
         }
     }
 
-    pub async fn logs(&self, limit: i64) -> Result<Vec<db::LogRow>> {
+    pub async fn logs(&self, sources: &[String], limit: i64) -> Result<Vec<db::LogRow>> {
         match self {
-            Backend::Direct(db) => db.logs(None, limit).await,
+            Backend::Direct(db) => db.logs_for_sources(sources, limit).await,
             Backend::Daemon { base, client } => {
-                get(client, &format!("{base}/api/logs?limit={limit}")).await
+                let mut url = format!("{base}/api/logs?limit={limit}");
+                for s in sources {
+                    let _ = std::fmt::write(&mut url, format_args!("&source={s}"));
+                }
+                get(client, &url).await
             }
         }
     }

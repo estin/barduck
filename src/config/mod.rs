@@ -385,6 +385,16 @@ mod tests {
         );
     }
 
+    /// (spec: source-configuration — Value formats)
+    #[test]
+    fn removed_json_format_rejected() {
+        let err = toml::from_str::<Config>(&source_toml("format = \"json\"")).unwrap_err();
+        assert!(
+            err.to_string().contains("json"),
+            "error should name the removed format: {err}"
+        );
+    }
+
     #[test]
     fn accent_color_prioritizes_health_over_a_stale_band() {
         // Unhealthy overrides any band reading, banded or not.
