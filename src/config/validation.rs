@@ -78,6 +78,14 @@ pub(crate) fn validate_source(s: &SourceCfg) -> Result<()> {
                 bail!("source `{}` retry_interval must be > 0", s.name());
             }
         }
+        SourceCfg::Ingest {
+            expected_interval,
+            ..
+        } => {
+            if expected_interval.is_zero() {
+                bail!("ingest source `{}` expected_interval must be > 0", s.name());
+            }
+        }
     }
     for t in s.thresholds() {
         if !t.bound.is_finite() {

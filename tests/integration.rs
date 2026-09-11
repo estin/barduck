@@ -6,7 +6,6 @@ use barduck::{
     health,
     query::Backend,
 };
-use fs2::FileExt as _;
 use std::sync::{Arc, OnceLock};
 
 /// The asset bundle for page-rendering tests, built once per test-binary run.
@@ -38,7 +37,7 @@ fn test_asset_bundle() -> Option<topcoat::asset::AssetBundle> {
             let lock_file = std::fs::File::create(target_dir.join(".topcoat-asset-bundle.lock"))
                 .expect("creating asset-bundle lockfile");
             lock_file
-                .lock_exclusive()
+                .lock()
                 .expect("locking asset-bundle lockfile");
 
             let status = std::process::Command::new("topcoat")

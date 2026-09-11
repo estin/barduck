@@ -163,6 +163,9 @@ pub async fn print_fetch(cfg: &Config, source: &str, json: bool) -> Result<()> {
             vec![crate::source::debug_query(cfg, src).await?]
         }
         crate::config::SourceCfg::Stream { .. } => crate::source::debug_stream(cfg, src).await?,
+        crate::config::SourceCfg::Ingest { .. } => {
+            bail!("ingest sources receive data via HTTP push, not fetch");
+        }
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);

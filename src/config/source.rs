@@ -54,6 +54,7 @@ where
 pub enum SourceType {
     Query,
     Stream,
+    Ingest,
 }
 
 impl SourceType {
@@ -62,6 +63,7 @@ impl SourceType {
         match self {
             SourceType::Query => "query",
             SourceType::Stream => "stream",
+            SourceType::Ingest => "ingest",
         }
     }
 }
@@ -289,6 +291,25 @@ pub enum SourceCfg {
         #[serde(default, deserialize_with = "de_retry_interval")]
         retry_interval: Option<Duration>,
     },
+    /// Push-based source that receives data via HTTP. No command;
+    /// data arrives via `POST /api/ingest`. Staleness is governed
+    /// by `expected_interval` (each push counts as a success).
+    Ingest {
+        name: String,
+        title: Option<String>,
+        /// Humantime string (e.g. `"1m"`). Required: the maximum
+        /// silence between pushes before the source reports stale.
+        #[serde(deserialize_with = "de_expected_interval")]
+        expected_interval: Duration,
+        unit: Option<String>,
+        format: Option<ValueFormat>,
+        #[serde(default)]
+        thresholds: Vec<Threshold>,
+        history_points: Option<u32>,
+        show_history: Option<bool>,
+        show_in: Option<View>,
+        value_type: Option<ValueType>,
+    },
 }
 
 impl SourceCfg {
@@ -297,6 +318,7 @@ impl SourceCfg {
         match self {
             SourceCfg::Query { .. } => SourceType::Query,
             SourceCfg::Stream { .. } => SourceType::Stream,
+            SourceCfg::Ingest { .. } => SourceType::Ingest,
         }
     }
 
@@ -306,16 +328,20 @@ impl SourceCfg {
     }
 
     #[must_use]
+    pub fn is_ingest(&self) -> bool {
+        matches!(self, SourceCfg::Ingest { .. })
+    }
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            SourceCfg::Query { name, .. } | SourceCfg::Stream { name, .. } => name,
+            SourceCfg::Query { name, .. } | SourceCfg::Stream { name, .. } | SourceCfg::Ingest { name, .. } => name,
         }
     }
 
     #[must_use]
     pub fn display_title(&self) -> Option<&str> {
         match self {
-            SourceCfg::Query { title, .. } | SourceCfg::Stream { title, .. } => title.as_deref(),
+            SourceCfg::Query { title, .. } | SourceCfg::Stream { title, .. } | SourceCfg::Ingest { title, .. } => title.as_deref(),
         }
     }
 
@@ -323,13 +349,14 @@ impl SourceCfg {
     pub fn timeout(&self) -> Duration {
         match self {
             SourceCfg::Query { timeout, .. } | SourceCfg::Stream { timeout, .. } => *timeout,
+            SourceCfg::Ingest { .. } => super::defaults::default_timeout(),
         }
     }
 
     #[must_use]
     pub fn unit(&self) -> Option<&str> {
         match self {
-            SourceCfg::Query { unit, .. } | SourceCfg::Stream { unit, .. } => unit.as_deref(),
+            SourceCfg::Query { unit, .. } | SourceCfg::Stream { unit, .. } | SourceCfg::Ingest { unit, .. } => unit.as_deref(),
         }
     }
 
@@ -337,20 +364,21 @@ impl SourceCfg {
     pub fn setup(&self) -> Option<&str> {
         match self {
             SourceCfg::Query { setup, .. } | SourceCfg::Stream { setup, .. } => setup.as_deref(),
+            SourceCfg::Ingest { .. } => None,
         }
     }
 
     #[must_use]
     pub fn format(&self) -> Option<ValueFormat> {
         match self {
-            SourceCfg::Query { format, .. } | SourceCfg::Stream { format, .. } => *format,
+            SourceCfg::Query { format, .. } | SourceCfg::Stream { format, .. } | SourceCfg::Ingest { format, .. } => *format,
         }
     }
 
     #[must_use]
     pub fn thresholds(&self) -> &[Threshold] {
         match self {
-            SourceCfg::Query { thresholds, .. } | SourceCfg::Stream { thresholds, .. } => {
+            SourceCfg::Query { thresholds, .. } | SourceCfg::Stream { thresholds, .. } | SourceCfg::Ingest { thresholds, .. } => {
                 thresholds
             }
         }
@@ -359,7 +387,7 @@ impl SourceCfg {
     #[must_use]
     pub fn history_points(&self) -> Option<u32> {
         match self {
-            SourceCfg::Query { history_points, .. } | SourceCfg::Stream { history_points, .. } => {
+            SourceCfg::Query { history_points, .. } | SourceCfg::Stream { history_points, .. } | SourceCfg::Ingest { history_points, .. } => {
                 *history_points
             }
         }
@@ -368,7 +396,7 @@ impl SourceCfg {
     #[must_use]
     pub fn show_history(&self) -> Option<bool> {
         match self {
-            SourceCfg::Query { show_history, .. } | SourceCfg::Stream { show_history, .. } => {
+            SourceCfg::Query { show_history, .. } | SourceCfg::Stream { show_history, .. } | SourceCfg::Ingest { show_history, .. } => {
                 *show_history
             }
         }
@@ -377,14 +405,14 @@ impl SourceCfg {
     #[must_use]
     pub fn show_in(&self) -> Option<View> {
         match self {
-            SourceCfg::Query { show_in, .. } | SourceCfg::Stream { show_in, .. } => *show_in,
+            SourceCfg::Query { show_in, .. } | SourceCfg::Stream { show_in, .. } | SourceCfg::Ingest { show_in, .. } => *show_in,
         }
     }
 
     #[must_use]
     pub fn value_type(&self) -> Option<ValueType> {
         match self {
-            SourceCfg::Query { value_type, .. } | SourceCfg::Stream { value_type, .. } => {
+            SourceCfg::Query { value_type, .. } | SourceCfg::Stream { value_type, .. } | SourceCfg::Ingest { value_type, .. } => {
                 *value_type
             }
         }
@@ -394,6 +422,7 @@ impl SourceCfg {
     pub fn command(&self) -> &str {
         match self {
             SourceCfg::Query { command, .. } | SourceCfg::Stream { command, .. } => command,
+            SourceCfg::Ingest { .. } => "",
         }
     }
 
@@ -403,7 +432,7 @@ impl SourceCfg {
     pub fn cron(&self) -> Option<&str> {
         match self {
             SourceCfg::Query { cron, .. } => cron.as_deref(),
-            SourceCfg::Stream { .. } => None,
+            SourceCfg::Stream { .. } | SourceCfg::Ingest { .. } => None,
         }
     }
 
@@ -413,7 +442,7 @@ impl SourceCfg {
     pub fn interval(&self) -> Option<Duration> {
         match self {
             SourceCfg::Query { interval, .. } => *interval,
-            SourceCfg::Stream { .. } => None,
+            SourceCfg::Stream { .. } | SourceCfg::Ingest { .. } => None,
         }
     }
 
@@ -423,6 +452,7 @@ impl SourceCfg {
             SourceCfg::Query { retry_interval, .. } | SourceCfg::Stream { retry_interval, .. } => {
                 *retry_interval
             }
+            SourceCfg::Ingest { .. } => None,
         }
     }
 
@@ -434,7 +464,8 @@ impl SourceCfg {
             SourceCfg::Query { .. } => None,
             SourceCfg::Stream {
                 expected_interval, ..
-            } => Some(*expected_interval),
+            }
+            | SourceCfg::Ingest { expected_interval, .. } => Some(*expected_interval),
         }
     }
 
@@ -447,7 +478,8 @@ impl SourceCfg {
             SourceCfg::Query { interval, .. } => interval.unwrap_or_else(default_interval),
             SourceCfg::Stream {
                 expected_interval, ..
-            } => *expected_interval,
+            }
+            | SourceCfg::Ingest { expected_interval, .. } => *expected_interval,
         }
     }
 
@@ -714,5 +746,30 @@ mod tests {
         let (epoch, ts) = r.ts.unwrap().resolve((0.0, "fallback".into()));
         assert!((epoch - 1000.5).abs() < 0.001, "got {epoch}");
         assert!(ts.contains("1970-01-01"), "unexpected ts: {ts}");
+    }
+
+    /// (spec: source-configuration — Ingest source type)
+    #[test]
+    fn ingest_source_parses() {
+        let s: SourceCfg = toml::from_str(
+            r#"name = "webhook"
+type = "ingest"
+expected_interval = "1m""#,
+        )
+        .unwrap();
+        assert!(matches!(s, SourceCfg::Ingest { .. }));
+        assert_eq!(s.name(), "webhook");
+        assert_eq!(s.expected_interval(), Some(Duration::from_mins(1)));
+    }
+
+    /// (spec: source-configuration — Ingest source type)
+    #[test]
+    fn ingest_source_missing_expected_interval_fails() {
+        let err = toml::from_str::<SourceCfg>(
+            r#"name = "webhook"
+type = "ingest""#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("expected_interval"));
     }
 }

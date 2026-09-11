@@ -4,7 +4,6 @@ use crate::config::Threshold;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use duckdb::{Connection, params};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -495,7 +494,7 @@ impl Db {
         let file = File::create(&lock_path)
             .with_context(|| format!("creating lockfile {}", lock_path.display()))?;
         for i in 0..ATTEMPTS {
-            match file.try_lock_exclusive() {
+            match file.try_lock() {
                 Ok(()) => return Ok(DbLock(file)),
                 Err(e) if i + 1 < ATTEMPTS => {
                     let _ = e;

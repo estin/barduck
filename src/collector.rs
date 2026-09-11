@@ -144,6 +144,15 @@ pub struct ResetHub {
     pub rxs: HashMap<String, tokio::sync::mpsc::UnboundedReceiver<()>>,
 }
 
+/// Sources the collector drives with a task: every source except `ingest`,
+/// which has no schedule and receives data only via HTTP push, so it never
+/// reaches [`loop_source`] (spec: data-collection — Ingest sources have no
+/// collector task). Shared by every entry point that iterates `cfg.sources`
+/// so the exclusion lives in exactly one place.
+fn collectible(cfg: &Config) -> impl Iterator<Item = &SourceCfg> {
+    cfg.sources.iter().filter(|src| !src.is_ingest())
+}
+
 /// Builds the [`ResetHub`] for a config. Fails on a source whose kind
 /// cannot be built, mirroring what its collector task would report at
 /// startup.
@@ -152,7 +161,7 @@ pub fn reset_channels(cfg: &Config) -> Result<ResetHub> {
         txs: HashMap::new(),
         rxs: HashMap::new(),
     };
-    for src in &cfg.sources {
+    for src in collectible(cfg) {
         let is_interval_query = src.cron().is_none()
             && !matches!(source::build(src)?, source::SourceKind::Stream { .. });
         if is_interval_query {
@@ -169,7 +178,7 @@ pub fn reset_channels(cfg: &Config) -> Result<ResetHub> {
 /// no cooperative shutdown — used by tests and one-shot callers. The daemon
 /// uses [`spawn_graceful`] instead.
 pub fn spawn_all(db: &Db, cfg: &Config) {
-    for src in &cfg.sources {
+    for src in collectible(cfg) {
         let db = db.clone();
         let src = src.clone();
         let cfg = cfg.clone();
@@ -197,8 +206,7 @@ pub fn spawn_graceful(
     hub: ResetHub,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut rxs = hub.rxs;
-    cfg.sources
-        .iter()
+    collectible(cfg)
         .map(|src| {
             let db = db.clone();
             let src = src.clone();
@@ -214,7 +222,9 @@ pub fn spawn_graceful(
         })
         .collect()
 }
-
+/// Drives one non-`ingest` source's collection for the task's lifetime.
+/// Callers (`spawn_all`, `spawn_graceful`) only ever reach this through
+/// [`collectible`], so `src` is never `ingest` here.
 async fn loop_source(
     db: Db,
     src: SourceCfg,
@@ -232,6 +242,7 @@ async fn loop_source(
     // is retried on this source's schedule tick instead of fetching. Stream
     // sources retry setup on `retry_interval` instead of opening the stream.
     let mut setup_done = src.setup().is_none();
+
 
     if matches!(kind, source::SourceKind::Stream { .. }) {
         return loop_stream(
@@ -561,10 +572,7 @@ pub(crate) async fn refresh_health_opt(
 /// used by tests and one-shot runs. Stream sources are skipped: they are
 /// continuous processes, not per-tick fetches.
 pub async fn collect_once(db: &Db, cfg: &Config) {
-    for src in &cfg.sources {
-        if src.is_stream() {
-            continue;
-        }
+    for src in collectible(cfg).filter(|src| !src.is_stream()) {
         let Ok(kind) = source::build(src) else {
             continue;
         };

@@ -773,7 +773,7 @@ mod tests {
         if let Cell::Group { style: Some(cell_style), .. } = &cfg.layouts[0].rows[0][0] {
             assert_eq!(cell_style.get("font_family"), Some(&"sans-serif".to_string()));
         } else {
-            panic!("expected Group cell");
+            unreachable!("expected Group cell");
         }
     }
 

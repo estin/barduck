@@ -132,6 +132,15 @@ command = "echo '{\"value\":\"1\"}'; sleep 300"
 expected_interval = "20s"
 unit = "ticks"
 
+# An ingest source: receives data via HTTP push. No command; data arrives
+# via POST /api/ingest. Staleness is governed by expected_interval.
+[[sources]]
+name = "webhook-events"
+type = "ingest"
+expected_interval = "1m"
+unit = "events"
+format = "json"
+
 # Grid layouts: each row is a list of cells. A panel's title defaults to its
 # source's `title` (see `disk-root` above), or its raw name if it declares
 # none.

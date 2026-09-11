@@ -250,28 +250,42 @@ pub(super) fn text_style_for_color(color: Option<Level>) -> &'static str {
 }
 
 
-/// Convert an optional style override map to a CSS inline string.
-/// Each key-value pair becomes `key: value`, joined by semicolons.
+/// Converts a config-authored style-override key to a CSS property name:
+/// config keys follow this project's `snake_case` convention (matching
+/// `history_points`, `show_history`, ...), but CSS properties are
+/// hyphenated (`font-family`) — an unrecognized property name is silently
+/// ignored by the browser, so without this conversion an override key like
+/// `font_family` would parse fine but never actually take visual effect.
+fn css_property_name(key: &str) -> String {
+    key.replace('_', "-")
+}
+
+/// Convert an optional style override map to a CSS inline string. Each
+/// key-value pair becomes `key: value;`, converting the config's
+/// `snake_case` keys to hyphenated CSS property names.
 fn style_override_to_css(style: Option<&HashMap<String, String>>) -> String {
     match style {
         Some(map) => map
             .iter()
-            .map(|(k, v)| format!("{}: {}", k, v))
+            .map(|(k, v)| format!("{}: {v};", css_property_name(k)))
             .collect::<Vec<_>>()
-            .join("; "),
+            .join(" "),
         None => String::new(),
     }
 }
 
 /// Build a CSS inline style string from base styles and optional overrides.
-/// Avoids leading/trailing semicolons when overrides are empty.
+/// Avoids leading/trailing semicolons and double semicolons.
 fn style_string(base: &str, extra: &str) -> String {
+    let base = base.trim().trim_start_matches(';').trim_end_matches(';').trim();
     if extra.is_empty() {
         base.to_string()
     } else {
-        format!("{}; {}", base, extra)
+        let extra = extra.trim().trim_start_matches(';').trim_end_matches(';').trim();
+        format!("{base}; {extra}")
     }
 }
+
 struct Grid {
     title: String,
     style: Option<HashMap<String, String>>,
@@ -342,6 +356,92 @@ async fn build_panel(
     }
 }
 
+/// One cell's built panel data and card metadata: `(main, secondary, table,
+/// group_title, text_panel, style)`.
+type CellParts = (
+    Option<Panel>,
+    Vec<Panel>,
+    Vec<Panel>,
+    Option<String>,
+    Option<TextPanel>,
+    Option<HashMap<String, String>>,
+);
+
+/// Builds one cell's panel data, dispatching on its config variant. A source
+/// hidden from this view (spec: source-configuration — per-source view
+/// visibility) is simply omitted here, so the cell falls through to the same
+/// empty-grid-position rendering as an explicit `space` cell (spec: web-ui —
+/// hidden sources render as space in the web dashboard).
+async fn build_cell_parts(
+    st: &AppState,
+    latest: &[crate::db::ReadingRow],
+    cell: &config::Cell,
+) -> CellParts {
+    match cell {
+        config::Cell::Group {
+            title,
+            main,
+            secondary,
+            table: cell_table,
+            style: group_style,
+            ..
+        } => {
+            let main = match main.as_ref().filter(|item| {
+                config::source_visible_in(&st.cfg, item.id(), config::View::Web)
+            }) {
+                Some(item) => Some(build_panel(st, latest, item.id(), item.explicit_label()).await),
+                None => None,
+            };
+            let mut secondary_panels = Vec::new();
+            for item in config::visible_items(&st.cfg, secondary, config::View::Web) {
+                secondary_panels.push(build_panel(st, latest, item.id(), item.explicit_label()).await);
+            }
+            let mut table_out = Vec::new();
+            for item in config::visible_items(&st.cfg, cell_table, config::View::Web) {
+                table_out.push(build_panel(st, latest, item.id(), item.explicit_label()).await);
+            }
+            (main, secondary_panels, table_out, title.clone(), None, group_style.clone())
+        }
+        config::Cell::Source(name) => {
+            let main = if config::source_visible_in(&st.cfg, name, config::View::Web) {
+                Some(build_panel(st, latest, name, None).await)
+            } else {
+                None
+            };
+            (main, Vec::new(), Vec::new(), None, None, None)
+        }
+        config::Cell::Pane { id, title, style: pane_style } => {
+            let main = if config::source_visible_in(&st.cfg, id, config::View::Web) {
+                Some(build_panel(st, latest, id, title.as_deref()).await)
+            } else {
+                None
+            };
+            (main, Vec::new(), Vec::new(), None, None, pane_style.clone())
+        }
+        config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None, None),
+        config::Cell::Text {
+            title,
+            format,
+            text,
+            style: text_style,
+            ..
+        } => (
+            None,
+            Vec::new(),
+            Vec::new(),
+            title.clone(),
+            Some(TextPanel {
+                format: format
+                    .as_deref()
+                    .and_then(|f| ValueFormat::parse(f).ok())
+                    .unwrap_or_default(),
+                text: text.clone(),
+            }),
+            text_style.clone(),
+        ),
+    }
+}
+
 async fn collect_grids(st: &AppState) -> Vec<Grid> {
     let Ok(latest) = st.db.latest_values().await else {
         return Vec::new();
@@ -353,80 +453,8 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
             let mut slots = Vec::new();
             let mut col = 1;
             for cell in cells {
-                // A source hidden from this view (spec: source-configuration —
-                // per-source view visibility) is simply omitted here, so the cell
-                // falls through to the same empty-grid-position rendering as an
-                // explicit `space` cell (spec: web-ui — hidden sources render as
-                // space in the web dashboard).
-                let (main, secondary, table_panels, group_title, text_panel, cell_style) = match cell {
-                    config::Cell::Group {
-                        title,
-                        main,
-                        secondary,
-                        table: cell_table,
-                        style: group_style,
-                        ..
-                    } => {
-                        let main = match main.as_ref().filter(|item| {
-                            config::source_visible_in(&st.cfg, item.id(), config::View::Web)
-                        }) {
-                            Some(item) => Some(
-                                build_panel(st, &latest, item.id(), item.explicit_label()).await,
-                            ),
-                            None => None,
-                        };
-                        let mut secondary_panels = Vec::new();
-                        for item in config::visible_items(&st.cfg, secondary, config::View::Web) {
-                            secondary_panels.push(
-                                build_panel(st, &latest, item.id(), item.explicit_label()).await,
-                            );
-                        }
-                        let mut table_out = Vec::new();
-                        for item in config::visible_items(&st.cfg, cell_table, config::View::Web) {
-                            table_out.push(
-                                build_panel(st, &latest, item.id(), item.explicit_label()).await,
-                            );
-                        }
-                        (main, secondary_panels, table_out, title.clone(), None, group_style.clone())
-                    }
-                    config::Cell::Source(name) => {
-                        let main = if config::source_visible_in(&st.cfg, name, config::View::Web) {
-                            Some(build_panel(st, &latest, name, None).await)
-                        } else {
-                            None
-                        };
-                        (main, Vec::new(), Vec::new(), None, None, None)
-                    }
-                    config::Cell::Pane { id, title, style: pane_style } => {
-                        let main = if config::source_visible_in(&st.cfg, id, config::View::Web) {
-                            Some(build_panel(st, &latest, id, title.as_deref()).await)
-                        } else {
-                            None
-                        };
-                        (main, Vec::new(), Vec::new(), None, None, pane_style.clone())
-                    }
-                    config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None, None),
-                    config::Cell::Text {
-                        title,
-                        format,
-                        text,
-                        style: text_style,
-                        ..
-                    } => (
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                        title.clone(),
-                        Some(TextPanel {
-                            format: format
-                                .as_deref()
-                                .and_then(|f| ValueFormat::parse(f).ok())
-                                .unwrap_or_default(),
-                            text: text.clone(),
-                        }),
-                        text_style.clone(),
-                    ),
-                };
+                let (main, secondary, table_panels, group_title, text_panel, cell_style) =
+                    build_cell_parts(st, &latest, cell).await;
                 let span = cell.span();
                 slots.push(Slot {
                     span,
@@ -660,5 +688,86 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                 "No panels configured. Add sources and layouts to the config file."
             </div>
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn style_string_no_override() {
+        let result = style_string("grid-row: 1; grid-column: 2", "");
+        assert_eq!(result, "grid-row: 1; grid-column: 2");
+    }
+
+    #[test]
+    fn style_string_with_override() {
+        let result = style_string("grid-row: 1", "font-family: monospace");
+        assert_eq!(result, "grid-row: 1; font-family: monospace");
+    }
+
+    #[test]
+    fn style_string_leading_semicolon_stripped() {
+        let result = style_string("; grid-row: 1; grid-column: 3", "font-family: monospace");
+        assert_eq!(result, "grid-row: 1; grid-column: 3; font-family: monospace");
+    }
+
+    #[test]
+    fn style_string_no_double_semicolons() {
+        let result = style_string("grid-row: 1; ", "font-family: monospace;");
+        assert!(!result.contains(";;"));
+    }
+
+    #[test]
+    fn style_string_trailing_semicolon_on_extra_stripped() {
+        // A trailing `;` on the override half must not survive into the
+        // combined string, so it stays consistent regardless of whether the
+        // config author's last declaration happened to end with one.
+        let result = style_string("grid-row: 1", "font-family: monospace;");
+        assert_eq!(result, "grid-row: 1; font-family: monospace");
+    }
+
+    /// A `snake_case` config key (this project's convention for every other
+    /// config field) must become a hyphenated CSS property, or the browser
+    /// silently ignores the whole declaration and the override has no
+    /// visible effect at all.
+    #[test]
+    fn css_property_name_converts_underscores_to_hyphens() {
+        assert_eq!(css_property_name("font_family"), "font-family");
+        assert_eq!(css_property_name("grid-column"), "grid-column");
+    }
+
+    #[test]
+    fn style_override_to_css_converts_keys_and_terminates_each_declaration() {
+        let mut map = HashMap::new();
+        map.insert("font_family".to_string(), "monospace".to_string());
+        let css = style_override_to_css(Some(&map));
+        assert_eq!(css, "font-family: monospace;");
+    }
+
+    #[test]
+    fn style_override_to_css_empty_for_none_or_empty_map() {
+        assert_eq!(style_override_to_css(None), "");
+        assert_eq!(style_override_to_css(Some(&HashMap::new())), "");
+    }
+
+    /// End-to-end: a config-authored override lands in the final `style`
+    /// attribute as valid, hyphenated CSS with no missing/doubled
+    /// semicolons — the bug this covers rendered `font_family: monospace`
+    /// (an unrecognized property the browser drops) instead of
+    /// `font-family: monospace`.
+    #[test]
+    fn slot_style_combines_base_and_override_as_valid_css() {
+        let mut map = HashMap::new();
+        map.insert("font_family".to_string(), "monospace".to_string());
+        let result = style_string(
+            "grid-row: 1; grid-column: 3 / span 1",
+            &style_override_to_css(Some(&map)),
+        );
+        assert_eq!(
+            result,
+            "grid-row: 1; grid-column: 3 / span 1; font-family: monospace"
+        );
     }
 }

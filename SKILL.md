@@ -5,13 +5,15 @@
 
 ## Creating Sources by User Query
 
-When a user asks to add a data source, translate their request into a TOML `[[sources]]` table. barduck supports two source types:
+When a user asks to add a data source, translate their request into a TOML `[[sources]]` table. barduck supports three source types:
 
 ### Source Types
 
 **`query`** — A oneshot shell command run on a schedule (`interval` or `cron`). Use this for periodic data points like disk usage, domain expiry, or weather.
 
 **`stream`** — A long-running command emitting JSON lines to stdout. Use this for continuous data feeds like live API streams or log ingestion.
+
+**`ingest`** — A push-based source that receives data via HTTP POST. Use this for webhooks, event buses, or any producer that pushes values to barduck's `/api/ingest` endpoint. Has no `command`; data arrives via push. Reports `stale` when no push arrives within `expected_interval`.
 
 ### Configuration Format
 
@@ -32,6 +34,15 @@ type = "stream"
 command = "nc localhost 9090"
 expected_interval = "1s"
 timeout = "30s"
+```
+
+```toml
+[[sources]]
+name = "webhook"
+type = "ingest"
+expected_interval = "1m"
+unit = "events"
+format = "json"
 ```
 
 ### Key Fields
@@ -62,6 +73,12 @@ timeout = "30s"
 |-------|----------|-------------|
 | `expected_interval` | Yes | Maximum silence between values before reporting stale |
 | `retry_interval` | No | Delay before reopening after command exits |
+
+**Ingest-only fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `expected_interval` | Yes | Maximum silence between pushes before reporting stale |
 
 **Query-only fields:**
 

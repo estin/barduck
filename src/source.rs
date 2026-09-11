@@ -8,6 +8,7 @@ use std::path::Path;
 pub enum SourceKind {
     Query { command: String },
     Stream { command: String },
+    Ingest,
 }
 
 /// Validates type-specific params at startup (spec: source-configuration).
@@ -15,15 +16,23 @@ pub enum SourceKind {
 /// callers building kinds directly — `collect_once`, tests — get the same
 /// guarantee rather than a second, drifted check.
 pub fn build(cfg: &SourceCfg) -> Result<SourceKind> {
-    let name = cfg.name().to_string();
+    match cfg {
+        SourceCfg::Query { .. } => Ok(SourceKind::Query {
+            command: require_command(cfg, "query")?,
+        }),
+        SourceCfg::Stream { .. } => Ok(SourceKind::Stream {
+            command: require_command(cfg, "stream")?,
+        }),
+        SourceCfg::Ingest { .. } => Ok(SourceKind::Ingest),
+    }
+}
+
+fn require_command(cfg: &SourceCfg, kind: &str) -> Result<String> {
     let command = cfg.command().to_string();
     if command.is_empty() {
-        bail!("{} source `{name}` requires `command`", cfg.kind().as_str());
+        bail!("{kind} source `{}` requires `command`", cfg.name());
     }
-    match cfg {
-        SourceCfg::Query { .. } => Ok(SourceKind::Query { command }),
-        SourceCfg::Stream { .. } => Ok(SourceKind::Stream { command }),
-    }
+    Ok(command)
 }
 
 /// Converts a fetched value against a source's declared `value_type` (spec:
@@ -69,6 +78,9 @@ impl SourceKind {
             SourceKind::Query { command } => fetch_query(command, dir).await,
             SourceKind::Stream { .. } => {
                 bail!("stream sources are ingested continuously, not fetched per tick")
+            }
+            SourceKind::Ingest => {
+                bail!("ingest sources receive data via HTTP push, not fetch")
             }
         }
     }

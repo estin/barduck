@@ -101,8 +101,8 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
 fn is_stale(last_ok_age: f64, source: Option<&SourceCfg>, fallback_interval: Duration) -> bool {
     let interval = match source {
         Some(s) if s.cron().is_some() => return last_ok_age.is_infinite(),
-        Some(s) if s.is_stream() => {
-            // No doubling: a stream emits continuously, so any silence past
+        Some(s) if s.is_stream() || s.is_ingest() => {
+            // No doubling: streams and ingest sources emit continuously, so any silence past
             // one full expected interval already means missed values.
             return last_ok_age > s.effective_interval().as_secs_f64();
         }
@@ -127,6 +127,34 @@ mod tests {
                 .unwrap_or_default(),
         ))
         .unwrap()
+    }
+
+    fn ingest_source(name: &str, expected_interval: Duration) -> SourceCfg {
+        let q = char::from(34);
+        let s = format!(
+            "name = {q}{0}{q}\ntype = {q}ingest{q}\nexpected_interval = {q}{1}{q}",
+            name,
+            humantime::format_duration(expected_interval),
+        );
+        toml::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn ingest_source_within_window_is_not_stale() {
+        let s = ingest_source("webhook", Duration::from_mins(1));
+        assert!(!is_stale(30.0, Some(&s), Duration::from_mins(5)));
+
+    }
+    #[test]
+    fn ingest_source_past_expected_interval_is_stale() {
+        let s = ingest_source("webhook", Duration::from_mins(1));
+        assert!(is_stale(90.0 * 60.0, Some(&s), Duration::from_mins(5)));
+
+    }
+    #[test]
+    fn ingest_source_at_boundary_is_not_stale() {
+        let s = ingest_source("webhook", Duration::from_mins(1));
+        assert!(!is_stale(59.0, Some(&s), Duration::from_mins(5)));
     }
 
     #[test]
