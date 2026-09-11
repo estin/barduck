@@ -9,6 +9,58 @@ use topcoat::{
     view::{Unescaped, component, view},
 };
 
+/// Schemes safe to leave as a live link/image destination. Anything else —
+/// notably `javascript:` and `data:` — is neutralized instead.
+const SAFE_URL_SCHEMES: &[&str] = &["http", "https", "mailto"];
+
+/// Whether `url` is safe to render as a link/image destination: either it
+/// has no scheme at all (a relative path, `#fragment`, or `?query`, which
+/// can't execute anything on its own), or its scheme is one of
+/// [`SAFE_URL_SCHEMES`]. A scheme is `[a-zA-Z][a-zA-Z0-9+.-]*` followed by
+/// `:` (RFC 3986); the first character that's neither part of that alphabet
+/// nor `:` settles it either way.
+fn is_safe_url(url: &str) -> bool {
+    match url.find(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')) {
+        Some(i) if url.as_bytes()[i] == b':' => {
+            SAFE_URL_SCHEMES.contains(&url[..i].to_ascii_lowercase().as_str())
+        }
+        // No `:` before the first non-scheme character (or no such
+        // character at all): no scheme, so it's a relative reference.
+        _ => true,
+    }
+}
+
+/// Rewrites a link/image `Start` event's destination to the empty string
+/// when [`is_safe_url`] rejects it, leaving every other event untouched.
+fn neutralize_unsafe_destination(event: pulldown_cmark::Event<'_>) -> pulldown_cmark::Event<'_> {
+    use pulldown_cmark::{Event, Tag};
+    match event {
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) if !is_safe_url(&dest_url) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: "".into(),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) if !is_safe_url(&dest_url) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: "".into(),
+            title,
+            id,
+        }),
+        other => other,
+    }
+}
+
 /// Markdown rendered to HTML. The *Markdown* itself is trusted to become
 /// styled markup (config-authored: either a static-text cell's literal text,
 /// or a source's fetched value when that source's panel is configured with
@@ -18,18 +70,29 @@ use topcoat::{
 /// raw HTML blocks/inline spans as part of the `CommonMark` spec regardless of
 /// which `Options` are enabled, so disabling extensions isn't enough —
 /// any `Html`/`InlineHtml` event is rewritten to literal text (escaped by
-/// `push_html` like any other text event) before rendering, and only the
-/// Markdown *syntax* (links, lists, emphasis, …) still becomes markup.
+/// `push_html` like any other text event) before rendering. Link/image
+/// destinations are markdown *syntax*, not raw HTML, so that rewrite doesn't
+/// cover them — `pulldown-cmark` writes `dest_url` straight into the
+/// rendered `href`/`src` attribute (HTML-attribute-escaped, but not
+/// scheme-filtered), so a `[text](javascript:...)` link from an untrusted
+/// source is neutralized separately, by [`neutralize_unsafe_destination`].
 pub(super) fn markdown_to_html(value: &str) -> Unescaped<String> {
-    let events = pulldown_cmark::Parser::new_ext(value, Options::ENABLE_TABLES).map(|event| match event {
-        pulldown_cmark::Event::Html(html) | pulldown_cmark::Event::InlineHtml(html) => {
-            pulldown_cmark::Event::Text(html)
-        }
-        other => other,
-    });
+    Unescaped::new_unchecked(render_markdown(value))
+}
+
+/// The actual rendering behind [`markdown_to_html`], factored out so tests
+/// can assert on the plain `String` instead of reaching into `Unescaped`.
+fn render_markdown(value: &str) -> String {
+    let events = pulldown_cmark::Parser::new_ext(value, Options::ENABLE_TABLES)
+        .map(|event| match event {
+            pulldown_cmark::Event::Html(html) | pulldown_cmark::Event::InlineHtml(html) => {
+                pulldown_cmark::Event::Text(html)
+            }
+            other => neutralize_unsafe_destination(other),
+        });
     let mut html = String::new();
     pulldown_cmark::html::push_html(&mut html, events);
-    Unescaped::new_unchecked(html)
+    html
 }
 
 /// Renders `value` (with `unit` appended when non-empty, except for
@@ -50,5 +113,95 @@ pub(super) async fn formatted_content(format: ValueFormat, value: String, unit: 
         } else {
             <div class="text-2xl font-semibold">(value_and_unit)</div>
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `javascript:` link destination from an untrusted `format =
+    /// "markdown"` source must never reach the rendered `href` — that's a
+    /// same-origin XSS the moment a viewer clicks the link.
+    #[test]
+    fn javascript_scheme_link_is_neutralized() {
+        let html = render_markdown("[click me](javascript:alert(document.cookie))");
+        assert!(
+            !html.to_lowercase().contains("javascript:"),
+            "javascript: scheme leaked into rendered HTML: {html}"
+        );
+    }
+
+    /// Same for image destinations, and for `data:` (which can also carry
+    /// script, e.g. an SVG payload).
+    #[test]
+    fn unsafe_schemes_neutralized_for_links_and_images() {
+        for md in [
+            "[x](data:text/html,<script>alert(1)</script>)",
+            "![x](javascript:alert(1))",
+            "[x](VBScript:msgbox(1))",
+        ] {
+            let html = render_markdown(md);
+            assert!(
+                !html.to_lowercase().contains("javascript:")
+                    && !html.to_lowercase().contains("data:")
+                    && !html.to_lowercase().contains("vbscript:"),
+                "unsafe scheme leaked into rendered HTML for {md:?}: {html}"
+            );
+        }
+    }
+
+    /// Ordinary links must still work: this isn't a blanket link-stripping
+    /// pass, only unsafe schemes are touched.
+    #[test]
+    fn safe_link_schemes_pass_through() {
+        for (md, want_fragment) in [
+            ("[site](https://example.com/page)", "https://example.com/page"),
+            ("[mail](mailto:a@example.com)", "mailto:a@example.com"),
+            ("[rel](/dashboard)", "/dashboard"),
+            ("[anchor](#panel-cpu)", "#panel-cpu"),
+        ] {
+            let html = render_markdown(md);
+            assert!(
+                html.contains(want_fragment),
+                "expected {want_fragment:?} in rendered HTML for {md:?}: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_url_accepts_allowlisted_and_relative_urls() {
+        for url in [
+            "http://example.com",
+            "HTTPS://example.com",
+            "mailto:a@example.com",
+            "/relative/path",
+            "#fragment",
+            "?query=1",
+            "plain-text-not-a-url",
+        ] {
+            assert!(is_safe_url(url), "expected safe: {url}");
+        }
+    }
+
+    #[test]
+    fn is_safe_url_rejects_dangerous_schemes() {
+        for url in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_safe_url(url), "expected unsafe: {url}");
+        }
+    }
+
+    /// Raw HTML (blocks or inline spans) is still fully neutralized —
+    /// this coverage predates the scheme filter and must keep holding.
+    #[test]
+    fn raw_html_is_escaped_not_rendered() {
+        let html = render_markdown("<script>alert(1)</script>text");
+        assert!(!html.contains("<script>"));
     }
 }

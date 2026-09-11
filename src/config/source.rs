@@ -236,7 +236,7 @@ pub enum SourceCfg {
         /// Optional shell command run once before this source's first fetch
         /// (start a service, open a tunnel). Failure defers fetching; retried on schedule.
         setup: Option<String>,
-        /// How to render the value in the UI: `text` (default), `markdown`, or `json`.
+        /// How to render the value in the UI: `text` (default) or `markdown`.
         format: Option<ValueFormat>,
         /// Optional coloring bands, e.g. `[{bound=60.0, level="green"}, {bound=85.0, level="yellow"}, {bound=100.0, level="red"}]`.
         #[serde(default)]
@@ -544,9 +544,15 @@ impl JsonlTs {
     pub fn resolve(&self, fallback: (f64, String)) -> (f64, String) {
         match self {
             JsonlTs::Epoch(secs) => {
-                let whole = secs.trunc();
+                // `floor`, not `trunc`: for a pre-epoch fractional value
+                // (e.g. `-1.5`), `trunc` rounds toward zero (`-1.0`) and
+                // `.abs()` on the remainder then flips it positive, landing
+                // exactly one second late. Flooring keeps `secs - whole` in
+                // `[0, 1)` for either sign, already the correct positive
+                // nanosecond offset.
+                let whole = secs.floor();
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let nanos = ((secs - whole).abs() * 1_000_000_000.0).round() as u32;
+                let nanos = ((secs - whole) * 1_000_000_000.0).round() as u32;
                 #[allow(clippy::cast_possible_truncation)]
                 let dt = chrono::DateTime::from_timestamp(whole as i64, nanos);
                 dt.map_or(fallback, |d| {
@@ -746,6 +752,20 @@ mod tests {
         let (epoch, ts) = r.ts.unwrap().resolve((0.0, "fallback".into()));
         assert!((epoch - 1000.5).abs() < 0.001, "got {epoch}");
         assert!(ts.contains("1970-01-01"), "unexpected ts: {ts}");
+    }
+
+    /// A pre-epoch fractional `ts` (half a second before 1969-12-31T23:59:59Z)
+    /// must resolve to that exact instant, not one second off (spec:
+    /// source-configuration — JSONL row schema).
+    #[test]
+    fn pre_epoch_fractional_ts_resolves_correctly() {
+        let r = parse_jsonl_row("s", row(r#"{"value":"ok","ts":-1.5}"#)).unwrap();
+        let (epoch, ts) = r.ts.unwrap().resolve((0.0, "fallback".into()));
+        assert!((epoch - (-1.5)).abs() < 0.001, "got {epoch}");
+        assert!(
+            ts.starts_with("1969-12-31T23:59:58.5"),
+            "expected 23:59:58.5, got {ts}"
+        );
     }
 
     /// (spec: source-configuration — Ingest source type)

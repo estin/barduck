@@ -45,6 +45,7 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("binding {}", cfg.listen))?;
+    warn_if_listen_not_loopback(&cfg.listen);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut hub = collector::reset_channels(&cfg)?;
     let txs = std::mem::take(&mut hub.txs);
@@ -71,6 +72,33 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
         let _ = task.await;
     }
     Ok(())
+}
+
+/// `/api/ingest` (and every other `/api/*` route) has no authentication of
+/// its own — the listen address is the only access control. Warns once at
+/// startup when that address isn't loopback-only, since anything that can
+/// reach a non-loopback bind can read and write this daemon's data (spec:
+/// http-api — HTTP ingest endpoint).
+fn warn_if_listen_not_loopback(listen: &str) {
+    if !is_loopback_listen(listen) {
+        tracing::warn!(
+            "listening on {listen}, which is not loopback-only — /api/ingest \
+             and the other HTTP endpoints have no authentication, so anything \
+             that can reach this address can read and write this daemon's \
+             data. Bind to 127.0.0.1/::1/localhost unless you have another \
+             access control (a reverse proxy, firewall rule, ...) in front \
+             of it."
+        );
+    }
+}
+
+/// Whether `listen` (a `host:port` string) resolves to a loopback address,
+/// or the bare hostname `localhost` a `SocketAddr` parse can't resolve
+/// without a DNS lookup this check deliberately avoids doing.
+fn is_loopback_listen(listen: &str) -> bool {
+    listen
+        .parse::<std::net::SocketAddr>()
+        .map_or_else(|_| listen.starts_with("localhost:"), |a| a.ip().is_loopback())
 }
 
 /// Resolves on Ctrl+C or (on Unix) `SIGTERM` — the same signals
@@ -161,3 +189,22 @@ pub fn build_router_with_bundle(
 /// gets the real one-shot collection round — including its setup-command
 /// gating — rather than a second, drifted copy.
 pub use collector::collect_once;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_addresses_recognized() {
+        for listen in ["127.0.0.1:8420", "[::1]:8420", "localhost:8420"] {
+            assert!(is_loopback_listen(listen), "expected loopback: {listen}");
+        }
+    }
+
+    #[test]
+    fn non_loopback_addresses_recognized() {
+        for listen in ["0.0.0.0:8420", "192.168.1.5:8420", "[::]:8420"] {
+            assert!(!is_loopback_listen(listen), "expected non-loopback: {listen}");
+        }
+    }
+}

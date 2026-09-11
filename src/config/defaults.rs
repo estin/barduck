@@ -37,14 +37,11 @@ pub(crate) fn default_config_dir() -> PathBuf {
 /// variables, taking precedence over both the config file's value and the
 /// field's built-in default (spec: source-configuration — environment
 /// variables override top-level settings). Structural fields (`sources`,
-/// `layouts`) are not covered.
-pub(crate) fn apply_env_overrides(cfg: &mut Config) -> Result<()> {
-    apply_env_overrides_from(cfg, |name| std::env::var(name).ok())
-}
-
-/// Same as [`apply_env_overrides`], but reads variables through `lookup`
-/// instead of the real process environment — lets tests exercise the
-/// override logic without mutating global process state.
+/// `layouts`) are not covered. Reads variables through `lookup` rather than
+/// the real process environment directly — [`super::load`] passes
+/// `std::env::var`; tests pass an injectable stand-in instead, since
+/// `std::env::set_var` is `unsafe` as of the 2024 edition and this project
+/// denies `unsafe_code`.
 pub(crate) fn apply_env_overrides_from(
     cfg: &mut Config,
     lookup: impl Fn(&str) -> Option<String>,

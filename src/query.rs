@@ -16,12 +16,22 @@ pub enum Backend {
     },
 }
 
+/// Per-request timeout for the daemon-mode HTTP client. Without one, a
+/// stalled daemon response (network hang, a wedged handler) leaves the
+/// request pending forever — in the TUI that means `refresh_in_flight`
+/// never clears, silently freezing the display on stale data with no error
+/// shown, since nothing ever completes to report one.
+const DAEMON_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Backend {
     pub fn new(cfg: &Config, use_daemon: bool) -> Result<Self> {
         if use_daemon {
             Ok(Self::Daemon {
                 base: format!("http://{}", cfg.listen),
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder()
+                    .timeout(DAEMON_REQUEST_TIMEOUT)
+                    .build()
+                    .context("building HTTP client")?,
             })
         } else {
             Ok(Self::Direct(Db::open_ro(&cfg.database_path)?))

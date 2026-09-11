@@ -129,16 +129,28 @@ pub(crate) fn validate_cell(
                 );
             }
         }
-        Cell::Space {
-            colspan: Some(0), ..
-        } => {
-            bail!(
-                "layout `{}` row {} has a space with colspan 0",
-                layout_title,
-                row_idx + 1
-            );
+        Cell::Space { kind, colspan } => {
+            // `kind`'s only purpose in the schema is disambiguating this
+            // variant from `Group` while parsing (its value is otherwise
+            // unused downstream) — but that also means a typo like `kind =
+            // "spacer"` would otherwise silently succeed as a valid space
+            // cell instead of surfacing as the mistake it is.
+            if kind != "space" {
+                bail!(
+                    "layout `{}` row {} has a cell with unknown `kind` `{}` (only `space` is valid)",
+                    layout_title,
+                    row_idx + 1,
+                    kind
+                );
+            }
+            if *colspan == Some(0) {
+                bail!(
+                    "layout `{}` row {} has a space with colspan 0",
+                    layout_title,
+                    row_idx + 1
+                );
+            }
         }
-        Cell::Space { .. } => {}
         Cell::Text { text, format, .. } => {
             if text.is_empty() {
                 bail!(

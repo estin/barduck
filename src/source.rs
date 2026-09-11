@@ -286,6 +286,7 @@ impl StreamProc {
     pub async fn next_line(&mut self) -> Result<Option<String>> {
         self.lines.next_line().await.context("reading stream line")
     }
+    /// Waits for the process to exit after EOF, for the collector's exit
     /// log; disarms the orphan-killer since the child is reaped.
     pub async fn wait_for_exit(&mut self) -> Result<std::process::ExitStatus> {
         let status = self.child.wait().await.context("waiting for stream exit")?;
@@ -293,9 +294,15 @@ impl StreamProc {
         Ok(status)
     }
 
-    /// Kills the process group and reaps the child (daemon shutdown).
+    /// Kills the process group and reaps the child (daemon shutdown). Kills
+    /// the whole group, not just the direct `sh` pid — a command like
+    /// `cmd | tee` or one that backgrounds work with `&` leaves descendants
+    /// that `Child::kill` (which only signals the direct child) would
+    /// otherwise orphan, reparented to init instead of cleaned up.
     pub async fn shutdown(&mut self) {
-        self.guard.0 = None;
+        if let Some(pgid) = self.guard.0.take() {
+            KillGroupOnDrop::kill_group(pgid);
+        }
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
@@ -311,15 +318,24 @@ impl StreamProc {
 /// source's misbehavior must not degrade the whole daemon over time).
 struct KillGroupOnDrop(Option<i32>);
 
+impl KillGroupOnDrop {
+    /// Fire-and-forget: the negative pid targets the whole process group
+    /// `process_group(0)` put the command in at spawn time. Shared by the
+    /// `Drop` glue (no async context available there) and
+    /// [`StreamProc::shutdown`], which needs the same whole-group kill from
+    /// an async context that can also reap the child afterward.
+    fn kill_group(pgid: i32) {
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pgid}"))
+            .spawn();
+    }
+}
+
 impl Drop for KillGroupOnDrop {
     fn drop(&mut self) {
         if let Some(pgid) = self.0.take() {
-            // Fire-and-forget: the negative pid targets the whole process
-            // group `process_group(0)` put the command in at spawn time.
-            let _ = std::process::Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{pgid}"))
-                .spawn();
+            Self::kill_group(pgid);
         }
     }
 }

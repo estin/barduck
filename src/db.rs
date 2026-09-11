@@ -204,10 +204,19 @@ impl WriteCmd {
         // concurrent direct-mode read appears stuck while the daemon runs
         // (spec: data-storage — concurrent access safety). Checkpointing
         // here, before the reply, means a caller's successful `.await`
-        // durably guarantees visibility, not just a race with it; writes
-        // are minutes apart, so the extra fsync is free at this scale.
-        let result = result
-            .and_then(|()| db.with_lock(|| conn.execute_batch("CHECKPOINT").map_err(Into::into)));
+        // usually already guarantees visibility, not just a race with it;
+        // writes are minutes apart, so the extra fsync is free at this
+        // scale. A checkpoint failure (e.g. a concurrent direct-mode reader
+        // briefly holding the file lock) is logged and tolerated rather
+        // than folded into `result`: the write above already committed, so
+        // reporting it as a failure would be a false negative — durably
+        // stored data reported to the caller (an ingest POST, a collector
+        // insert) as an error.
+        if result.is_ok()
+            && let Err(e) = db.with_lock(|| conn.execute_batch("CHECKPOINT").map_err(Into::into))
+        {
+            tracing::warn!("checkpoint after write: {e:#}");
+        }
         let _ = reply.send(result);
     }
 
@@ -310,6 +319,13 @@ pub struct HealthEventRow {
 pub const DEFAULT_HISTORY_LIMIT: i64 = 1000;
 pub const MAX_HISTORY_LIMIT: i64 = 10_000;
 
+/// Cap accepted by [`Db::logs`]/[`Db::logs_for_sources`] — same rationale as
+/// [`MAX_HISTORY_LIMIT`]: a requested `limit` (HTTP `/api/logs?limit=`, the
+/// CLI's `--limit`, or a caller's own default) is clamped rather than passed
+/// straight into `LIMIT ?`, so neither an unbounded nor a negative value
+/// (which `DuckDB` treats as unbounded) can force a full-table scan.
+pub const MAX_LOGS_LIMIT: i64 = 10_000;
+
 pub(crate) fn now() -> (f64, String) {
     let t: DateTime<Utc> = Utc::now();
     (t.timestamp_millis() as f64 / 1000.0, t.to_rfc3339())
@@ -340,6 +356,15 @@ fn create_schema(conn: &Connection) -> Result<()> {
             value_double DOUBLE,
             value_json   JSON
         );
+        -- `CREATE TABLE IF NOT EXISTS` above is a no-op on a database file
+        -- from before these columns existed, so — same as `fetch_logs`
+        -- below — bringing an old database forward needs its own
+        -- statement; no backfill needed, `NULL` (every pre-existing row's
+        -- value_type was `string`, so it never populated these) is already
+        -- the correct value.
+        ALTER TABLE readings ADD COLUMN IF NOT EXISTS value_bigint BIGINT;
+        ALTER TABLE readings ADD COLUMN IF NOT EXISTS value_double DOUBLE;
+        ALTER TABLE readings ADD COLUMN IF NOT EXISTS value_json JSON;
         CREATE TABLE IF NOT EXISTS fetch_logs (
             id          BIGINT NOT NULL,
             source      VARCHAR NOT NULL,
@@ -381,6 +406,18 @@ fn create_schema(conn: &Connection) -> Result<()> {
 /// executing each queued [`WriteCmd`] in turn. If the connection itself
 /// fails to open, every already- and later-queued command is failed with a
 /// clear error instead of hanging forever waiting on a reply.
+/// Opens a fresh writer connection. The open races the same "read-only open
+/// sees a torn write" hazard as any other operation, so it takes the
+/// advisory lock too — briefly, same as every write that follows. Shared by
+/// [`spawn_writer`]'s initial open and its post-panic reconnect.
+fn open_writer_conn(db: &Db) -> Result<Connection> {
+    db.acquire().and_then(|guard| {
+        let c = db.connect();
+        drop(guard);
+        c
+    })
+}
+
 fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WriteCmd>();
     tokio::task::spawn_blocking(move || {
@@ -390,14 +427,7 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
             writer: None,
             session_bands: SessionBands::default(),
         };
-        // The initial open races the same "read-only open sees a torn write"
-        // hazard as any other operation, so it takes the lock too — briefly,
-        // same as every write that follows.
-        let conn = match db.acquire().and_then(|guard| {
-            let c = db.connect();
-            drop(guard);
-            c
-        }) {
+        let mut conn = match open_writer_conn(&db) {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!("db writer: failed to open connection: {e:#}");
@@ -423,6 +453,17 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
                     "db writer: write command panicked: {}",
                     panic_message(&panic)
                 );
+                // The panic may have left `conn` mid-statement or otherwise
+                // in an unknown state — there's no reliable way to tell, so
+                // reopen rather than risk every subsequent write silently
+                // failing against a wedged connection until the daemon
+                // restarts.
+                match open_writer_conn(&db) {
+                    Ok(fresh) => conn = fresh,
+                    Err(e) => {
+                        tracing::error!("db writer: failed to reopen after panic: {e:#}");
+                    }
+                }
             }
         }
     });
@@ -836,6 +877,7 @@ impl Db {
     }
 
     pub async fn logs(&self, source: Option<&str>, limit: i64) -> Result<Vec<LogRow>> {
+        let limit = limit.clamp(1, MAX_LOGS_LIMIT);
         let (_guard, conn) = self.connect_async().await?;
         // `id DESC` breaks ties between attempts sharing the same
         // millisecond `ts_epoch` — callers (e.g. the consecutive-failure
@@ -868,6 +910,7 @@ impl Db {
     /// way fetch-then-filter would. Empty `sources` returns the newest rows
     /// across all sources.
     pub async fn logs_for_sources(&self, sources: &[String], limit: i64) -> Result<Vec<LogRow>> {
+        let limit = limit.clamp(1, MAX_LOGS_LIMIT);
         if sources.is_empty() {
             return self.logs(None, limit).await;
         }
@@ -876,7 +919,8 @@ impl Db {
             out.extend(self.logs(Some(s), limit).await?);
         }
         out.sort_by(|a, b| b.ts_epoch.total_cmp(&a.ts_epoch));
-        out.truncate(limit.max(0).try_into().unwrap_or(usize::MAX));
+        #[allow(clippy::cast_sign_loss)] // clamped to >= 1 above
+        out.truncate(limit as usize);
         Ok(out)
     }
 
@@ -1067,6 +1111,38 @@ mod tests {
         assert_eq!(filtered[0].value.as_deref(), Some("q"));
     }
 
+    /// A negative or absurdly large requested `limit` (`GET
+    /// /api/logs?limit=-1` or `limit=1000000000`, or the CLI's `--limit`)
+    /// must not force an unbounded `fetch_logs` scan — `DuckDB` treats a
+    /// negative `LIMIT` as unbounded, so this has to be clamped before it
+    /// ever reaches the query (spec: http-api — bounded queries).
+    #[tokio::test]
+    async fn logs_limit_is_clamped_not_passed_through_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        for i in 0..5 {
+            db.insert_log("s", 1, None, Some(&i.to_string()), Origin::Poll)
+                .await
+                .unwrap();
+        }
+
+        // Same clamp `history()` already uses: a negative limit clamps up to
+        // the floor of 1 rather than being treated as "no limit" — it never
+        // reaches the query as a negative number, so `DuckDB` never sees the
+        // value that would make it scan unbounded.
+        let negative = db.logs(Some("s"), -1).await.unwrap();
+        assert_eq!(negative.len(), 1, "negative limit clamps to the floor of 1");
+
+        let huge = db.logs(Some("s"), 1_000_000_000).await.unwrap();
+        assert_eq!(huge.len(), 5, "still returns every row that exists");
+
+        let via_sources = db
+            .logs_for_sources(&["s".to_string()], -1)
+            .await
+            .unwrap();
+        assert_eq!(via_sources.len(), 1);
+    }
+
     /// Pre-migration rows (no `origin` column) read as `poll` once the
     /// database is opened, while newly written rows keep their origin
     /// (spec: data-collection — Fetch attempts logged).
@@ -1099,6 +1175,37 @@ mod tests {
         let rows = db.logs(Some("old"), 10).await.unwrap();
         assert_eq!(rows[0].origin, Origin::Push);
         assert_eq!(rows[1].origin, Origin::Poll);
+    }
+
+    /// Opening a pre-typed-columns database file (`readings` predates
+    /// `value_bigint`/`value_double`/`value_json`) must not fail subsequent
+    /// inserts with "column not found" — `CREATE TABLE IF NOT EXISTS` alone
+    /// is a no-op on an existing table, so the typed columns need the same
+    /// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration `fetch_logs.origin`
+    /// gets (spec: data-storage — typed value columns).
+    #[tokio::test]
+    async fn readings_typed_columns_migrate_onto_a_pre_typed_columns_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        {
+            let conn = duckdb::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE SEQUENCE readings_id_seq;
+                 CREATE TABLE readings (
+                     id BIGINT NOT NULL, source VARCHAR NOT NULL, value VARCHAR NOT NULL,
+                     unit VARCHAR, ts_epoch DOUBLE NOT NULL, ts VARCHAR NOT NULL
+                 );
+                 INSERT INTO readings (id, source, value, unit, ts_epoch, ts)
+                 VALUES (nextval('readings_id_seq'), 'old', 'v', NULL, 1000.0, 't');",
+            )
+            .unwrap();
+        }
+        let db = Db::open_rw(&path).unwrap();
+        db.insert_reading("old", "42", None, Some(42), None, None)
+            .await
+            .unwrap();
+        let rows = db.history("old", None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 2, "the pre-migration row must survive too");
     }
 
     /// `last_attempt` returns the newest entry whatever its outcome, unlike

@@ -139,7 +139,6 @@ name = "webhook-events"
 type = "ingest"
 expected_interval = "1m"
 unit = "events"
-format = "json"
 
 # Grid layouts: each row is a list of cells. A panel's title defaults to its
 # source's `title` (see `disk-root` above), or its raw name if it declares
@@ -168,8 +167,8 @@ format = "json"
 #                                      schedule, health, log view, or
 #                                      summary-strip chip. Renders like any
 #                                      other source's `format` (markdown as
-#                                      HTML, json pretty-printed, else plain
-#                                      text); the TUI always shows it as-is.
+#                                      HTML, else plain text); the TUI always
+#                                      shows it as-is.
 #
 # A source may also declare `show_in = "tui"` or `show_in = "web"` (default
 # "all") to restrict which UI displays it — see `dead-service` above. This

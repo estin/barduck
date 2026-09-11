@@ -42,6 +42,18 @@ fn json_err(status: StatusCode, msg: &str) -> Response {
     resp
 }
 
+/// A genuine internal failure (DB connection/query error, not caller
+/// input): logged server-side with full detail, answered with a generic
+/// message. Unlike a 400 for bad request input — where echoing back what's
+/// wrong with the caller's *own* data is expected UX — a 500 here reflects
+/// internal state (file paths, connection detail, `DuckDB` internals) that
+/// `/api/ingest` and friends being unauthenticated by default makes fair
+/// game to any caller that can reach the listen address (spec: http-api).
+fn internal_error(context: &str, e: &anyhow::Error) -> Response {
+    tracing::error!("{context}: {e:#}");
+    json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
 /// The vendored topcoat browser runtime (see assets/README note in repo);
 /// served here so no external bundler step is needed.
 #[route(GET "/assets/bd-runtime.js")]
@@ -70,10 +82,7 @@ pub async fn latest(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
     match st.db.latest_values().await {
         Ok(rows) => Ok(json_ok(&rows)),
-        Err(e) => Ok(json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("{e:#}"),
-        )),
+        Err(e) => Ok(internal_error("GET /api/sources/latest", &e)),
     }
 }
 
@@ -104,10 +113,7 @@ pub async fn history(cx: &Cx) -> Result<Response> {
         .map_err(|e| topcoat::Error::from(bad_request(format!("invalid time range query: {e}"))))?;
     match st.db.history(&source, q.from, q.to, q.limit).await {
         Ok(rows) => Ok(json_ok(&rows)),
-        Err(e) => Ok(json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("{e:#}"),
-        )),
+        Err(e) => Ok(internal_error("GET /api/sources/{source}/history", &e)),
     }
 }
 
@@ -118,12 +124,7 @@ pub async fn health_all(cx: &Cx) -> Result<Response> {
     for s in &st.cfg.sources {
         match health::compute(&st.db, &st.cfg, s.name()).await {
             Ok(h) => out.push(h),
-            Err(e) => {
-                return Ok(json_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{e:#}"),
-                ));
-            }
+            Err(e) => return Ok(internal_error("GET /api/health", &e)),
         }
     }
     Ok(json_ok(&out))
@@ -179,10 +180,7 @@ pub async fn logs(cx: &Cx) -> Result<Response> {
         .await
     {
         Ok(rows) => Ok(json_ok(&rows)),
-        Err(e) => Ok(json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("{e:#}"),
-        )),
+        Err(e) => Ok(internal_error("GET /api/logs", &e)),
     }
 }
 
@@ -314,8 +312,14 @@ fn epoch_to_ts(secs: f64, source: &str) -> std::result::Result<(f64, String), St
     if !secs.is_finite() {
         return Err(format!("ingest `ts` for `{source}` is not a finite number"));
     }
-    let whole = secs.trunc();
-    let nanos = ((secs - whole).abs() * 1_000_000_000.0).round() as u32;
+    // `floor`, not `trunc`: for a pre-epoch fractional value (e.g. `-1.5`),
+    // `trunc` rounds toward zero (`-1.0`), and an `.abs()` on the negative
+    // remainder that follows would flip it positive, landing exactly one
+    // second late. Flooring keeps `secs - whole` in `[0, 1)` for either
+    // sign, so the remainder is already the correct positive nanosecond
+    // offset with no `.abs()` needed.
+    let whole = secs.floor();
+    let nanos = ((secs - whole) * 1_000_000_000.0).round() as u32;
     match chrono::DateTime::from_timestamp(whole as i64, nanos) {
         Some(d) => {
             #[allow(clippy::cast_precision_loss)]
@@ -323,5 +327,44 @@ fn epoch_to_ts(secs: f64, source: &str) -> std::result::Result<(f64, String), St
             Ok((epoch, d.to_rfc3339()))
         }
         None => Err(format!("ingest `ts` for `{source}` is out of range")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// A pre-epoch fractional `ts` (e.g. `-1.5`, half a second before
+    /// 1969-12-31T23:59:59Z) must resolve to that exact instant, not one
+    /// second off (spec: http-api — HTTP ingest endpoint).
+    #[test]
+    fn epoch_to_ts_handles_pre_epoch_fractional_seconds() {
+        let (epoch, ts) = epoch_to_ts(-1.5, "s").unwrap();
+        assert!((epoch - (-1.5)).abs() < 0.001, "got epoch {epoch}");
+        assert!(
+            ts.starts_with("1969-12-31T23:59:58.5"),
+            "expected 23:59:58.5, got {ts}"
+        );
+    }
+
+    #[test]
+    fn epoch_to_ts_handles_positive_fractional_seconds() {
+        let (epoch, ts) = epoch_to_ts(1.5, "s").unwrap();
+        assert!((epoch - 1.5).abs() < 0.001, "got epoch {epoch}");
+        assert!(ts.starts_with("1970-01-01T00:00:01.5"), "got {ts}");
+    }
+
+    #[test]
+    fn epoch_to_ts_handles_whole_seconds_either_side_of_the_epoch() {
+        assert!((epoch_to_ts(-1.0, "s").unwrap().0 - (-1.0)).abs() < 0.001);
+        assert!((epoch_to_ts(0.0, "s").unwrap().0).abs() < 0.001);
+        assert!((epoch_to_ts(1.0, "s").unwrap().0 - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn epoch_to_ts_rejects_non_finite() {
+        assert!(epoch_to_ts(f64::NAN, "s").is_err());
+        assert!(epoch_to_ts(f64::INFINITY, "s").is_err());
     }
 }

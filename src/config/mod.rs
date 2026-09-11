@@ -20,7 +20,7 @@ pub use source::{
 };
 
 use defaults::{
-    apply_env_overrides, default_config_dir, default_db_path, default_history_points,
+    apply_env_overrides_from, default_config_dir, default_db_path, default_history_points,
     default_interval, default_listen, default_threshold, default_tui_width,
 };
 use validation::{validate_cell, validate_source};
@@ -88,20 +88,29 @@ impl Default for Config {
 }
 
 pub fn load(path: &Path) -> Result<Config> {
+    load_from(path, |name| std::env::var(name).ok())
+}
+
+/// Same as [`load`], but reads `BARDUCK_*` overrides through `lookup`
+/// instead of the real process environment — lets tests exercise the
+/// override-then-resolve interaction without mutating global process state
+/// (`std::env::set_var` is `unsafe` as of the 2024 edition, and this
+/// project denies `unsafe_code`).
+fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config {}", path.display()))?;
     let mut cfg: Config =
         toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
-    // `database_path` (and any future relative, config-declared path) is
-    // resolved against the config file's own directory here, up front, so
-    // nothing downstream needs the process's current directory to behave
-    // correctly (spec: source-configuration — config-relative working
-    // directory) — `main()` never has to `chdir` the whole process.
     cfg.config_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // Env overrides apply before the relative-path resolution below, so a
+    // `BARDUCK_DATABASE_PATH` override is resolved against the config file's
+    // own directory exactly like a TOML-declared one — not the process's
+    // current directory (spec: source-configuration — config-relative
+    // working directory) — `main()` never has to `chdir` the whole process.
+    apply_env_overrides_from(&mut cfg, lookup)?;
     if cfg.database_path.is_relative() {
         cfg.database_path = cfg.config_dir.join(&cfg.database_path);
     }
-    apply_env_overrides(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
 }
@@ -109,6 +118,12 @@ pub fn load(path: &Path) -> Result<Config> {
 pub fn validate(cfg: &Config) -> Result<()> {
     if cfg.history_points == 0 {
         bail!("history_points must be > 0");
+    }
+    if cfg.failure_threshold == 0 {
+        // `health::compute` treats "0 consecutive failures >= threshold" as
+        // failing, so a 0 threshold would mark every source permanently
+        // failing from its very first health check, healthy or not.
+        bail!("failure_threshold must be > 0");
     }
     if let Some(r) = cfg.retention
         && r.is_zero()
@@ -509,6 +524,41 @@ mod tests {
         validate(&cfg).unwrap();
     }
 
+    /// `kind = "space"` is the only kind's schema allows; a typo (e.g.
+    /// `kind = "spacer"`) has to surface as a named mistake instead of
+    /// silently rendering as a working space cell.
+    #[test]
+    fn space_cell_unknown_kind_rejected() {
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ kind = \"spacer\", colspan = 2 }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("spacer"),
+            "error should name the bad kind: {err}"
+        );
+    }
+
+    #[test]
+    fn space_cell_colspan_zero_rejected() {
+        // A second, normal-width cell in the row keeps the layout's total
+        // column count above 0, so it's the colspan-0 space cell itself
+        // that trips validation, not the layout-wide column-count check.
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ kind = \"space\", colspan = 0 }, { kind = \"space\", colspan = 1 }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("colspan 0"),
+            "error should name the problem: {err}"
+        );
+    }
+
+    #[test]
+    fn space_cell_accepted() {
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ kind = \"space\", colspan = 2 }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        validate(&cfg).unwrap();
+    }
+
     #[test]
     fn group_cell_with_no_sections_rejected() {
         let cfg: Config = toml::from_str(&group_layout_toml("table = []")).unwrap();
@@ -782,5 +832,40 @@ mod tests {
         let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ main = \"s\" }]]\n[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\ninterval = \"10s\"\ntimeout = \"5s\"\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.layouts[0].style.is_none());
+    }
+
+    /// A `0` threshold would make `health::compute` treat "0 consecutive
+    /// failures >= threshold" as failing, marking every source permanently
+    /// failing from its first health check (spec: data-collection —
+    /// consecutive failures flip to failing).
+    #[test]
+    fn failure_threshold_zero_rejected() {
+        let cfg: Config = toml::from_str("failure_threshold = 0").unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("failure_threshold"),
+            "error should name the field: {err}"
+        );
+    }
+
+    /// A relative `BARDUCK_DATABASE_PATH` override must resolve against the
+    /// config file's own directory, exactly like a TOML-declared relative
+    /// `database_path` — not the process's current directory (spec:
+    /// source-configuration — config-relative working directory). Exercises
+    /// `load_from` directly (real file, injectable env lookup) rather than
+    /// spawning a daemon, so it's neither flaky nor timing-dependent.
+    #[test]
+    fn env_override_relative_database_path_resolves_against_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "listen = \"127.0.0.1:0\"\n").unwrap();
+
+        let cfg = load_from(
+            &config_path,
+            lookup_from(&[("BARDUCK_DATABASE_PATH", "override.duckdb")]),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.database_path, dir.path().join("override.duckdb"));
     }
 }

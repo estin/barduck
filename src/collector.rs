@@ -24,22 +24,29 @@ enum Schedule {
 }
 
 impl Schedule {
-    /// Built once per query source at collector startup; the cron string was
-    /// already validated at config load, so parsing here cannot fail. An
-    /// interval-scheduled query's first tick resumes from its most recent
-    /// fetch log entry (any outcome): a fresh success defers until the
-    /// remaining `interval` elapses, a fresh failure defers until the
-    /// remaining `retry_interval` elapses, and an overdue (or absent) last
-    /// run is due immediately (spec: data-collection — Per-source
-    /// schedules: daemon startup resumes from the last run). Stream sources
-    /// never reach this constructor — they are ingested continuously.
+    /// Built once per query source at collector startup. The cron string is
+    /// already validated by `config::load` for the daemon's own config, but
+    /// this is a `pub` entry point's transitive dependency — a caller that
+    /// builds a `Config`/`SourceCfg` without going through `config::load`
+    /// (a library caller, or a future internal one) could still reach this
+    /// with an unvalidated cron string, so parsing is a proper `Err`
+    /// instead of an `expect`, matching [`source::build`]'s equivalent
+    /// re-check of command presence. An interval-scheduled query's first
+    /// tick resumes from its most recent fetch log entry (any outcome): a
+    /// fresh success defers until the remaining `interval` elapses, a fresh
+    /// failure defers until the remaining `retry_interval` elapses, and an
+    /// overdue (or absent) last run is due immediately (spec:
+    /// data-collection — Per-source schedules: daemon startup resumes from
+    /// the last run). Stream sources never reach this constructor — they
+    /// are ingested continuously.
     async fn new(db: &Db, src: &SourceCfg) -> Result<Self> {
         if let Some(expr) = src.cron() {
-            #[allow(clippy::expect_used)]
-            // validated at config load (spec: source-configuration — cron schedule)
-            let cron: Cron = expr
-                .parse()
-                .expect("cron expression validated at config load");
+            let cron: Cron = expr.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "source `{}` has invalid cron expression `{expr}`: {e}",
+                    src.name()
+                )
+            })?;
             Ok(Schedule::Cron(Box::new(cron)))
         } else {
             let effective_interval = src.effective_interval();
@@ -413,7 +420,30 @@ async fn ingest_stream_run(
             }
         }
     }
-    match proc.wait_for_exit().await {
+    // Raced against shutdown the same way the read loop above is: the
+    // process's stdout closing (natural `Ok(None)` EOF) doesn't guarantee
+    // the process itself exits promptly — a hung or lingering child would
+    // otherwise block this `.await` (and so the whole task, and so the
+    // daemon's graceful shutdown, which awaits every collector task)
+    // indefinitely.
+    let exit = match shutdown {
+        Some(sd) if !*sd.borrow() => {
+            tokio::select! {
+                status = proc.wait_for_exit() => status,
+                res = sd.changed() => {
+                    let _ = res;
+                    proc.shutdown().await;
+                    return;
+                }
+            }
+        }
+        Some(_) => {
+            proc.shutdown().await;
+            return;
+        }
+        None => proc.wait_for_exit().await,
+    };
+    match exit {
         Ok(status) if status.success() => {
             if let Err(e) = db
                 .insert_log(&name, elapsed_ms(), None, None, Origin::Poll)
@@ -948,6 +978,25 @@ mod tests {
         assert!(matches!(schedule, Schedule::Cron(_)));
     }
 
+    /// An invalid cron expression is a proper `Err`, not a panic — `cron()`
+    /// syntax is only validated by `config::validate`, which a caller
+    /// reaching this constructor directly (as this test does, via
+    /// `toml::from_str::<SourceCfg>` instead of `config::load`) can bypass.
+    #[tokio::test]
+    async fn schedule_new_rejects_invalid_cron_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let src = cron_source("bad", "not a cron expression");
+
+        let Err(err) = Schedule::new(&db, &src).await else {
+            unreachable!("expected an invalid-cron error");
+        };
+        assert!(
+            err.to_string().contains("invalid cron"),
+            "error should name the problem: {err}"
+        );
+    }
+
     /// A `query` printing a `jsonl` row stores the extracted value with the
     /// row timestamp and persists the row's thresholds (spec:
     /// source-configuration — Generic query source type, JSONL row schema).
@@ -992,6 +1041,51 @@ mod tests {
         let logs = db.logs(Some("b"), 10).await.unwrap();
         assert_eq!(logs.len(), 1);
         assert!(logs[0].error.is_some());
+    }
+
+    /// A stream process whose stdout closes without the process itself
+    /// exiting (e.g. it backgrounds more work, or hangs) must not block
+    /// shutdown: `wait_for_exit`, reached after the read loop hits natural
+    /// EOF, is raced against the shutdown signal too — not just the read
+    /// loop itself — since this whole future is what `run_daemon`'s
+    /// graceful shutdown awaits per collector task (spec: data-collection —
+    /// daemon shutdown lets in-flight collection finish).
+    #[tokio::test]
+    async fn ingest_stream_run_does_not_block_shutdown_on_a_lingering_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = Config::default();
+        let marker = dir.path().join("closed-stdout");
+        let src: SourceCfg = toml::from_str(&format!(
+            "name = \"s\"\ntype = \"stream\"\ncommand = \"exec 1>&-; touch {}; sleep 30\"\nexpected_interval = \"30s\"\n",
+            marker.display()
+        ))
+        .unwrap();
+        let mut status = "healthy".to_string();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut shutdown = Some(rx);
+
+        let run = ingest_stream_run(&db, &src, &cfg, &mut status, &mut shutdown);
+        tokio::pin!(run);
+        // Deadline-poll for the marker (written right after stdout closes,
+        // just before the 30s sleep) instead of a blind fixed sleep, so
+        // this isn't sensitive to machine load — `run` is still driven
+        // forward as the other `select!` branch while polling.
+        tokio::select! {
+            () = &mut run => unreachable!("must not finish before shutdown is even requested"),
+            () = async {
+                while !marker.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            } => {}
+        }
+        let _ = tx.send(true);
+
+        // Must return promptly once shutdown fires above, not block on the
+        // process's own 30s sleep.
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .unwrap();
     }
 
     /// A valid stream line becomes a reading; a malformed line becomes a
