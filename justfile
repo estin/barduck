@@ -17,3 +17,10 @@ run *ARGS:
 
 demo:
     just run daemon --config demo/config.toml
+
+# Update Cargo.lock, holding back any dependency version published more
+# recently than cooldown.toml's window allows (see
+# https://crates.io/crates/cargo-cooldown) so a compromised just-published
+# release isn't pulled in before the ecosystem has had a chance to notice.
+update-deps:
+    cargo cooldown update
