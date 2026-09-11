@@ -116,6 +116,23 @@ enum WriteCmd {
         cutoff_epoch: f64,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Hands the reader task a second connection to the *same* `DuckDB`
+    /// database handle (spec: data-storage — resident reader connection).
+    /// The reader must never open its own independent connection to this
+    /// file: `DuckDB` has exactly one `Database` instance per file per
+    /// process, and a second `Connection::open` on the same path creates a
+    /// second, uncoordinated instance — sharing an on-disk file (and every
+    /// `CHECKPOINT` the writer runs after each write) without sharing the
+    /// in-memory structures that track it. That's undefined behavior, not
+    /// just a lock conflict: it manifested as an intermittent hang and,
+    /// once, a segfault, and left a reader-side query reading corrupted
+    /// dictionary data. `Connection::try_clone` opens a second connection
+    /// against the writer's own already-open `Database` handle instead,
+    /// which is the crate's supported way to use one database from two
+    /// threads.
+    CloneConnection {
+        reply: oneshot::Sender<Result<Connection>>,
+    },
 }
 
 impl WriteCmd {
@@ -124,6 +141,13 @@ impl WriteCmd {
     #[allow(clippy::too_many_lines)]
     fn run(self, db: &Db, conn: &Connection) {
         let (result, reply) = match self {
+            WriteCmd::CloneConnection { reply } => {
+                let _ = reply.send(
+                    conn.try_clone()
+                        .context("cloning writer connection for reader task"),
+                );
+                return;
+            }
             WriteCmd::InsertReading {
                 source,
                 value,
@@ -232,13 +256,17 @@ impl WriteCmd {
     /// connection itself never opened, so a caller waiting on its reply
     /// gets a clear error instead of hanging forever.
     fn fail(self, err: &anyhow::Error) {
-        let reply = match self {
+        match self {
+            WriteCmd::CloneConnection { reply } => {
+                let _ = reply.send(Err(anyhow::anyhow!("db writer unavailable: {err:#}")));
+            }
             WriteCmd::InsertReading { reply, .. }
             | WriteCmd::InsertLog { reply, .. }
             | WriteCmd::InsertHealthEvent { reply, .. }
-            | WriteCmd::PurgeOlderThan { reply, .. } => reply,
-        };
-        let _ = reply.send(Err(anyhow::anyhow!("db writer unavailable: {err:#}")));
+            | WriteCmd::PurgeOlderThan { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!("db writer unavailable: {err:#}")));
+            }
+        }
     }
 }
 
@@ -579,29 +607,48 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
     tx
 }
 
+/// Requests a second connection to the writer's already-open database
+/// handle (spec: data-storage — resident reader connection). Must run on a
+/// blocking thread — it drives the returned future to completion with
+/// `handle.block_on`, not `.await`, since callers are themselves inside a
+/// `spawn_blocking` closure with no async context of their own.
+fn clone_writer_conn(
+    handle: &tokio::runtime::Handle,
+    writer: &mpsc::UnboundedSender<WriteCmd>,
+) -> Result<Connection> {
+    let (reply, rx) = oneshot::channel();
+    writer
+        .send(WriteCmd::CloneConnection { reply })
+        .map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
+    handle.block_on(rx).context("db writer task dropped the reply")?
+}
+
 /// Starts the daemon's single reader task (spec: data-storage — resident
-/// reader connection): opens one `DuckDB` connection and keeps it for as
-/// long as any sender is still alive, executing each queued [`ReadCmd`]
-/// against it — instead of every read reopening its own connection, which
-/// is cheap for a one-shot direct-mode process but dominates page-render
-/// latency for a daemon config with many sources (every panel's
-/// `health::compute` plus, for banded sources, its history bar each read
-/// separately). Mirrors [`spawn_writer`] in every other respect, including
-/// panic handling.
-fn spawn_reader(path: PathBuf) -> mpsc::UnboundedSender<ReadCmd> {
+/// reader connection): keeps a connection cloned off the writer's own (see
+/// [`clone_writer_conn`]) for as long as any sender is still alive,
+/// executing each queued [`ReadCmd`] against it — instead of every read
+/// reopening its own connection, which is cheap for a one-shot direct-mode
+/// process but dominates page-render latency for a daemon config with many
+/// sources (every panel's `health::compute` plus, for banded sources, its
+/// history bar each read separately). Mirrors [`spawn_writer`]'s panic
+/// handling, but reconnects via a fresh clone rather than a fresh
+/// independent open — see [`WriteCmd::CloneConnection`] for why the two
+/// aren't interchangeable.
+fn spawn_reader(path: PathBuf, writer: mpsc::UnboundedSender<WriteCmd>) -> mpsc::UnboundedSender<ReadCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ReadCmd>();
+    let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let db = Db {
             path,
-            ro: false,
+            ro: true,
             writer: None,
             reader: None,
             session_bands: SessionBands::default(),
         };
-        let mut conn = match open_daemon_conn(&db) {
+        let mut conn = match clone_writer_conn(&handle, &writer) {
             Ok(conn) => conn,
             Err(e) => {
-                tracing::error!("db reader: failed to open connection: {e:#}");
+                tracing::error!("db reader: failed to clone writer connection: {e:#}");
                 while let Some(cmd) = rx.blocking_recv() {
                     cmd.fail(&e);
                 }
@@ -616,10 +663,10 @@ fn spawn_reader(path: PathBuf) -> mpsc::UnboundedSender<ReadCmd> {
                     "db reader: read command panicked: {}",
                     panic_message(&panic)
                 );
-                match open_daemon_conn(&db) {
+                match clone_writer_conn(&handle, &writer) {
                     Ok(fresh) => conn = fresh,
                     Err(e) => {
-                        tracing::error!("db reader: failed to reopen after panic: {e:#}");
+                        tracing::error!("db reader: failed to reclone after panic: {e:#}");
                     }
                 }
             }
@@ -812,8 +859,9 @@ impl Db {
     /// runtime.
     pub fn open_rw_daemon(path: &Path) -> Result<Self> {
         let mut db = Self::open_rw(path)?;
-        db.writer = Some(spawn_writer(db.path.clone()));
-        db.reader = Some(spawn_reader(db.path.clone()));
+        let writer = spawn_writer(db.path.clone());
+        db.reader = Some(spawn_reader(db.path.clone(), writer.clone()));
+        db.writer = Some(writer);
         Ok(db)
     }
 
@@ -1355,6 +1403,50 @@ mod tests {
         assert_eq!(success.value.as_deref(), Some("42"));
         let attempt = db.last_attempt("cpu").await.unwrap().unwrap();
         assert_eq!(attempt.error.as_deref(), Some("boom"));
+    }
+
+    /// Regression test for a real production incident: the reader task
+    /// originally opened its own independent `Connection::open` on the same
+    /// file the writer already had open read-write. Two independent
+    /// `DuckDB` connections to one file from the same process is undefined
+    /// behavior — not just a lock conflict — and manifested as an
+    /// intermittent hang and, once, a segfault, worsened by the writer's
+    /// `CHECKPOINT` after every write racing the reader's independent view
+    /// of the file. `ReadCmd`/`spawn_reader` must instead get its
+    /// connection via `Connection::try_clone` off the writer's own (see
+    /// [`WriteCmd::CloneConnection`]). This drives many concurrent
+    /// reads and writes — the interleaving a real 30+ source daemon
+    /// produces at startup — and would be expected to hang, panic, or
+    /// return a "database file appears corrupted" error if the reader ever
+    /// went back to opening its own connection.
+    #[tokio::test]
+    async fn concurrent_reads_and_writes_via_daemon_handles_survive_without_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw_daemon(&dir.path().join("t.duckdb")).unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..100 {
+            let writer_side = db.clone();
+            tasks.push(tokio::spawn(async move {
+                writer_side
+                    .insert_reading("cpu", &i.to_string(), None, None, None, None)
+                    .await
+                    .unwrap();
+            }));
+            let reader_side = db.clone();
+            tasks.push(tokio::spawn(async move {
+                reader_side.latest_values().await.unwrap();
+                reader_side.history("cpu", None, None, None).await.unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        assert_eq!(
+            db.history("cpu", None, None, None).await.unwrap().len(),
+            100
+        );
     }
 
     /// Two attempts landing in the same millisecond (routine — every source
