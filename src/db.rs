@@ -16,18 +16,22 @@ use tokio::sync::{mpsc, oneshot};
 ///
 /// `DuckDB` takes an exclusive cross-process lock on the file and a read-only
 /// open racing a live write can see torn blocks (spec: data-storage —
-/// concurrent access safety). So every operation — daemon writes and
-/// direct-mode reads alike — takes an advisory flock on a sidecar lockfile
+/// concurrent access safety). So a one-shot caller (direct-mode CLI/TUI, a
+/// test) — every operation — takes an advisory flock on a sidecar lockfile
 /// for its duration, then opens its own short-lived `DuckDB` connection.
-/// `ponytail`: reopen per operation (~ms); move to a resident reader process
-/// only if this shows up in practice.
+/// `ponytail`: reopen per operation (~ms); fine for a one-shot process
+/// running a handful of queries.
 ///
-/// The daemon (spec: data-storage — single daemon writer) is the one
-/// exception: [`Db::open_rw_daemon`] starts a single writer task holding one
-/// persistent connection for every insert/purge, instead of each one
-/// reopening its own. It still takes the advisory lock per-operation, not
-/// for the connection's whole lifetime, so a direct-mode CLI/TUI read
-/// against the same file can still interleave between writes.
+/// The daemon (spec: data-storage — single daemon writer, resident reader
+/// connection) is the exception in both directions: [`Db::open_rw_daemon`]
+/// starts one writer task holding a persistent connection for every
+/// insert/purge, and one reader task holding a second persistent connection
+/// for every read — a page render across dozens of sources means dozens of
+/// reads, and reopening a connection per read is the cost that showed up in
+/// practice reopening-per-op was deferred on. Both tasks still take the
+/// advisory lock per-operation, not for the connection's whole lifetime, so
+/// a direct-mode CLI/TUI read against the same file can still interleave
+/// between either.
 ///
 /// The lock-acquire + connect retry loop is synchronous (`std::thread::sleep`
 /// between attempts) by design — every async caller runs it via
@@ -41,6 +45,10 @@ pub struct Db {
     /// its request here instead of taking the per-op `connect_async` path
     /// when this is `Some`.
     writer: Option<mpsc::UnboundedSender<WriteCmd>>,
+    /// Set only by [`Db::open_rw_daemon`]; every read method sends its
+    /// request here instead of taking the per-op `connect_async` path when
+    /// this is `Some` (spec: data-storage — resident reader connection).
+    reader: Option<mpsc::UnboundedSender<ReadCmd>>,
     /// `jsonl` threshold overrides for the current process only (spec:
     /// source-configuration — Threshold bands): written by ingest, read by
     /// health/renderers, forgotten when the handle is dropped. A fresh
@@ -234,6 +242,105 @@ impl WriteCmd {
     }
 }
 
+/// One read request sent to the daemon's single reader task (spec:
+/// data-storage — resident reader connection), mirroring [`WriteCmd`] for
+/// reads: each carries a reply channel so the caller still gets back the
+/// exact `Result<T>` a direct call would have returned. `limit` fields
+/// arrive already clamped — the clamping stays in the `Db` method (shared
+/// by both this path and the direct-mode fallback), not duplicated here.
+enum ReadCmd {
+    LastHealth {
+        source: String,
+        reply: oneshot::Sender<Result<Option<String>>>,
+    },
+    LatestValues {
+        reply: oneshot::Sender<Result<Vec<ReadingRow>>>,
+    },
+    History {
+        source: String,
+        from: Option<f64>,
+        to: Option<f64>,
+        limit: i64,
+        reply: oneshot::Sender<Result<Vec<ReadingRow>>>,
+    },
+    Logs {
+        source: Option<String>,
+        limit: i64,
+        reply: oneshot::Sender<Result<Vec<LogRow>>>,
+    },
+    LastSuccess {
+        source: String,
+        reply: oneshot::Sender<Result<Option<LogRow>>>,
+    },
+    LastAttempt {
+        source: String,
+        reply: oneshot::Sender<Result<Option<LogRow>>>,
+    },
+}
+
+impl ReadCmd {
+    /// Executes this command against the reader's persistent connection,
+    /// taking the advisory lock only for this one query — same rationale as
+    /// [`WriteCmd::run`], and the same underlying query as the direct-mode
+    /// fallback each `Db` method falls back to (the `query_*` free
+    /// functions below are shared by both paths).
+    fn run(self, db: &Db, conn: &Connection) {
+        match self {
+            ReadCmd::LastHealth { source, reply } => {
+                let _ = reply.send(db.with_lock(|| query_last_health(conn, &source)));
+            }
+            ReadCmd::LatestValues { reply } => {
+                let _ = reply.send(db.with_lock(|| query_latest_values(conn)));
+            }
+            ReadCmd::History {
+                source,
+                from,
+                to,
+                limit,
+                reply,
+            } => {
+                let _ =
+                    reply.send(db.with_lock(|| query_history(conn, &source, from, to, limit)));
+            }
+            ReadCmd::Logs {
+                source,
+                limit,
+                reply,
+            } => {
+                let _ =
+                    reply.send(db.with_lock(|| query_logs(conn, source.as_deref(), limit)));
+            }
+            ReadCmd::LastSuccess { source, reply } => {
+                let _ = reply.send(db.with_lock(|| query_last_success(conn, &source)));
+            }
+            ReadCmd::LastAttempt { source, reply } => {
+                let _ = reply.send(db.with_lock(|| query_last_attempt(conn, &source)));
+            }
+        }
+    }
+
+    /// Fails every queued command with `err` — used when the reader's
+    /// connection itself never opened, so a caller waiting on its reply
+    /// gets a clear error instead of hanging forever.
+    fn fail(self, err: &anyhow::Error) {
+        let msg = anyhow::anyhow!("db reader unavailable: {err:#}");
+        match self {
+            ReadCmd::LastHealth { reply, .. } => {
+                let _ = reply.send(Err(msg));
+            }
+            ReadCmd::LatestValues { reply } | ReadCmd::History { reply, .. } => {
+                let _ = reply.send(Err(msg));
+            }
+            ReadCmd::Logs { reply, .. } => {
+                let _ = reply.send(Err(msg));
+            }
+            ReadCmd::LastSuccess { reply, .. } | ReadCmd::LastAttempt { reply, .. } => {
+                let _ = reply.send(Err(msg));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadingRow {
     pub source: String,
@@ -400,17 +507,12 @@ fn create_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Starts the daemon's single writer task (spec: data-storage — single
-/// daemon writer): opens one `DuckDB` connection and keeps it for as long as
-/// any sender (i.e. any clone of the `Db` this came from) is still alive,
-/// executing each queued [`WriteCmd`] in turn. If the connection itself
-/// fails to open, every already- and later-queued command is failed with a
-/// clear error instead of hanging forever waiting on a reply.
-/// Opens a fresh writer connection. The open races the same "read-only open
-/// sees a torn write" hazard as any other operation, so it takes the
-/// advisory lock too — briefly, same as every write that follows. Shared by
-/// [`spawn_writer`]'s initial open and its post-panic reconnect.
-fn open_writer_conn(db: &Db) -> Result<Connection> {
+/// Opens a fresh persistent connection for the daemon's writer or reader
+/// task. The open races the same "read-only open sees a torn write" hazard
+/// as any other operation, so it takes the advisory lock too — briefly,
+/// same as every operation that follows. Shared by both tasks' initial open
+/// and their post-panic reconnect.
+fn open_daemon_conn(db: &Db) -> Result<Connection> {
     db.acquire().and_then(|guard| {
         let c = db.connect();
         drop(guard);
@@ -418,6 +520,12 @@ fn open_writer_conn(db: &Db) -> Result<Connection> {
     })
 }
 
+/// Starts the daemon's single writer task (spec: data-storage — single
+/// daemon writer): opens one `DuckDB` connection and keeps it for as long as
+/// any sender (i.e. any clone of the `Db` this came from) is still alive,
+/// executing each queued [`WriteCmd`] in turn. If the connection itself
+/// fails to open, every already- and later-queued command is failed with a
+/// clear error instead of hanging forever waiting on a reply.
 fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WriteCmd>();
     tokio::task::spawn_blocking(move || {
@@ -425,9 +533,10 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
             path,
             ro: false,
             writer: None,
+            reader: None,
             session_bands: SessionBands::default(),
         };
-        let mut conn = match open_writer_conn(&db) {
+        let mut conn = match open_daemon_conn(&db) {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!("db writer: failed to open connection: {e:#}");
@@ -458,7 +567,7 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
                 // reopen rather than risk every subsequent write silently
                 // failing against a wedged connection until the daemon
                 // restarts.
-                match open_writer_conn(&db) {
+                match open_daemon_conn(&db) {
                     Ok(fresh) => conn = fresh,
                     Err(e) => {
                         tracing::error!("db writer: failed to reopen after panic: {e:#}");
@@ -470,6 +579,214 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
     tx
 }
 
+/// Starts the daemon's single reader task (spec: data-storage — resident
+/// reader connection): opens one `DuckDB` connection and keeps it for as
+/// long as any sender is still alive, executing each queued [`ReadCmd`]
+/// against it — instead of every read reopening its own connection, which
+/// is cheap for a one-shot direct-mode process but dominates page-render
+/// latency for a daemon config with many sources (every panel's
+/// `health::compute` plus, for banded sources, its history bar each read
+/// separately). Mirrors [`spawn_writer`] in every other respect, including
+/// panic handling.
+fn spawn_reader(path: PathBuf) -> mpsc::UnboundedSender<ReadCmd> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<ReadCmd>();
+    tokio::task::spawn_blocking(move || {
+        let db = Db {
+            path,
+            ro: false,
+            writer: None,
+            reader: None,
+            session_bands: SessionBands::default(),
+        };
+        let mut conn = match open_daemon_conn(&db) {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!("db reader: failed to open connection: {e:#}");
+                while let Some(cmd) = rx.blocking_recv() {
+                    cmd.fail(&e);
+                }
+                return;
+            }
+        };
+        while let Some(cmd) = rx.blocking_recv() {
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.run(&db, &conn)))
+            {
+                tracing::error!(
+                    "db reader: read command panicked: {}",
+                    panic_message(&panic)
+                );
+                match open_daemon_conn(&db) {
+                    Ok(fresh) => conn = fresh,
+                    Err(e) => {
+                        tracing::error!("db reader: failed to reopen after panic: {e:#}");
+                    }
+                }
+            }
+        }
+    });
+    tx
+}
+
+/// Latest reading per source: highest `ts_epoch`, with `id` (a monotonic
+/// sequence, not `rowid`) as a tie-break for same-timestamp rows. Shared by
+/// [`Db::latest_values`]'s reader-task and direct-mode paths.
+fn query_latest_values(conn: &Connection) -> Result<Vec<ReadingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT source, value, unit, ts_epoch, ts FROM (
+            SELECT source, value, unit, ts_epoch, ts,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY source
+                       ORDER BY ts_epoch DESC, id DESC
+                   ) AS rn
+            FROM readings
+         ) sub
+         WHERE rn = 1
+         ORDER BY source",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ReadingRow {
+                source: r.get(0)?,
+                value: r.get(1)?,
+                unit: r.get(2)?,
+                ts_epoch: r.get(3)?,
+                ts: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Readings for `source` within `[from, to]`, newest `limit` rows, returned
+/// oldest first. Shared by [`Db::history`]'s reader-task and direct-mode
+/// paths; `limit` arrives already clamped.
+fn query_history(
+    conn: &Connection,
+    source: &str,
+    from: Option<f64>,
+    to: Option<f64>,
+    limit: i64,
+) -> Result<Vec<ReadingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT source, value, unit, ts_epoch, ts FROM (
+            SELECT source, value, unit, ts_epoch, ts, id AS ord FROM readings
+            WHERE source = ?
+              AND (?::DOUBLE IS NULL OR ts_epoch >= ?::DOUBLE)
+              AND (?::DOUBLE IS NULL OR ts_epoch <= ?::DOUBLE)
+            ORDER BY ts_epoch DESC, ord DESC
+            LIMIT ?
+         ) sub
+         ORDER BY ts_epoch, ord",
+    )?;
+    let rows = stmt
+        .query_map(params![source, from, from, to, to, limit], |r| {
+            Ok(ReadingRow {
+                source: r.get(0)?,
+                value: r.get(1)?,
+                unit: r.get(2)?,
+                ts_epoch: r.get(3)?,
+                ts: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Fetch logs for `source` (`None` for every source), newest first. Shared
+/// by [`Db::logs`]'s reader-task and direct-mode paths; `limit` arrives
+/// already clamped.
+fn query_logs(conn: &Connection, source: Option<&str>, limit: i64) -> Result<Vec<LogRow>> {
+    // `id DESC` breaks ties between attempts sharing the same millisecond
+    // `ts_epoch` — callers (e.g. the consecutive-failure count in
+    // `health::compute`) rely on this being true newest-first order, not an
+    // arbitrary tied order.
+    let mut stmt = conn.prepare(
+        "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
+         WHERE (?::VARCHAR IS NULL OR source = ?::VARCHAR)
+         ORDER BY ts_epoch DESC, id DESC LIMIT ?",
+    )?;
+    let rows = stmt
+        .query_map(params![source, source, limit], |r| {
+            Ok(LogRow {
+                source: r.get(0)?,
+                ts_epoch: r.get(1)?,
+                ts: r.get(2)?,
+                duration_ms: r.get(3)?,
+                error: r.get(4)?,
+                value: r.get(5)?,
+                unit: None,
+                origin: Origin::from_db(&r.get::<_, String>(6)?),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Most recent successful fetch log for `source`, if any (`error IS NULL`).
+/// Shared by [`Db::last_success`]'s reader-task and direct-mode paths.
+fn query_last_success(conn: &Connection, source: &str) -> Result<Option<LogRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
+         WHERE source = ? AND error IS NULL
+         ORDER BY ts_epoch DESC, id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![source])?;
+    Ok(rows
+        .next()?
+        .map(|r| {
+            Ok::<_, duckdb::Error>(LogRow {
+                source: r.get(0)?,
+                ts_epoch: r.get(1)?,
+                ts: r.get(2)?,
+                duration_ms: r.get(3)?,
+                error: r.get(4)?,
+                value: r.get(5)?,
+                unit: None,
+                origin: Origin::from_db(&r.get::<_, String>(6)?),
+            })
+        })
+        .transpose()?)
+}
+
+/// Most recent fetch log for `source` regardless of outcome, if any. Shared
+/// by [`Db::last_attempt`]'s reader-task and direct-mode paths.
+fn query_last_attempt(conn: &Connection, source: &str) -> Result<Option<LogRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
+         WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![source])?;
+    Ok(rows
+        .next()?
+        .map(|r| {
+            Ok::<_, duckdb::Error>(LogRow {
+                source: r.get(0)?,
+                ts_epoch: r.get(1)?,
+                ts: r.get(2)?,
+                duration_ms: r.get(3)?,
+                error: r.get(4)?,
+                value: r.get(5)?,
+                unit: None,
+                origin: Origin::from_db(&r.get::<_, String>(6)?),
+            })
+        })
+        .transpose()?)
+}
+
+/// Most recent health-event status for `source`, if any. Shared by
+/// [`Db::last_health`]'s reader-task and direct-mode paths.
+fn query_last_health(conn: &Connection, source: &str) -> Result<Option<String>> {
+    // `id DESC` breaks ties between events sharing the same millisecond
+    // `ts_epoch`; `ORDER BY ts_epoch DESC` alone picked an arbitrary tied
+    // row, not necessarily the actually-latest one.
+    let mut stmt = conn.prepare(
+        "SELECT status FROM health_events WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![source])?;
+    Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+}
+
 impl Db {
     /// Read-write handle; creates schema. Every insert/purge still reopens
     /// its own connection per call — fine for one-shot callers (`reset`,
@@ -479,6 +796,7 @@ impl Db {
             path: path.to_path_buf(),
             ro: false,
             writer: None,
+            reader: None,
             session_bands: SessionBands::default(),
         };
         db.with_conn(create_schema)?;
@@ -486,13 +804,16 @@ impl Db {
     }
 
     /// Read-write handle for the daemon (spec: data-storage — single daemon
-    /// writer): same as [`Db::open_rw`], but every insert/purge is instead
-    /// routed to one persistent-connection writer task, shared by every
-    /// clone of the returned handle (collector tasks, HTTP handlers, the
-    /// retention task). Must be called from within a Tokio runtime.
+    /// writer, resident reader connection): same as [`Db::open_rw`], but
+    /// every insert/purge is routed to one persistent-connection writer
+    /// task and every read to one persistent-connection reader task,
+    /// shared by every clone of the returned handle (collector tasks, HTTP
+    /// handlers, the retention task). Must be called from within a Tokio
+    /// runtime.
     pub fn open_rw_daemon(path: &Path) -> Result<Self> {
         let mut db = Self::open_rw(path)?;
         db.writer = Some(spawn_writer(db.path.clone()));
+        db.reader = Some(spawn_reader(db.path.clone()));
         Ok(db)
     }
 
@@ -502,6 +823,7 @@ impl Db {
             path: path.to_path_buf(),
             ro: true,
             writer: None,
+            reader: None,
             session_bands: SessionBands::default(),
         })
     }
@@ -767,15 +1089,18 @@ impl Db {
     }
 
     pub async fn last_health(&self, source: &str) -> Result<Option<String>> {
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::LastHealth {
+                    source: source.to_string(),
+                    reply,
+                })
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
+        }
         let (_guard, conn) = self.connect_async().await?;
-        // `id DESC` breaks ties between events sharing the same millisecond
-        // `ts_epoch`; `ORDER BY ts_epoch DESC` alone picked an arbitrary tied
-        // row, not necessarily the actually-latest one.
-        let mut stmt = conn.prepare(
-            "SELECT status FROM health_events WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![source])?;
-        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+        query_last_health(&conn, source)
     }
 
     pub async fn insert_health_event(&self, source: &str, status: &str) -> Result<()> {
@@ -810,31 +1135,15 @@ impl Db {
     /// for different sources routinely land in the same millisecond (e.g.
     /// every source fetched at daemon startup).
     pub async fn latest_values(&self) -> Result<Vec<ReadingRow>> {
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::LatestValues { reply })
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
+        }
         let (_guard, conn) = self.connect_async().await?;
-        let mut stmt = conn.prepare(
-            "SELECT source, value, unit, ts_epoch, ts FROM (
-                SELECT source, value, unit, ts_epoch, ts,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY source
-                           ORDER BY ts_epoch DESC, id DESC
-                       ) AS rn
-                FROM readings
-             ) sub
-             WHERE rn = 1
-             ORDER BY source",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(ReadingRow {
-                    source: r.get(0)?,
-                    value: r.get(1)?,
-                    unit: r.get(2)?,
-                    ts_epoch: r.get(3)?,
-                    ts: r.get(4)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        query_latest_values(&conn)
     }
 
     /// Readings for `source` within `[from, to]` (either bound optional),
@@ -850,59 +1159,38 @@ impl Db {
         let limit = limit
             .unwrap_or(DEFAULT_HISTORY_LIMIT)
             .clamp(1, MAX_HISTORY_LIMIT);
-        let (_guard, conn) = self.connect_async().await?;
-        let mut stmt = conn.prepare(
-            "SELECT source, value, unit, ts_epoch, ts FROM (
-                SELECT source, value, unit, ts_epoch, ts, id AS ord FROM readings
-                WHERE source = ?
-                  AND (?::DOUBLE IS NULL OR ts_epoch >= ?::DOUBLE)
-                  AND (?::DOUBLE IS NULL OR ts_epoch <= ?::DOUBLE)
-                ORDER BY ts_epoch DESC, ord DESC
-                LIMIT ?
-             ) sub
-             ORDER BY ts_epoch, ord",
-        )?;
-        let rows = stmt
-            .query_map(params![source, from, from, to, to, limit], |r| {
-                Ok(ReadingRow {
-                    source: r.get(0)?,
-                    value: r.get(1)?,
-                    unit: r.get(2)?,
-                    ts_epoch: r.get(3)?,
-                    ts: r.get(4)?,
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::History {
+                    source: source.to_string(),
+                    from,
+                    to,
+                    limit,
+                    reply,
                 })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
+        }
+        let (_guard, conn) = self.connect_async().await?;
+        query_history(&conn, source, from, to, limit)
     }
 
     pub async fn logs(&self, source: Option<&str>, limit: i64) -> Result<Vec<LogRow>> {
         let limit = limit.clamp(1, MAX_LOGS_LIMIT);
-        let (_guard, conn) = self.connect_async().await?;
-        // `id DESC` breaks ties between attempts sharing the same
-        // millisecond `ts_epoch` — callers (e.g. the consecutive-failure
-        // count in `health::compute`) rely on this being true newest-first
-        // order, not an arbitrary tied order.
-        let mut stmt = conn.prepare(
-            "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
-             WHERE (?::VARCHAR IS NULL OR source = ?::VARCHAR)
-             ORDER BY ts_epoch DESC, id DESC LIMIT ?",
-        )?;
-        let rows = stmt
-            .query_map(params![source, source, limit], |r| {
-                Ok(LogRow {
-                    source: r.get(0)?,
-                    ts_epoch: r.get(1)?,
-                    ts: r.get(2)?,
-                    duration_ms: r.get(3)?,
-                    error: r.get(4)?,
-                    value: r.get(5)?,
-                    unit: None,
-                    origin: Origin::from_db(&r.get::<_, String>(6)?),
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::Logs {
+                    source: source.map(str::to_string),
+                    limit,
+                    reply,
                 })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
+        }
+        let (_guard, conn) = self.connect_async().await?;
+        query_logs(&conn, source, limit)
     }
     /// Recent fetch logs for the given sources, newest first (spec: cli —
     /// Filter query output by source). The filter applies inside the query
@@ -931,28 +1219,18 @@ impl Db {
     /// attempts logged), so this filters on `error IS NULL` rather than a
     /// separately stored outcome flag.
     pub async fn last_success(&self, source: &str) -> Result<Option<LogRow>> {
-        let (_guard, conn) = self.connect_async().await?;
-        let mut stmt = conn.prepare(
-            "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
-             WHERE source = ? AND error IS NULL
-             ORDER BY ts_epoch DESC, id DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![source])?;
-        Ok(rows
-            .next()?
-            .map(|r| {
-                Ok::<_, duckdb::Error>(LogRow {
-                    source: r.get(0)?,
-                    ts_epoch: r.get(1)?,
-                    ts: r.get(2)?,
-                    duration_ms: r.get(3)?,
-                    error: r.get(4)?,
-                    value: r.get(5)?,
-                    unit: None,
-                    origin: Origin::from_db(&r.get::<_, String>(6)?),
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::LastSuccess {
+                    source: source.to_string(),
+                    reply,
                 })
-            })
-            .transpose()?)
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
+        }
+        let (_guard, conn) = self.connect_async().await?;
+        query_last_success(&conn, source)
     }
 
     /// Most recent fetch log for `source` regardless of outcome, if any
@@ -963,27 +1241,18 @@ impl Db {
     /// `ts_epoch DESC, id DESC` ordering so same-millisecond ties resolve
     /// deterministically to the higher-id row.
     pub async fn last_attempt(&self, source: &str) -> Result<Option<LogRow>> {
-        let (_guard, conn) = self.connect_async().await?;
-        let mut stmt = conn.prepare(
-            "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
-             WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![source])?;
-        Ok(rows
-            .next()?
-            .map(|r| {
-                Ok::<_, duckdb::Error>(LogRow {
-                    source: r.get(0)?,
-                    ts_epoch: r.get(1)?,
-                    ts: r.get(2)?,
-                    duration_ms: r.get(3)?,
-                    error: r.get(4)?,
-                    value: r.get(5)?,
-                    unit: None,
-                    origin: Origin::from_db(&r.get::<_, String>(6)?),
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::LastAttempt {
+                    source: source.to_string(),
+                    reply,
                 })
-            })
-            .transpose()?)
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
+        }
+        let (_guard, conn) = self.connect_async().await?;
+        query_last_attempt(&conn, source)
     }
 
     /// Deletes readings, fetch logs, and health events older than
@@ -1037,6 +1306,13 @@ mod tests {
             .await
             .unwrap();
 
+        // The daemon handle's own read (through its resident reader task,
+        // not a fresh connection) must see the write too, not just a
+        // separate direct-mode connection.
+        let own_read = writer.latest_values().await.unwrap();
+        assert_eq!(own_read.len(), 1);
+        assert_eq!(own_read[0].value, "42");
+
         let reader = Db::open_ro(&path).unwrap();
         let latest = reader.latest_values().await.unwrap();
         assert_eq!(
@@ -1045,6 +1321,40 @@ mod tests {
             "read-only reader should already see the write"
         );
         assert_eq!(latest[0].value, "42");
+    }
+
+    /// Every read method routed through the daemon's resident reader task
+    /// (spec: data-storage — resident reader connection) must return the
+    /// same data a direct-mode, per-op connection would — this is the
+    /// correctness check for `ReadCmd`/`spawn_reader`, exercising each
+    /// variant once against a `Db::open_rw_daemon` handle.
+    #[tokio::test]
+    async fn daemon_reader_task_serves_every_read_method_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw_daemon(&dir.path().join("t.duckdb")).unwrap();
+
+        db.insert_log("cpu", 5, None, Some("42"), Origin::Poll)
+            .await
+            .unwrap();
+        db.insert_reading("cpu", "42", None, None, None, None)
+            .await
+            .unwrap();
+        db.insert_health_event("cpu", "healthy").await.unwrap();
+        db.insert_log("cpu", 3, Some("boom"), None, Origin::Poll)
+            .await
+            .unwrap();
+
+        assert_eq!(db.last_health("cpu").await.unwrap().as_deref(), Some("healthy"));
+        assert_eq!(db.latest_values().await.unwrap().len(), 1);
+        assert_eq!(
+            db.history("cpu", None, None, None).await.unwrap().len(),
+            1
+        );
+        assert_eq!(db.logs(Some("cpu"), 10).await.unwrap().len(), 2);
+        let success = db.last_success("cpu").await.unwrap().unwrap();
+        assert_eq!(success.value.as_deref(), Some("42"));
+        let attempt = db.last_attempt("cpu").await.unwrap().unwrap();
+        assert_eq!(attempt.error.as_deref(), Some("boom"));
     }
 
     /// Two attempts landing in the same millisecond (routine — every source
