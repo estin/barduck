@@ -18,56 +18,67 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How often the TUI re-reads data.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long each keyboard poll waits before the loop comes back around: the
+/// upper bound on how long a keypress, a completed refresh, or a resize can
+/// sit unnoticed. Independent of [`REFRESH_INTERVAL`], which is measured
+/// against the wall clock — the two used to be the same knob (refresh "every
+/// 8th poll"), so a burst of keypresses, each cutting a poll short, silently
+/// sped refreshes up.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Renders config-declared layouts as panels (spec: tui). Refreshes
 /// periodically; shows an error banner instead of crashing when the data
 /// path is unavailable (spec: tui — graceful degradation).
 pub fn run(backend: &Backend, cfg: &Config) -> Result<()> {
-    let mut terminal = init()?;
-    let res = event_loop(&mut terminal, backend, cfg);
-    restore(&mut terminal)?;
-    res
+    let mut terminal = TerminalGuard::enter()?;
+    event_loop(&mut terminal, backend, cfg)
 }
 
-fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    backend: &Backend,
-    cfg: &Config,
-) -> Result<()> {
+fn event_loop(terminal: &mut TerminalGuard, backend: &Backend, cfg: &Config) -> Result<()> {
     let mut state = UiState {
         error: None,
         rows: Vec::new(),
-        tick: 0,
     };
-    // Fetches run on a detached thread so a slow daemon/DB round trip never
-    // blocks the keyboard poll below — otherwise `q` has to wait for the
-    // in-flight fetch to finish before it's even read.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut refresh_in_flight = false;
+    let mut refresher = Refresher::start(backend.clone(), cfg.clone());
+    // Due immediately, so the first frame isn't an empty dashboard.
+    let mut next_refresh = Instant::now();
     loop {
-        if crossterm::event::poll(Duration::from_millis(250))?
-            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
-            && matches!(key.kind, crossterm::event::KeyEventKind::Press)
-            && matches!(
-                key.code,
-                crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
-            )
-        {
-            return Ok(());
+        if refresher.is_idle() && Instant::now() >= next_refresh {
+            if !refresher.request() {
+                state.error = Some("refresh worker stopped".into());
+            }
+            next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
-        // Refresh data every ~2 seconds.
-        state.tick += 1;
-        if !refresh_in_flight && state.tick % 8 == 1 {
-            refresh_in_flight = true;
-            spawn_refresh(backend.clone(), cfg.clone(), tx.clone());
-        }
-        if let Ok(outcome) = rx.try_recv() {
-            refresh_in_flight = false;
+        if let Some(outcome) = refresher.take_latest() {
             apply_outcome(cfg, outcome, &mut state);
         }
         terminal.draw(|f| draw(f, &state, &cfg.tui_width))?;
+        if crossterm::event::poll(POLL_INTERVAL)? && quit_requested(&crossterm::event::read()?) {
+            return Ok(());
+        }
     }
+}
+
+/// Whether `event` asks the TUI to exit: `q`, Esc, or Ctrl+C. Ctrl+C has to
+/// be handled here rather than left to a signal handler — raw mode is
+/// exactly the mode in which the terminal stops turning it into `SIGINT`, so
+/// without this the TUI cannot be interrupted the way every other terminal
+/// program can.
+fn quit_requested(event: &crossterm::event::Event) -> bool {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    let Event::Key(key) = event else {
+        return false;
+    };
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+    matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 struct Panel {
@@ -144,7 +155,6 @@ fn build_panel(
 struct UiState {
     error: Option<String>,
     rows: Vec<Vec<Slot>>,
-    tick: u32,
 }
 
 enum Outcome {
@@ -152,25 +162,95 @@ enum Outcome {
     Failed(String),
 }
 
-fn spawn_refresh(backend: Backend, cfg: Config, tx: std::sync::mpsc::Sender<Outcome>) {
-    std::thread::spawn(move || {
-        let fut = async {
-            match (backend.latest().await, backend.health(&cfg).await) {
-                (Ok(latest), Ok(healths)) => Outcome::Data(latest, healths),
-                (Err(e), _) | (_, Err(e)) => Outcome::Failed(format!("{e:#}")),
+/// The TUI's background refresh worker: one OS thread owning one Tokio
+/// runtime for the whole session, driven by a request channel.
+///
+/// Refreshes stay off the UI thread so a slow daemon/DB round trip never
+/// blocks the keyboard poll — otherwise `q` waits for the in-flight fetch
+/// before it is even read. What changed is the cost of that: each refresh
+/// used to spawn a fresh thread *and* build a fresh current-thread runtime,
+/// every two seconds, for as long as the TUI stayed open. Both are now
+/// created once.
+///
+/// The worker is deliberately not joined on exit. Dropping the request
+/// sender ends its loop, but a fetch already in flight can still be sitting
+/// on the daemon client's 10-second timeout, and quitting a TUI must be
+/// immediate.
+struct Refresher {
+    requests: std::sync::mpsc::Sender<()>,
+    outcomes: std::sync::mpsc::Receiver<Outcome>,
+    in_flight: bool,
+}
+
+impl Refresher {
+    fn start(backend: Backend, cfg: Config) -> Self {
+        let (requests, work) = std::sync::mpsc::channel::<()>();
+        let (results, outcomes) = std::sync::mpsc::channel::<Outcome>();
+        std::thread::spawn(move || {
+            // This thread runs outside any ambient Tokio context, so it owns
+            // a runtime rather than borrowing a `Handle`.
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = results.send(Outcome::Failed(format!("internal error: {e}")));
+                    return;
+                }
+            };
+            while work.recv().is_ok() {
+                if results.send(rt.block_on(fetch(&backend, &cfg))).is_err() {
+                    return; // the UI is gone
+                }
             }
-        };
-        // Dedicated single-thread runtime; this thread runs outside any
-        // ambient tokio context so `Handle::block_on` would be unsafe here.
-        let outcome = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt.block_on(fut),
-            Err(e) => Outcome::Failed(format!("internal error: {e}")),
-        };
-        let _ = tx.send(outcome);
-    });
+        });
+        Self {
+            requests,
+            outcomes,
+            in_flight: false,
+        }
+    }
+
+    /// Whether a refresh can be started — false while one is still running,
+    /// so a slow backend can never queue up a backlog of them.
+    fn is_idle(&self) -> bool {
+        !self.in_flight
+    }
+
+    /// Starts a refresh. False means the worker thread is gone (its runtime
+    /// failed to build), which the caller surfaces rather than retrying
+    /// silently forever.
+    fn request(&mut self) -> bool {
+        self.in_flight = self.requests.send(()).is_ok();
+        self.in_flight
+    }
+
+    /// The newest completed refresh, if any finished since the last call.
+    /// Drains rather than taking one per frame, so the UI always renders the
+    /// freshest result instead of working through a backlog of stale ones.
+    fn take_latest(&mut self) -> Option<Outcome> {
+        let mut latest = None;
+        while let Ok(outcome) = self.outcomes.try_recv() {
+            self.in_flight = false;
+            latest = Some(outcome);
+        }
+        latest
+    }
+}
+
+/// One refresh: the dashboard's values and every source's health.
+///
+/// Sequential, not `join!`ed. In direct mode both sides take the database's
+/// advisory lock, so running them concurrently just makes one back off and
+/// sleep; and each is now a fixed two or three queries whatever the source
+/// count (see `health::compute_all`), which is what actually made refreshes
+/// cheap.
+async fn fetch(backend: &Backend, cfg: &Config) -> Outcome {
+    match (backend.latest().await, backend.health(cfg).await) {
+        (Ok(latest), Ok(healths)) => Outcome::Data(latest, healths),
+        (Err(e), _) | (_, Err(e)) => Outcome::Failed(format!("{e:#}")),
+    }
 }
 
 fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
@@ -579,31 +659,186 @@ fn color_style(color: Level) -> Style {
     }
 }
 
-fn init() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    crossterm::execute!(
-        stdout,
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
-    )?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+/// Owns the terminal's raw-mode and alternate-screen state for the TUI's
+/// lifetime, restoring both on drop.
+///
+/// A `Drop` impl rather than a `restore()` call at the end of `run`: the
+/// call is skipped when the stack unwinds, so any panic inside the render
+/// loop used to leave the user's shell in raw mode with no echo and no
+/// visible prompt — recoverable only by blindly typing `reset`. Drop runs on
+/// that path too.
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
 }
 
-fn restore(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
-    crossterm::execute!(
-        terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
-    crossterm::terminal::disable_raw_mode()?;
-    Ok(())
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        // No mouse capture: nothing here reads mouse events, and enabling it
+        // costs the user their terminal's own click-to-select and copy.
+        if let Err(e) = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(e.into());
+        }
+        match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(e) => {
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::LeaveAlternateScreen
+                );
+                let _ = crossterm::terminal::disable_raw_mode();
+                Err(e.into())
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for TerminalGuard {
+    type Target = Terminal<CrosstermBackend<std::io::Stdout>>;
+    fn deref(&self) -> &Self::Target {
+        &self.terminal
+    }
+}
+
+impl std::ops::DerefMut for TerminalGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.terminal
+    }
+}
+
+impl Drop for TerminalGuard {
+    /// Best-effort: nothing useful can be done if restoring the terminal
+    /// fails, and a `Drop` running during an unwind must not panic.
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            self.terminal.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = self.terminal.show_cursor();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    /// `q` and Esc quit, and so does Ctrl+C: raw mode stops the terminal
+    /// turning it into `SIGINT`, so without handling it here the TUI can't
+    /// be interrupted the way every other terminal program can (spec: tui).
+    #[test]
+    fn quit_keys_are_recognized() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        assert!(quit_requested(&key(KeyCode::Char('q'))));
+        assert!(quit_requested(&key(KeyCode::Esc)));
+        assert!(quit_requested(&Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        ))));
+
+        // Anything else keeps the TUI running.
+        assert!(!quit_requested(&key(KeyCode::Char('c'))));
+        assert!(!quit_requested(&key(KeyCode::Char('x'))));
+        assert!(!quit_requested(&key(KeyCode::Enter)));
+        assert!(!quit_requested(&Event::Resize(10, 10)));
+
+        // A key *release* must not quit — otherwise letting go of an
+        // unrelated key would exit on terminals that report both edges.
+        let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert!(!quit_requested(&Event::Key(release)));
+    }
+
+    fn wait_for_outcome(r: &mut Refresher) -> Outcome {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(outcome) = r.take_latest() {
+                return outcome;
+            }
+            assert!(Instant::now() < deadline, "refresh never completed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// One worker serves every refresh for the TUI's lifetime — the whole
+    /// point of the request channel, replacing a thread *and* a Tokio
+    /// runtime built per refresh. A worker that only handled the first
+    /// request would hang here on the second.
+    #[test]
+    fn refresher_serves_many_refreshes_from_one_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        drop(crate::db::Db::open_rw(&path).unwrap());
+        let cfg: Config =
+            toml::from_str(&format!("database_path = \"{}\"\n", path.display())).unwrap();
+        let backend = Backend::new(&cfg, false).unwrap();
+
+        let mut refresher = Refresher::start(backend, cfg);
+        assert!(refresher.is_idle(), "nothing running before the first request");
+        for round in 0..3 {
+            assert!(refresher.request(), "request {round} should dispatch");
+            assert!(
+                !refresher.is_idle(),
+                "a running refresh must block a second one"
+            );
+            assert!(
+                matches!(wait_for_outcome(&mut refresher), Outcome::Data(..)),
+                "refresh {round} should have returned data"
+            );
+            assert!(refresher.is_idle(), "finishing frees the worker again");
+        }
+    }
+
+    /// Several results queued between frames collapse to the newest, so a
+    /// slow UI renders current data instead of working through stale ones.
+    #[test]
+    fn take_latest_drains_to_the_newest_outcome() {
+        let (requests, _work) = std::sync::mpsc::channel();
+        let (results, outcomes) = std::sync::mpsc::channel();
+        let mut refresher = Refresher {
+            requests,
+            outcomes,
+            in_flight: true,
+        };
+        results.send(Outcome::Failed("stale".into())).unwrap();
+        results.send(Outcome::Data(Vec::new(), Vec::new())).unwrap();
+
+        assert!(matches!(
+            refresher.take_latest(),
+            Some(Outcome::Data(..))
+        ));
+        assert!(refresher.is_idle());
+        assert!(refresher.take_latest().is_none(), "queue is drained");
+    }
+
+    /// A worker that never started (its runtime failed to build) must be
+    /// reported, not retried silently forever.
+    #[test]
+    fn request_reports_a_dead_worker() {
+        let (requests, work) = std::sync::mpsc::channel();
+        drop(work);
+        let (_results, outcomes) = std::sync::mpsc::channel();
+        let mut refresher = Refresher {
+            requests,
+            outcomes,
+            in_flight: false,
+        };
+        assert!(!refresher.request());
+        assert!(
+            refresher.is_idle(),
+            "a failed dispatch must not leave the UI thinking a refresh is running"
+        );
+    }
 
     /// Renders one frame offscreen; fails if drawing panics or drops panels.
     #[test]
@@ -670,7 +905,6 @@ mod tests {
                     },
                 ],
             ],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -731,7 +965,6 @@ mod tests {
                 ],
                 text: None,
             }]],
-            tick: 0,
         };
         // Fixed, not "auto": the line now carries a plain "[stale]" label
         // alongside its age suffix, needing more than auto-sizing's
@@ -851,7 +1084,6 @@ mod tests {
                 ],
                 text: None,
             }]],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -925,7 +1157,6 @@ mod tests {
                 table: Vec::new(),
                 text: None,
             }]],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -998,7 +1229,6 @@ mod tests {
                 }],
                 text: None,
             }]],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1048,7 +1278,6 @@ mod tests {
                 table: Vec::new(),
                 text: Some("github.com".into()),
             }]],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1090,7 +1319,6 @@ mod tests {
                 table: Vec::new(),
                 text: Some("Just a note.".into()),
             }]],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1123,7 +1351,6 @@ mod tests {
                 table: Vec::new(),
                 text: Some("# Heading".into()),
             }]],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1159,7 +1386,6 @@ mod tests {
                 table: Vec::new(),
                 text: Some("first line\nsecond line\nthird line".into()),
             }]],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1209,7 +1435,6 @@ mod tests {
                 table: Vec::new(),
                 text: None,
             }]],
-            tick: 0,
         };
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1361,7 +1586,6 @@ mod tests {
         let mut state = UiState {
             error: None,
             rows: Vec::new(),
-            tick: 0,
         };
         apply_outcome(cfg, Outcome::Data(Vec::new(), Vec::new()), &mut state);
         state.rows.remove(0).remove(0)
@@ -1455,7 +1679,6 @@ mod tests {
         let mut visible_state = UiState {
             error: None,
             rows: Vec::new(),
-            tick: 0,
         };
         apply_outcome(
             &visible,
@@ -1465,7 +1688,6 @@ mod tests {
         let mut hidden_state = UiState {
             error: None,
             rows: Vec::new(),
-            tick: 0,
         };
         apply_outcome(
             &hidden,
