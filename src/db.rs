@@ -30,8 +30,15 @@ use tokio::sync::{mpsc, oneshot};
 /// reads, and reopening a connection per read is the cost that showed up in
 /// practice reopening-per-op was deferred on. Both tasks still take the
 /// advisory lock per-operation, not for the connection's whole lifetime, so
-/// a direct-mode CLI/TUI read against the same file can still interleave
-/// between either.
+/// two in-process callers still interleave between either.
+///
+/// Across processes, though, resident connections mean the daemon holds the
+/// file's `DuckDB` lock for its whole lifetime — so while it runs, another
+/// process cannot open the database at all, read-only included. The advisory
+/// lock does not change that: it serializes operations, it cannot make
+/// `DuckDB` release a lock. Direct-mode CLI/TUI callers therefore detect
+/// that case up front ([`Db::is_locked_by_another_process`]) and read
+/// through the daemon's HTTP API instead (spec: cli — dual modes).
 ///
 /// The lock-acquire + connect retry loop is synchronous (`std::thread::sleep`
 /// between attempts) by design — every async caller runs it via
@@ -292,7 +299,9 @@ enum ReadCmd {
         reply: oneshot::Sender<Result<Vec<ReadingRow>>>,
     },
     Logs {
-        source: Option<String>,
+        /// Empty means "every source" (spec: cli — Filter query output by
+        /// source); otherwise the filter is applied inside the query.
+        sources: Vec<String>,
         limit: i64,
         reply: oneshot::Sender<Result<Vec<LogRow>>>,
     },
@@ -304,6 +313,46 @@ enum ReadCmd {
         source: String,
         reply: oneshot::Sender<Result<Option<LogRow>>>,
     },
+    /// Both inputs [`crate::health::compute_all`] needs, in one round trip.
+    HealthInputs {
+        per_source: i64,
+        reply: oneshot::Sender<Result<HealthInputs>>,
+    },
+    /// Every source's recent readings for the dashboard's history bars, in
+    /// one round trip (see [`query_recent_readings_all`]).
+    RecentReadings {
+        per_source: i64,
+        reply: oneshot::Sender<Result<std::collections::HashMap<String, Vec<ReadingRow>>>>,
+    },
+}
+
+/// Everything [`crate::health::compute_all`] reads from the database: the
+/// newest successful attempt per source, and the newest `failure_threshold`
+/// attempts per source (spec: data-collection — Health status derived from
+/// fetch outcomes). Two queries total regardless of source count, replacing
+/// the two-per-source the per-source [`Db::last_success`]/[`Db::logs`] pair
+/// used to cost on every dashboard render.
+pub struct HealthInputs {
+    pub last_success: std::collections::HashMap<String, LogRow>,
+    /// Newest first within each source.
+    pub recent: std::collections::HashMap<String, Vec<LogRow>>,
+}
+
+impl HealthInputs {
+    fn read(conn: &Connection, per_source: i64) -> Result<Self> {
+        let mut recent: std::collections::HashMap<String, Vec<LogRow>> =
+            std::collections::HashMap::new();
+        for row in query_recent_logs_all(conn, per_source)? {
+            recent.entry(row.source.clone()).or_default().push(row);
+        }
+        Ok(Self {
+            last_success: query_last_success_all(conn)?
+                .into_iter()
+                .map(|r| (r.source.clone(), r))
+                .collect(),
+            recent,
+        })
+    }
 }
 
 impl ReadCmd {
@@ -331,18 +380,24 @@ impl ReadCmd {
                     reply.send(db.with_lock(|| query_history(conn, &source, from, to, limit)));
             }
             ReadCmd::Logs {
-                source,
+                sources,
                 limit,
                 reply,
             } => {
-                let _ =
-                    reply.send(db.with_lock(|| query_logs(conn, source.as_deref(), limit)));
+                let _ = reply.send(db.with_lock(|| query_logs(conn, &sources, limit)));
             }
             ReadCmd::LastSuccess { source, reply } => {
                 let _ = reply.send(db.with_lock(|| query_last_success(conn, &source)));
             }
             ReadCmd::LastAttempt { source, reply } => {
                 let _ = reply.send(db.with_lock(|| query_last_attempt(conn, &source)));
+            }
+            ReadCmd::HealthInputs { per_source, reply } => {
+                let _ = reply.send(db.with_lock(|| HealthInputs::read(conn, per_source)));
+            }
+            ReadCmd::RecentReadings { per_source, reply } => {
+                let _ =
+                    reply.send(db.with_lock(|| query_recent_readings_all(conn, per_source)));
             }
         }
     }
@@ -351,20 +406,21 @@ impl ReadCmd {
     /// connection itself never opened, so a caller waiting on its reply
     /// gets a clear error instead of hanging forever.
     fn fail(self, err: &anyhow::Error) {
-        let msg = anyhow::anyhow!("db reader unavailable: {err:#}");
+        // One arm per reply payload type: the arms are identical apart from
+        // the `oneshot::Sender<Result<T>>` each carries, so the error is
+        // built by a shared closure rather than restated in every arm.
+        let msg = || anyhow::anyhow!("db reader unavailable: {err:#}");
         match self {
-            ReadCmd::LastHealth { reply, .. } => {
-                let _ = reply.send(Err(msg));
-            }
+            ReadCmd::LastHealth { reply, .. } => drop(reply.send(Err(msg()))),
             ReadCmd::LatestValues { reply } | ReadCmd::History { reply, .. } => {
-                let _ = reply.send(Err(msg));
+                drop(reply.send(Err(msg())));
             }
-            ReadCmd::Logs { reply, .. } => {
-                let _ = reply.send(Err(msg));
-            }
+            ReadCmd::Logs { reply, .. } => drop(reply.send(Err(msg()))),
             ReadCmd::LastSuccess { reply, .. } | ReadCmd::LastAttempt { reply, .. } => {
-                let _ = reply.send(Err(msg));
+                drop(reply.send(Err(msg())));
             }
+            ReadCmd::HealthInputs { reply, .. } => drop(reply.send(Err(msg()))),
+            ReadCmd::RecentReadings { reply, .. } => drop(reply.send(Err(msg()))),
         }
     }
 }
@@ -705,6 +761,43 @@ fn query_latest_values(conn: &Connection) -> Result<Vec<ReadingRow>> {
     Ok(rows)
 }
 
+/// The newest `per_source` readings for *every* source, oldest first within
+/// each source — the batched form of [`query_history`] for the unbounded
+/// case. The web dashboard's history bars need exactly this for every banded
+/// panel, and one windowed query replaces one round trip per panel.
+fn query_recent_readings_all(
+    conn: &Connection,
+    per_source: i64,
+) -> Result<std::collections::HashMap<String, Vec<ReadingRow>>> {
+    let mut stmt = conn.prepare(
+        "SELECT source, value, unit, ts_epoch, ts FROM (
+            SELECT source, value, unit, ts_epoch, ts,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY source ORDER BY ts_epoch DESC, id DESC
+                   ) AS rn
+            FROM readings
+         ) sub
+         WHERE rn <= ?
+         ORDER BY source, rn DESC",
+    )?;
+    let mut out: std::collections::HashMap<String, Vec<ReadingRow>> =
+        std::collections::HashMap::new();
+    let rows = stmt.query_map(params![per_source], |r| {
+        Ok(ReadingRow {
+            source: r.get(0)?,
+            value: r.get(1)?,
+            unit: r.get(2)?,
+            ts_epoch: r.get(3)?,
+            ts: r.get(4)?,
+        })
+    })?;
+    for row in rows {
+        let row = row?;
+        out.entry(row.source.clone()).or_default().push(row);
+    }
+    Ok(out)
+}
+
 /// Readings for `source` within `[from, to]`, newest `limit` rows, returned
 /// oldest first. Shared by [`Db::history`]'s reader-task and direct-mode
 /// paths; `limit` arrives already clamped.
@@ -740,32 +833,60 @@ fn query_history(
     Ok(rows)
 }
 
-/// Fetch logs for `source` (`None` for every source), newest first. Shared
-/// by [`Db::logs`]'s reader-task and direct-mode paths; `limit` arrives
-/// already clamped.
-fn query_logs(conn: &Connection, source: Option<&str>, limit: i64) -> Result<Vec<LogRow>> {
+/// Column list every `fetch_logs` query selects, in the order [`log_row`]
+/// reads them back.
+const LOG_COLUMNS: &str =
+    "source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll')";
+
+fn log_row(r: &duckdb::Row<'_>) -> std::result::Result<LogRow, duckdb::Error> {
+    Ok(LogRow {
+        source: r.get(0)?,
+        ts_epoch: r.get(1)?,
+        ts: r.get(2)?,
+        duration_ms: r.get(3)?,
+        error: r.get(4)?,
+        value: r.get(5)?,
+        unit: None,
+        origin: Origin::from_db(&r.get::<_, String>(6)?),
+    })
+}
+
+/// Fetch logs for `sources` (empty for every source), newest first. Shared
+/// by [`Db::logs`]/[`Db::logs_for_sources`]'s reader-task and direct-mode
+/// paths; `limit` arrives already clamped.
+///
+/// The source filter and the limit are applied together in one statement
+/// rather than per-source-then-merged: merging in Rust had to re-sort on
+/// `ts_epoch` alone, which silently dropped the `id` tie-break below and
+/// returned same-millisecond rows in an arbitrary order.
+fn query_logs(conn: &Connection, sources: &[String], limit: i64) -> Result<Vec<LogRow>> {
     // `id DESC` breaks ties between attempts sharing the same millisecond
     // `ts_epoch` — callers (e.g. the consecutive-failure count in
     // `health::compute`) rely on this being true newest-first order, not an
     // arbitrary tied order.
-    let mut stmt = conn.prepare(
-        "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
-         WHERE (?::VARCHAR IS NULL OR source = ?::VARCHAR)
-         ORDER BY ts_epoch DESC, id DESC LIMIT ?",
-    )?;
+    let filter = if sources.is_empty() {
+        String::new()
+    } else {
+        // Placeholders only; the names themselves are still bound, never
+        // interpolated.
+        format!(
+            "WHERE source IN ({})",
+            std::iter::repeat_n("?", sources.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LOG_COLUMNS} FROM fetch_logs {filter}
+         ORDER BY ts_epoch DESC, id DESC LIMIT ?"
+    ))?;
+    let mut binds: Vec<duckdb::types::Value> = sources
+        .iter()
+        .map(|s| duckdb::types::Value::Text(s.clone()))
+        .collect();
+    binds.push(duckdb::types::Value::BigInt(limit));
     let rows = stmt
-        .query_map(params![source, source, limit], |r| {
-            Ok(LogRow {
-                source: r.get(0)?,
-                ts_epoch: r.get(1)?,
-                ts: r.get(2)?,
-                duration_ms: r.get(3)?,
-                error: r.get(4)?,
-                value: r.get(5)?,
-                unit: None,
-                origin: Origin::from_db(&r.get::<_, String>(6)?),
-            })
-        })?
+        .query_map(duckdb::params_from_iter(binds), log_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -773,52 +894,64 @@ fn query_logs(conn: &Connection, source: Option<&str>, limit: i64) -> Result<Vec
 /// Most recent successful fetch log for `source`, if any (`error IS NULL`).
 /// Shared by [`Db::last_success`]'s reader-task and direct-mode paths.
 fn query_last_success(conn: &Connection, source: &str) -> Result<Option<LogRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LOG_COLUMNS} FROM fetch_logs
          WHERE source = ? AND error IS NULL
-         ORDER BY ts_epoch DESC, id DESC LIMIT 1",
-    )?;
+         ORDER BY ts_epoch DESC, id DESC LIMIT 1"
+    ))?;
     let mut rows = stmt.query(params![source])?;
-    Ok(rows
-        .next()?
-        .map(|r| {
-            Ok::<_, duckdb::Error>(LogRow {
-                source: r.get(0)?,
-                ts_epoch: r.get(1)?,
-                ts: r.get(2)?,
-                duration_ms: r.get(3)?,
-                error: r.get(4)?,
-                value: r.get(5)?,
-                unit: None,
-                origin: Origin::from_db(&r.get::<_, String>(6)?),
-            })
-        })
-        .transpose()?)
+    Ok(rows.next()?.map(log_row).transpose()?)
+}
+
+/// The newest successful fetch log for *every* source, one row each — the
+/// batched form of [`query_last_success`] (spec: data-storage — resident
+/// reader connection): rendering a dashboard needs this for every panel, and
+/// one windowed query replaces one round trip per source.
+fn query_last_success_all(conn: &Connection) -> Result<Vec<LogRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LOG_COLUMNS} FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY source ORDER BY ts_epoch DESC, id DESC
+                   ) AS rn
+            FROM fetch_logs WHERE error IS NULL
+         ) sub
+         WHERE rn = 1"
+    ))?;
+    let rows = stmt
+        .query_map([], log_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The newest `per_source` fetch logs for every source, newest first within
+/// each source — the batched form of [`query_logs`] for a single source,
+/// used by [`crate::health::compute_all`] for its consecutive-failure count.
+fn query_recent_logs_all(conn: &Connection, per_source: i64) -> Result<Vec<LogRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LOG_COLUMNS} FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY source ORDER BY ts_epoch DESC, id DESC
+                   ) AS rn
+            FROM fetch_logs
+         ) sub
+         WHERE rn <= ?
+         ORDER BY source, rn"
+    ))?;
+    let rows = stmt
+        .query_map(params![per_source], log_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Most recent fetch log for `source` regardless of outcome, if any. Shared
 /// by [`Db::last_attempt`]'s reader-task and direct-mode paths.
 fn query_last_attempt(conn: &Connection, source: &str) -> Result<Option<LogRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT source, ts_epoch, ts, duration_ms, error, value, COALESCE(origin,'poll') FROM fetch_logs
-         WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LOG_COLUMNS} FROM fetch_logs
+         WHERE source = ? ORDER BY ts_epoch DESC, id DESC LIMIT 1"
+    ))?;
     let mut rows = stmt.query(params![source])?;
-    Ok(rows
-        .next()?
-        .map(|r| {
-            Ok::<_, duckdb::Error>(LogRow {
-                source: r.get(0)?,
-                ts_epoch: r.get(1)?,
-                ts: r.get(2)?,
-                duration_ms: r.get(3)?,
-                error: r.get(4)?,
-                value: r.get(5)?,
-                unit: None,
-                origin: Origin::from_db(&r.get::<_, String>(6)?),
-            })
-        })
-        .transpose()?)
+    Ok(rows.next()?.map(log_row).transpose()?)
 }
 
 /// Most recent health-event status for `source`, if any. Shared by
@@ -895,89 +1028,129 @@ impl Db {
         })
     }
 
+    /// Opens (creating as needed) the sidecar advisory lockfile. Shared by
+    /// the retrying and single-attempt acquire paths.
+    fn lock_file(&self) -> Result<(PathBuf, File)> {
+        std::fs::create_dir_all(self.path.parent().unwrap_or(Path::new(".")))?;
+        let lock_path = self.path.with_extension("duckdb.lock");
+        let file = File::create(&lock_path)
+            .with_context(|| format!("creating lockfile {}", lock_path.display()))?;
+        Ok((lock_path, file))
+    }
+
     /// Takes the advisory lock serializing all database access. Blocking —
     /// callers on an async runtime must go through [`Db::connect_async`]
     /// (`spawn_blocking`), never call this directly from an async fn.
     fn acquire(&self) -> Result<DbLock> {
         const ATTEMPTS: u32 = 50;
-        std::fs::create_dir_all(self.path.parent().unwrap_or(Path::new(".")))?;
-        let lock_path = self.path.with_extension("duckdb.lock");
-        let file = File::create(&lock_path)
-            .with_context(|| format!("creating lockfile {}", lock_path.display()))?;
-        for i in 0..ATTEMPTS {
+        let (lock_path, file) = self.lock_file()?;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
             match file.try_lock() {
                 Ok(()) => return Ok(DbLock(file)),
-                Err(e) if i + 1 < ATTEMPTS => {
-                    let _ = e;
-                    std::thread::sleep(Duration::from_millis(100));
-                }
                 Err(e) => {
-                    return Err(anyhow::Error::from(e))
-                        .context(format!("locking {}", lock_path.display()));
+                    last = Some(e);
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
         }
-        unreachable!()
+        Err(last.map_or_else(
+            || anyhow::anyhow!("locking {}", lock_path.display()),
+            |e| anyhow::Error::from(e).context(format!("locking {}", lock_path.display())),
+        ))
+    }
+
+    /// One immediate attempt at the advisory lock, no retry loop.
+    fn acquire_once(&self) -> Result<DbLock> {
+        let (lock_path, file) = self.lock_file()?;
+        file.try_lock()
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("locking {}", lock_path.display()))?;
+        Ok(DbLock(file))
+    }
+
+    /// One `DuckDB` open at this handle's access mode, with no retry. The
+    /// single place the read-only/read-write flag is applied, shared by the
+    /// retrying paths and [`Db::is_locked_by_another_process`].
+    fn open_connection(&self) -> Result<Connection> {
+        if self.ro {
+            let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+            Connection::open_with_flags(&self.path, cfg)
+        } else {
+            Connection::open(&self.path)
+        }
+        .context(format!("opening database {}", self.path.display()))
     }
 
     /// Opens a `DuckDB` connection, retrying on transient conflicts. Blocking
     /// — same caveat as [`Db::acquire`].
     fn connect(&self) -> Result<Connection> {
-        const ATTEMPTS: u32 = 50;
-        let mut last = None;
-        for i in 0..ATTEMPTS {
-            let res = if self.ro {
-                let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
-                Connection::open_with_flags(&self.path, cfg)
-            } else {
-                Connection::open(&self.path)
-            }
-            .context(format!("opening database {}", self.path.display()));
-            match res {
-                Ok(conn) => return Ok(conn),
-                Err(e) if is_lock_conflict(&e) => {
-                    last = Some(e);
-                    std::thread::sleep(Duration::from_millis(u64::from(100 + 10 * (i % 10))));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("could not open {}", self.path.display())))
+        self.retrying(|_| Ok(()), |(), conn| conn)
     }
 
     /// Blocking retry loop combining [`Db::acquire`] and [`Db::connect`],
     /// run entirely on a `spawn_blocking` thread by [`Db::connect_async`] so
     /// none of its sleeps ever park a Tokio worker.
     fn acquire_and_connect(&self) -> Result<(DbLock, Connection)> {
+        self.retrying(Db::acquire, |guard, conn| (guard, conn))
+    }
+
+    /// Shared retry loop: take `prelude` (the advisory lock, or nothing),
+    /// then open a connection, backing off and retrying while the failure is
+    /// a transient lock conflict. Any lock taken is released before each
+    /// sleep, so a competing process can make progress.
+    fn retrying<P, T>(
+        &self,
+        prelude: impl Fn(&Self) -> Result<P>,
+        combine: impl Fn(P, Connection) -> T,
+    ) -> Result<T> {
         const ATTEMPTS: u32 = 50;
         let mut last = None;
         for i in 0..ATTEMPTS {
-            let guard = match self.acquire() {
-                Ok(g) => g,
+            let held = match prelude(self) {
+                Ok(p) => p,
                 Err(e) => {
                     last = Some(e);
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
             };
-            let res = if self.ro {
-                let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
-                Connection::open_with_flags(&self.path, cfg)
-            } else {
-                Connection::open(&self.path)
-            }
-            .context(format!("opening database {}", self.path.display()));
-            match res {
-                Ok(conn) => return Ok((guard, conn)),
+            match self.open_connection() {
+                Ok(conn) => return Ok(combine(held, conn)),
                 Err(e) if is_lock_conflict(&e) => {
                     last = Some(e);
-                    drop(guard);
+                    drop(held);
                     std::thread::sleep(Duration::from_millis(u64::from(100 + 10 * (i % 10))));
                 }
                 Err(e) => return Err(e),
             }
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("could not open {}", self.path.display())))
+    }
+
+    /// Whether a `DuckDB` file lock held by *another process* currently
+    /// blocks this handle from opening the database.
+    ///
+    /// A running daemon holds its connection — and so the file lock — for
+    /// its whole lifetime (spec: data-storage — single daemon writer,
+    /// resident reader connection), which no amount of waiting clears. So
+    /// this is deliberately a single immediate attempt, unlike
+    /// [`Db::connect`]'s retry loop: it exists to let a direct-mode caller
+    /// decide *now* to go through the daemon's HTTP API instead (spec: cli —
+    /// dual modes), rather than spend seconds retrying an open that cannot
+    /// succeed.
+    ///
+    /// Failing to take the *advisory* lock is not reported as a conflict:
+    /// that means another short-lived process is mid-operation, which really
+    /// is transient and is what the retrying path is for.
+    #[must_use]
+    pub fn is_locked_by_another_process(&self) -> bool {
+        let Ok(_guard) = self.acquire_once() else {
+            return false;
+        };
+        self.open_connection()
+            .err()
+            .is_some_and(|e| is_lock_conflict(&e))
     }
 
     /// Acquires the lock and opens a connection without blocking the calling
@@ -1225,21 +1398,10 @@ impl Db {
     }
 
     pub async fn logs(&self, source: Option<&str>, limit: i64) -> Result<Vec<LogRow>> {
-        let limit = limit.clamp(1, MAX_LOGS_LIMIT);
-        if let Some(reader) = &self.reader {
-            let (reply, rx) = oneshot::channel();
-            reader
-                .send(ReadCmd::Logs {
-                    source: source.map(str::to_string),
-                    limit,
-                    reply,
-                })
-                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
-            return rx.await.context("db reader task dropped the reply")?;
-        }
-        let (_guard, conn) = self.connect_async().await?;
-        query_logs(&conn, source, limit)
+        let sources: Vec<String> = source.map(str::to_string).into_iter().collect();
+        self.logs_for_sources(&sources, limit).await
     }
+
     /// Recent fetch logs for the given sources, newest first (spec: cli —
     /// Filter query output by source). The filter applies inside the query
     /// so a quiet source's rows are not crowded out by the global limit the
@@ -1247,17 +1409,55 @@ impl Db {
     /// across all sources.
     pub async fn logs_for_sources(&self, sources: &[String], limit: i64) -> Result<Vec<LogRow>> {
         let limit = limit.clamp(1, MAX_LOGS_LIMIT);
-        if sources.is_empty() {
-            return self.logs(None, limit).await;
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::Logs {
+                    sources: sources.to_vec(),
+                    limit,
+                    reply,
+                })
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
         }
-        let mut out = Vec::new();
-        for s in sources {
-            out.extend(self.logs(Some(s), limit).await?);
+        let (_guard, conn) = self.connect_async().await?;
+        query_logs(&conn, sources, limit)
+    }
+
+    /// Both per-source inputs [`crate::health::compute_all`] needs, in one
+    /// round trip and two queries total — regardless of how many sources the
+    /// config declares (spec: data-storage — resident reader connection).
+    pub async fn health_inputs(&self, per_source: i64) -> Result<HealthInputs> {
+        let per_source = per_source.clamp(1, MAX_LOGS_LIMIT);
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::HealthInputs { per_source, reply })
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
         }
-        out.sort_by(|a, b| b.ts_epoch.total_cmp(&a.ts_epoch));
-        #[allow(clippy::cast_sign_loss)] // clamped to >= 1 above
-        out.truncate(limit as usize);
-        Ok(out)
+        let (_guard, conn) = self.connect_async().await?;
+        HealthInputs::read(&conn, per_source)
+    }
+
+    /// The newest `per_source` readings for every source, oldest first
+    /// within each source — the whole-dashboard form of [`Db::history`],
+    /// keyed by source name. Callers wanting fewer points than
+    /// `per_source` for a particular source take that source's tail.
+    pub async fn recent_readings(
+        &self,
+        per_source: i64,
+    ) -> Result<std::collections::HashMap<String, Vec<ReadingRow>>> {
+        let per_source = per_source.clamp(1, MAX_HISTORY_LIMIT);
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::RecentReadings { per_source, reply })
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
+        }
+        let (_guard, conn) = self.connect_async().await?;
+        query_recent_readings_all(&conn, per_source)
     }
 
     /// Most recent fetch log for `source`, if any (spec: data-collection —
@@ -1511,6 +1711,112 @@ mod tests {
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].value.as_deref(), Some("q"));
+    }
+
+    /// Lock detection must report a conflict only for an actual competing
+    /// `DuckDB` lock. Anything else — no daemon running, or no database file
+    /// at all — has to stay `false`, or a direct-mode caller would silently
+    /// reroute through the daemon's HTTP API and report "cannot connect to
+    /// the daemon" in place of the real problem (spec: cli — dual modes).
+    #[test]
+    fn lock_detection_is_false_without_a_competing_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+
+        // No database file yet: not a lock conflict, so the caller stays
+        // direct and gets the genuine "cannot open" error.
+        assert!(!Db::open_ro(&path).unwrap().is_locked_by_another_process());
+
+        // An existing database nobody holds: readable directly.
+        drop(Db::open_rw(&path).unwrap());
+        assert!(!Db::open_ro(&path).unwrap().is_locked_by_another_process());
+        assert!(!Db::open_rw(&path).unwrap().is_locked_by_another_process());
+    }
+
+    /// The batched readings query must agree with per-source `history` for
+    /// every source — same rows, same oldest-first order, same per-source
+    /// cap — since the web dashboard renders every history bar from it
+    /// (spec: web-ui — panel retrospective history bar).
+    #[tokio::test]
+    async fn recent_readings_matches_per_source_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        for i in 0..5 {
+            db.insert_reading("a", &i.to_string(), None, None, None, None)
+                .await
+                .unwrap();
+        }
+        for i in 0..2 {
+            db.insert_reading("b", &format!("b{i}"), None, None, None, None)
+                .await
+                .unwrap();
+        }
+
+        let batched = db.recent_readings(3).await.unwrap();
+        let values = |name: &str| -> Vec<String> {
+            batched
+                .get(name)
+                .map(|rows| rows.iter().map(|r| r.value.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            values("a"),
+            vec!["2", "3", "4"],
+            "newest 3, oldest first — the order a bar renders in"
+        );
+        assert_eq!(values("b"), vec!["b0", "b1"], "fewer rows than the cap");
+        assert!(!batched.contains_key("missing"));
+
+        for source in ["a", "b"] {
+            let per_source: Vec<String> = db
+                .history(source, None, None, Some(3))
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.value.clone())
+                .collect();
+            assert_eq!(values(source), per_source, "mismatch for `{source}`");
+        }
+    }
+
+    /// Filtering across several sources must keep the same deterministic
+    /// `ts_epoch DESC, id DESC` order a single-source query gives. Merging
+    /// per-source result sets in Rust could only re-sort on `ts_epoch`,
+    /// leaving same-millisecond rows (routine — every source fires at daemon
+    /// startup) in an arbitrary order.
+    #[tokio::test]
+    async fn logs_for_sources_keeps_the_id_tie_break_across_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.with_conn(|conn| {
+            // Three rows sharing one `ts_epoch`, inserted a/b/a so neither
+            // per-source grouping nor insertion-by-source can fake the
+            // expected order.
+            conn.execute_batch(
+                "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'a', 1000.0, 't', 1, NULL, 'first');
+                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'b', 1000.0, 't', 1, NULL, 'second');
+                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'a', 1000.0, 't', 1, NULL, 'third');
+                 INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value)
+                 VALUES (nextval('fetch_logs_id_seq'), 'c', 1000.0, 't', 1, NULL, 'ignored');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let rows = db
+            .logs_for_sources(&["a".to_string(), "b".to_string()], 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.value.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["third", "second", "first"],
+            "highest id first, and only the requested sources"
+        );
     }
 
     /// A negative or absurdly large requested `limit` (`GET

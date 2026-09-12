@@ -2,7 +2,7 @@
 //! format shared by a `Cell::Text` panel and `SourceCfg::format`.
 
 use super::GroupItem;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 
@@ -65,7 +65,7 @@ pub enum Cell {
         id: String,
         title: Option<String>,
         #[serde(default)]
-        style: Option<HashMap<String, String>>,
+        style: Option<BTreeMap<String, String>>,
     },
     Space {
         kind: String,
@@ -76,7 +76,7 @@ pub enum Cell {
         title: Option<String>,
         format: Option<String>,
         text: String,
-        style: Option<HashMap<String, String>>,
+        style: Option<BTreeMap<String, String>>,
     },
     Group {
         #[serde(default)]
@@ -87,7 +87,7 @@ pub enum Cell {
         #[serde(default)]
         table: Vec<GroupItem>,
         #[serde(default)]
-        style: Option<HashMap<String, String>>,
+        style: Option<BTreeMap<String, String>>,
     },
 }
 
@@ -138,7 +138,7 @@ impl Cell {
 pub struct LayoutCfg {
     pub title: String,
     #[serde(default)]
-    pub style: Option<HashMap<String, String>>,
+    pub style: Option<BTreeMap<String, String>>,
     pub rows: Vec<Vec<Cell>>,
 }
 

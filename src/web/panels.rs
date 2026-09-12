@@ -1,7 +1,7 @@
 //! Panel data model and the live panel-grid shard (spec: web-ui — current
 //! values without manual reload; group panes; panel retrospective history
 //! bar; source summary strip).
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use super::markdown::formatted_content;
 use crate::{
     AppState,
@@ -168,7 +168,7 @@ struct Slot {
     secondary: Vec<Panel>,
     table: Vec<Panel>,
     text: Option<TextPanel>,
-    style: Option<HashMap<String, String>>,
+    style: Option<BTreeMap<String, String>>,
 }
 
 impl Slot {
@@ -263,7 +263,13 @@ fn css_property_name(key: &str) -> String {
 /// Convert an optional style override map to a CSS inline string. Each
 /// key-value pair becomes `key: value;`, converting the config's
 /// `snake_case` keys to hyphenated CSS property names.
-fn style_override_to_css(style: Option<&HashMap<String, String>>) -> String {
+///
+/// Ordered (`BTreeMap`, not `HashMap`) so the same config always renders the
+/// same `style` attribute: a hash map's iteration order varies per process,
+/// which made otherwise-identical renders differ byte for byte and, where
+/// two overrides set the same longhand/shorthand pair, could flip which one
+/// actually won.
+fn style_override_to_css(style: Option<&BTreeMap<String, String>>) -> String {
     match style {
         Some(map) => map
             .iter()
@@ -288,22 +294,103 @@ fn style_string(base: &str, extra: &str) -> String {
 
 struct Grid {
     title: String,
-    style: Option<HashMap<String, String>>,
+    style: Option<BTreeMap<String, String>>,
     columns: usize,
     rows: Vec<Vec<Slot>>,
+}
+
+/// Everything one render pass reads, fetched once up front and shared across
+/// every panel it builds: latest value, health, and history-bar readings per
+/// source. All three are whole-set queries, so doing them per panel (as this
+/// used to) meant dozens of sequential round trips through the daemon's
+/// single reader task on every tick — now three, whatever the source count.
+struct RenderData {
+    latest: Vec<crate::db::ReadingRow>,
+    healths: Vec<health::SourceHealth>,
+    /// Recent readings per source, oldest first, capped at the largest
+    /// `history_points` any source asks for — each history bar takes the
+    /// tail it needs. Empty when no visible source renders a bar at all.
+    recent: BTreeMap<String, Vec<crate::db::ReadingRow>>,
+}
+
+impl RenderData {
+    /// Reads everything a whole render pass needs: three whole-set queries,
+    /// independent of how many sources or panels the config declares.
+    ///
+    /// Only a failed `latest_values` gives up on the page — without values
+    /// there is nothing to show. A health or history failure degrades that
+    /// part alone (every panel falls back to `stale`, bars render empty),
+    /// the same fallback each panel used to apply for itself.
+    async fn load(st: &AppState) -> Option<Self> {
+        let latest = st.db.latest_values().await.ok()?;
+        let healths = health::compute_all(&st.db, &st.cfg)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!("dashboard health: {e:#}");
+                Vec::new()
+            });
+        let recent = match max_history_points(st, &healths) {
+            Some(n) => st
+                .db
+                .recent_readings(i64::from(n))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            None => BTreeMap::new(),
+        };
+        Some(Self {
+            latest,
+            healths,
+            recent,
+        })
+    }
+
+    fn health_of(&self, name: &str) -> Option<&health::SourceHealth> {
+        self.healths.iter().find(|h| h.source == name)
+    }
+
+    /// The newest `n` readings for `name`, oldest first.
+    fn history_of(&self, name: &str, n: usize) -> &[crate::db::ReadingRow] {
+        let rows = self.recent.get(name).map_or(&[][..], Vec::as_slice);
+        &rows[rows.len().saturating_sub(n)..]
+    }
+}
+
+/// The largest `history_points` any bar-rendering source asks for — the
+/// single per-source cap [`RenderData::load`] fetches with, so one query
+/// serves every panel's bar. `None` when no source renders a bar at all, and
+/// the query is skipped entirely.
+///
+/// Bar eligibility is read off `healths`, not the declared config, so it
+/// matches `build_panel`'s own `show_bar` condition exactly: a `jsonl` row
+/// can introduce bands for a source that declared none (spec:
+/// source-configuration — Threshold bands), and that source's bar must still
+/// get its readings.
+fn max_history_points(st: &AppState, healths: &[health::SourceHealth]) -> Option<u32> {
+    st.cfg
+        .sources
+        .iter()
+        .filter(|s| s.show_history().unwrap_or(true))
+        .filter(|s| {
+            healths
+                .iter()
+                .any(|h| h.source == s.name() && !h.thresholds.is_empty())
+        })
+        .map(|s| s.history_points().unwrap_or(st.cfg.history_points))
+        .max()
 }
 
 /// Builds one panel's worth of value/status/threshold data for `name`. The
 /// label is `title_override` if given (an explicit cell/group-entry title),
 /// else the source's own declared `title`, else `name` itself.
 ///
-/// Async — like every other data-path method here, it goes through `Db`'s
-/// async API (`spawn_blocking`-backed), never the blocking sync path, so a
-/// slow lock/disk wait never parks the Tokio worker thread rendering this
-/// request.
-async fn build_panel(
+/// Purely in-memory: every database read for the whole render happened once
+/// in [`RenderData::load`], so building a panel can't park the Tokio worker
+/// thread rendering the request, however many panels the layout declares.
+fn build_panel(
     st: &AppState,
-    latest: &[crate::db::ReadingRow],
+    data: &RenderData,
     name: &str,
     title_override: Option<&str>,
 ) -> Panel {
@@ -311,13 +398,13 @@ async fn build_panel(
     let label = title_override
         .or_else(|| src.and_then(config::SourceCfg::display_title))
         .unwrap_or(name);
-    let row = latest.iter().find(|r| r.source == name);
-    let health = health::compute(&st.db, &st.cfg, name).await;
-    let status = health.as_ref().map_or(Health::Stale, |h| h.status);
+    let row = data.latest.iter().find(|r| r.source == name);
+    let health = data.health_of(name);
+    let status = health.map_or(Health::Stale, |h| h.status);
     // Effective bands (declared, or the latest `jsonl` override) ride on
     // the health payload so overrides color every surface without extra
     // plumbing (spec: source-configuration — JSONL row schema).
-    let bands: &[config::Threshold] = health.as_ref().map_or(&[], |h| &h.thresholds);
+    let bands: &[config::Threshold] = health.map_or(&[], |h| &h.thresholds);
     let level = match row {
         Some(r) => (!bands.is_empty())
             .then(|| config::level_for(bands, &r.value))
@@ -327,17 +414,13 @@ async fn build_panel(
     let show_bar = !bands.is_empty() && src.is_some_and(|s| s.show_history().unwrap_or(true));
     let history = match src.filter(|_| show_bar) {
         Some(s) => {
-            let n = s.history_points().unwrap_or(st.cfg.history_points);
-            let recent = st
-                .db
-                .history(name, None, None, Some(i64::from(n)))
-                .await
-                .unwrap_or_default();
+            let n = s.history_points().unwrap_or(st.cfg.history_points) as usize;
+            let recent = data.history_of(name, n);
             let mut segments: Vec<Option<Level>> = recent
                 .iter()
                 .map(|r| config::level_for(bands, &r.value))
                 .collect();
-            let mut padded = vec![None; (n as usize).saturating_sub(segments.len())];
+            let mut padded = vec![None; n.saturating_sub(segments.len())];
             padded.append(&mut segments);
             padded
         }
@@ -364,7 +447,7 @@ type CellParts = (
     Vec<Panel>,
     Option<String>,
     Option<TextPanel>,
-    Option<HashMap<String, String>>,
+    Option<BTreeMap<String, String>>,
 );
 
 /// Builds one cell's panel data, dispatching on its config variant. A source
@@ -372,11 +455,8 @@ type CellParts = (
 /// visibility) is simply omitted here, so the cell falls through to the same
 /// empty-grid-position rendering as an explicit `space` cell (spec: web-ui —
 /// hidden sources render as space in the web dashboard).
-async fn build_cell_parts(
-    st: &AppState,
-    latest: &[crate::db::ReadingRow],
-    cell: &config::Cell,
-) -> CellParts {
+fn build_cell_parts(st: &AppState, data: &RenderData, cell: &config::Cell) -> CellParts {
+    let panel = |item: &config::GroupItem| build_panel(st, data, item.id(), item.explicit_label());
     match cell {
         config::Cell::Group {
             title,
@@ -386,25 +466,23 @@ async fn build_cell_parts(
             style: group_style,
             ..
         } => {
-            let main = match main.as_ref().filter(|item| {
-                config::source_visible_in(&st.cfg, item.id(), config::View::Web)
-            }) {
-                Some(item) => Some(build_panel(st, latest, item.id(), item.explicit_label()).await),
-                None => None,
-            };
-            let mut secondary_panels = Vec::new();
-            for item in config::visible_items(&st.cfg, secondary, config::View::Web) {
-                secondary_panels.push(build_panel(st, latest, item.id(), item.explicit_label()).await);
-            }
-            let mut table_out = Vec::new();
-            for item in config::visible_items(&st.cfg, cell_table, config::View::Web) {
-                table_out.push(build_panel(st, latest, item.id(), item.explicit_label()).await);
-            }
+            let main = main
+                .as_ref()
+                .filter(|item| config::source_visible_in(&st.cfg, item.id(), config::View::Web))
+                .map(&panel);
+            let secondary_panels = config::visible_items(&st.cfg, secondary, config::View::Web)
+                .into_iter()
+                .map(&panel)
+                .collect();
+            let table_out = config::visible_items(&st.cfg, cell_table, config::View::Web)
+                .into_iter()
+                .map(&panel)
+                .collect();
             (main, secondary_panels, table_out, title.clone(), None, group_style.clone())
         }
         config::Cell::Source(name) => {
             let main = if config::source_visible_in(&st.cfg, name, config::View::Web) {
-                Some(build_panel(st, latest, name, None).await)
+                Some(build_panel(st, data, name, None))
             } else {
                 None
             };
@@ -412,7 +490,7 @@ async fn build_cell_parts(
         }
         config::Cell::Pane { id, title, style: pane_style } => {
             let main = if config::source_visible_in(&st.cfg, id, config::View::Web) {
-                Some(build_panel(st, latest, id, title.as_deref()).await)
+                Some(build_panel(st, data, id, title.as_deref()))
             } else {
                 None
             };
@@ -443,7 +521,7 @@ async fn build_cell_parts(
 }
 
 async fn collect_grids(st: &AppState) -> Vec<Grid> {
-    let Ok(latest) = st.db.latest_values().await else {
+    let Some(data) = RenderData::load(st).await else {
         return Vec::new();
     };
     let mut grids = Vec::new();
@@ -454,7 +532,7 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
             let mut col = 1;
             for cell in cells {
                 let (main, secondary, table_panels, group_title, text_panel, cell_style) =
-                    build_cell_parts(st, &latest, cell).await;
+                    build_cell_parts(st, &data, cell);
                 let span = cell.span();
                 slots.push(Slot {
                     span,
@@ -740,16 +818,35 @@ mod tests {
 
     #[test]
     fn style_override_to_css_converts_keys_and_terminates_each_declaration() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("font_family".to_string(), "monospace".to_string());
         let css = style_override_to_css(Some(&map));
         assert_eq!(css, "font-family: monospace;");
     }
 
+    /// Multiple overrides must render in one stable order every time — a
+    /// hash map's per-process iteration order made identical configs emit
+    /// different `style` attributes from one render to the next.
+    #[test]
+    fn style_override_to_css_orders_declarations_deterministically() {
+        let map: BTreeMap<String, String> = [
+            ("font_size", "14px"),
+            ("font_family", "monospace"),
+            ("color", "red"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(
+            style_override_to_css(Some(&map)),
+            "color: red; font-family: monospace; font-size: 14px;"
+        );
+    }
+
     #[test]
     fn style_override_to_css_empty_for_none_or_empty_map() {
         assert_eq!(style_override_to_css(None), "");
-        assert_eq!(style_override_to_css(Some(&HashMap::new())), "");
+        assert_eq!(style_override_to_css(Some(&BTreeMap::new())), "");
     }
 
     /// End-to-end: a config-authored override lands in the final `style`
@@ -759,7 +856,7 @@ mod tests {
     /// `font-family: monospace`.
     #[test]
     fn slot_style_combines_base_and_override_as_valid_css() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("font_family".to_string(), "monospace".to_string());
         let result = style_string(
             "grid-row: 1; grid-column: 3 / span 1",

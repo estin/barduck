@@ -48,18 +48,65 @@ pub struct SourceHealth {
 /// single most recent successful fetch (for staleness) — neither scans the
 /// source's full log history.
 pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth> {
-    let logs = db
+    let recent = db
         .logs(Some(source), i64::from(cfg.failure_threshold))
         .await?;
-    #[allow(clippy::cast_possible_truncation)] // counts are small
-    let failures = logs.iter().take_while(|l| l.error.is_some()).count() as u32;
-
     let last_success = db.last_success(source).await?;
-    let last_success_ts = last_success.as_ref().map(|l| l.ts.clone());
+    Ok(assemble(
+        db,
+        cfg,
+        source,
+        &recent,
+        last_success.as_ref(),
+        now_epoch()?,
+    ))
+}
 
-    let now = std::time::SystemTime::now()
+/// [`compute`] for every configured source at once (spec: data-collection —
+/// Health status derived from fetch outcomes). Two queries total instead of
+/// two *per source*: a dashboard render, `GET /api/health`, and the TUI's
+/// refresh all want the whole set, and the per-source form turned that into
+/// dozens of sequential round trips through the daemon's single reader task
+/// on every tick.
+pub async fn compute_all(db: &Db, cfg: &Config) -> Result<Vec<SourceHealth>> {
+    let inputs = db.health_inputs(i64::from(cfg.failure_threshold)).await?;
+    let now = now_epoch()?;
+    Ok(cfg
+        .sources
+        .iter()
+        .map(|s| {
+            let name = s.name();
+            assemble(
+                db,
+                cfg,
+                name,
+                inputs.recent.get(name).map_or(&[], Vec::as_slice),
+                inputs.last_success.get(name),
+                now,
+            )
+        })
+        .collect())
+}
+
+fn now_epoch() -> Result<f64> {
+    Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs_f64();
+        .as_secs_f64())
+}
+
+/// Derives one source's health from already-fetched inputs, so the
+/// per-source and batched entry points can't drift apart. `recent` is that
+/// source's newest `failure_threshold` attempts, newest first.
+fn assemble(
+    db: &Db,
+    cfg: &Config,
+    source: &str,
+    recent: &[crate::db::LogRow],
+    last_success: Option<&crate::db::LogRow>,
+    now: f64,
+) -> SourceHealth {
+    #[allow(clippy::cast_possible_truncation)] // bounded by failure_threshold
+    let failures = recent.iter().take_while(|l| l.error.is_some()).count() as u32;
     let last_ok_age = last_success.map_or(f64::INFINITY, |l| now - l.ts_epoch);
     let source_cfg = cfg.sources.iter().find(|s| s.name() == source);
 
@@ -79,13 +126,13 @@ pub async fn compute(db: &Db, cfg: &Config, source: &str) -> Result<SourceHealth
         .session_bands(source)
         .unwrap_or_else(|| declared.to_vec());
 
-    Ok(SourceHealth {
+    SourceHealth {
         source: source.to_string(),
         status,
         consecutive_failures: failures,
-        last_success_ts,
+        last_success_ts: last_success.map(|l| l.ts.clone()),
         thresholds,
-    })
+    }
 }
 
 /// Staleness derived from the source's own schedule, not a global window
@@ -210,6 +257,68 @@ mod tests {
     fn stream_value_within_expected_interval_is_not_stale() {
         let s = stream("ticks");
         assert!(!is_stale(30.0, Some(&s), Duration::from_mins(5)));
+    }
+
+    /// The batched form must agree with the per-source one for every
+    /// source, whatever its state — that equivalence is the only thing
+    /// keeping the two-query fast path honest (spec: data-collection —
+    /// Health status derived from fetch outcomes).
+    #[tokio::test]
+    async fn compute_all_agrees_with_per_source_compute() {
+        use crate::db::Origin;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg: Config = toml::from_str(
+            "failure_threshold = 2\n\
+             [[sources]]\nname = \"healthy\"\ntype = \"query\"\ncommand = \"echo 1\"\n\
+             [[sources]]\nname = \"failing\"\ntype = \"query\"\ncommand = \"echo 1\"\n\
+             [[sources]]\nname = \"recovered\"\ntype = \"query\"\ncommand = \"echo 1\"\n\
+             [[sources]]\nname = \"never-ran\"\ntype = \"query\"\ncommand = \"echo 1\"\n",
+        )
+        .unwrap();
+
+        db.insert_log("healthy", 1, None, Some("1"), Origin::Poll)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            db.insert_log("failing", 1, Some("boom"), None, Origin::Poll)
+                .await
+                .unwrap();
+        }
+        // A failure older than the newest success must not count: the batch
+        // has to preserve per-source newest-first ordering to see that.
+        db.insert_log("recovered", 1, Some("boom"), None, Origin::Poll)
+            .await
+            .unwrap();
+        db.insert_log("recovered", 1, None, Some("1"), Origin::Poll)
+            .await
+            .unwrap();
+
+        let batched = compute_all(&db, &cfg).await.unwrap();
+        assert_eq!(batched.len(), cfg.sources.len());
+        for (s, batch) in cfg.sources.iter().zip(&batched) {
+            let one = compute(&db, &cfg, s.name()).await.unwrap();
+            assert_eq!(batch.source, one.source);
+            assert_eq!(batch.status, one.status, "status for `{}`", s.name());
+            assert_eq!(
+                batch.consecutive_failures, one.consecutive_failures,
+                "failure count for `{}`",
+                s.name()
+            );
+            assert_eq!(batch.last_success_ts, one.last_success_ts);
+            assert_eq!(batch.thresholds, one.thresholds);
+        }
+        let status_of = |name: &str| {
+            batched
+                .iter()
+                .find(|h| h.source == name)
+                .map(|h| h.status)
+                .unwrap()
+        };
+        assert_eq!(status_of("healthy"), Health::Healthy);
+        assert_eq!(status_of("failing"), Health::Failing);
+        assert_eq!(status_of("recovered"), Health::Healthy);
+        assert_eq!(status_of("never-ran"), Health::Stale);
     }
 
     /// Session overrides flow into the computed health payload, so every

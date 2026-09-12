@@ -19,7 +19,15 @@ const SAFE_URL_SCHEMES: &[&str] = &["http", "https", "mailto"];
 /// [`SAFE_URL_SCHEMES`]. A scheme is `[a-zA-Z][a-zA-Z0-9+.-]*` followed by
 /// `:` (RFC 3986); the first character that's neither part of that alphabet
 /// nor `:` settles it either way.
+///
+/// The check runs against [`browser_normalized`] rather than the raw
+/// destination: `CommonMark` decodes character references inside a link
+/// destination, so `[x](&#9;javascript:alert(1))` and
+/// `[x](java&#9;script:alert(1))` both reach us as strings a naive scheme
+/// scan reads as *relative* (the tab isn't `:`) while the browser strips the
+/// tab and executes the scheme anyway.
 fn is_safe_url(url: &str) -> bool {
+    let url = browser_normalized(url);
     match url.find(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')) {
         Some(i) if url.as_bytes()[i] == b':' => {
             SAFE_URL_SCHEMES.contains(&url[..i].to_ascii_lowercase().as_str())
@@ -28,6 +36,17 @@ fn is_safe_url(url: &str) -> bool {
         // character at all): no scheme, so it's a relative reference.
         _ => true,
     }
+}
+
+/// A URL as the browser will actually see it when resolving the scheme: tab,
+/// LF, and CR are stripped from *anywhere* in the string, and leading C0
+/// controls/spaces are ignored (WHATWG URL parsing). Scheme checks must run
+/// on this form, never on the raw text.
+fn browser_normalized(url: &str) -> String {
+    url.chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .skip_while(|&c| c <= ' ')
+        .collect()
 }
 
 /// Rewrites a link/image `Start` event's destination to the empty string
@@ -194,6 +213,46 @@ mod tests {
             "file:///etc/passwd",
         ] {
             assert!(!is_safe_url(url), "expected unsafe: {url}");
+        }
+    }
+
+    /// Browsers strip tab/LF/CR from anywhere in a URL and skip leading
+    /// control characters, so a scheme check on the raw text is bypassable:
+    /// these all execute `javascript:` despite not *looking* like a scheme
+    /// to a left-to-right scan.
+    #[test]
+    fn is_safe_url_rejects_schemes_hidden_by_stripped_characters() {
+        for url in [
+            "\tjavascript:alert(1)",
+            "\njavascript:alert(1)",
+            "java\tscript:alert(1)",
+            "java\nscript:alert(1)",
+            " \u{1}javascript:alert(1)",
+            "\rdata:text/html,<script>alert(1)</script>",
+        ] {
+            assert!(!is_safe_url(url), "expected unsafe: {url:?}");
+        }
+    }
+
+    /// The same bypass reached through markdown's own character-reference
+    /// decoding, which is where an untrusted source's value actually enters.
+    #[test]
+    fn character_reference_hidden_scheme_is_neutralized() {
+        for md in [
+            "[x](&#9;javascript:alert&#40;1&#41;)",
+            "[x](java&#9;script:alert&#40;1&#41;)",
+            "![x](&#10;javascript:alert&#40;1&#41;)",
+        ] {
+            let html = render_markdown(md);
+            let flat: String = html
+                .to_lowercase()
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect();
+            assert!(
+                !flat.contains("javascript:"),
+                "javascript: survived for {md:?}: {html}"
+            );
         }
     }
 

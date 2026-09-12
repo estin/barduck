@@ -120,21 +120,50 @@ pub async fn history(cx: &Cx) -> Result<Response> {
 #[route(GET "/api/health")]
 pub async fn health_all(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
-    let mut out = Vec::new();
-    for s in &st.cfg.sources {
-        match health::compute(&st.db, &st.cfg, s.name()).await {
-            Ok(h) => out.push(h),
-            Err(e) => return Ok(internal_error("GET /api/health", &e)),
-        }
+    match health::compute_all(&st.db, &st.cfg).await {
+        Ok(out) => Ok(json_ok(&out)),
+        Err(e) => Ok(internal_error("GET /api/health", &e)),
     }
-    Ok(json_ok(&out))
 }
 
-#[derive(Debug, Deserialize)]
+/// `GET /api/logs`'s query string (spec: cli — Filter query output by
+/// source; http-api — bounded queries).
+///
+/// Parsed from raw key/value pairs rather than deserialized into a struct
+/// with a `Vec<String>` field: `serde_urlencoded` has no notion of a
+/// repeated key, so `?source=a` (let alone `?source=a&source=b`) failed the
+/// whole request with `invalid type: string ..., expected a sequence` —
+/// making the source filter unusable over HTTP, and with it `barduck logs
+/// --daemon --source`, which builds exactly that URL.
+#[derive(Debug, Default)]
 struct LogsQuery {
     limit: Option<i64>,
-    #[serde(default)]
     source: Vec<String>,
+}
+
+impl LogsQuery {
+    fn parse(query: &str) -> std::result::Result<Self, String> {
+        let pairs: Vec<(String, String)> =
+            serde_urlencoded::from_str(query).map_err(|e| format!("invalid query: {e}"))?;
+        let mut out = Self::default();
+        for (key, value) in pairs {
+            match key.as_str() {
+                // Repeated `limit` keeps the last, matching how a struct
+                // field would have resolved it.
+                "limit" => {
+                    out.limit = Some(
+                        value
+                            .parse()
+                            .map_err(|e| format!("invalid `limit` `{value}`: {e}"))?,
+                    );
+                }
+                "source" => out.source.push(value),
+                // Unknown parameters stay ignored, as before.
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,8 +201,8 @@ pub async fn set_theme(cx: &Cx, Json(body): Json<ThemeBody>) -> Result<Response>
 #[route(GET "/api/logs")]
 pub async fn logs(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
-    let q: LogsQuery = serde_urlencoded::from_str(uri(cx).query().unwrap_or(""))
-        .map_err(|e| topcoat::Error::from(bad_request(format!("invalid query: {e}"))))?;
+    let q = LogsQuery::parse(uri(cx).query().unwrap_or(""))
+        .map_err(|e| topcoat::Error::from(bad_request(e)))?;
     match st
         .db
         .logs_for_sources(&q.source, q.limit.unwrap_or(50))
@@ -366,5 +395,36 @@ mod tests {
     fn epoch_to_ts_rejects_non_finite() {
         assert!(epoch_to_ts(f64::NAN, "s").is_err());
         assert!(epoch_to_ts(f64::INFINITY, "s").is_err());
+    }
+
+    /// A repeated `source` key is how both the HTTP API and `barduck logs
+    /// --daemon --source` express a multi-source filter; deserializing the
+    /// query into a struct rejected even a single occurrence (spec: cli —
+    /// Filter query output by source).
+    #[test]
+    fn logs_query_accepts_repeated_source_keys() {
+        let q = LogsQuery::parse("limit=3&source=disk-root").unwrap();
+        assert_eq!(q.limit, Some(3));
+        assert_eq!(q.source, vec!["disk-root".to_string()]);
+
+        let q = LogsQuery::parse("source=a&limit=5&source=b").unwrap();
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.source, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn logs_query_defaults_and_ignores_unknown_parameters() {
+        let q = LogsQuery::parse("").unwrap();
+        assert_eq!(q.limit, None);
+        assert!(q.source.is_empty());
+
+        let q = LogsQuery::parse("unknown=1&source=a").unwrap();
+        assert_eq!(q.source, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn logs_query_rejects_an_unparseable_limit() {
+        let err = LogsQuery::parse("limit=many").unwrap_err();
+        assert!(err.contains("limit"), "error should name the field: {err}");
     }
 }

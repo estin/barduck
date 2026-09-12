@@ -24,18 +24,40 @@ pub enum Backend {
 const DAEMON_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Backend {
+    /// Picks the read path for a CLI/TUI invocation (spec: cli — dual
+    /// modes). `use_daemon` forces the HTTP API; otherwise this reads the
+    /// database file directly — *unless* a running daemon already holds the
+    /// file's `DuckDB` lock, in which case it transparently uses the daemon's
+    /// API instead.
+    ///
+    /// That fallback is what makes "direct mode while the daemon may be
+    /// running" actually work. `DuckDB` allows only one process to hold a
+    /// database at a time, and the daemon keeps its connection open for its
+    /// whole lifetime (spec: data-storage — single daemon writer, resident
+    /// reader connection), so every direct-mode read while the daemon runs
+    /// otherwise failed outright with `Conflicting lock is held`. The
+    /// sidecar advisory lock doesn't help here: it serializes *operations*
+    /// between processes, but cannot make `DuckDB` hand over a lock the
+    /// daemon never lets go of.
     pub fn new(cfg: &Config, use_daemon: bool) -> Result<Self> {
-        if use_daemon {
-            Ok(Self::Daemon {
-                base: format!("http://{}", cfg.listen),
-                client: reqwest::Client::builder()
-                    .timeout(DAEMON_REQUEST_TIMEOUT)
-                    .build()
-                    .context("building HTTP client")?,
-            })
-        } else {
-            Ok(Self::Direct(Db::open_ro(&cfg.database_path)?))
+        if !use_daemon {
+            let db = Db::open_ro(&cfg.database_path)?;
+            if !db.is_locked_by_another_process() {
+                return Ok(Self::Direct(db));
+            }
+            tracing::debug!(
+                "{} is locked by another process (a running daemon?); \
+                 reading through the daemon API instead",
+                cfg.database_path.display()
+            );
         }
+        Ok(Self::Daemon {
+            base: format!("http://{}", cfg.listen),
+            client: reqwest::Client::builder()
+                .timeout(DAEMON_REQUEST_TIMEOUT)
+                .build()
+                .context("building HTTP client")?,
+        })
     }
 
     pub async fn latest(&self) -> Result<Vec<db::ReadingRow>> {
@@ -75,13 +97,7 @@ impl Backend {
 
     pub async fn health(&self, cfg: &Config) -> Result<Vec<health::SourceHealth>> {
         match self {
-            Backend::Direct(db) => {
-                let mut out = Vec::new();
-                for s in &cfg.sources {
-                    out.push(health::compute(db, cfg, s.name()).await?);
-                }
-                Ok(out)
-            }
+            Backend::Direct(db) => health::compute_all(db, cfg).await,
             Backend::Daemon { base, client } => get(client, &format!("{base}/api/health")).await,
         }
     }

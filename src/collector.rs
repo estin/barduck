@@ -282,18 +282,23 @@ async fn loop_source(
                     // success path (spec: data-collection — Ingested values
                     // reset interval schedules). `advance` is a no-op for
                     // cron, and stream sources never reach this loop, so
-                    // routing a reset to them is harmless. A dropped sender
-                    // (handler gone) fires once, then the loop re-arms on
-                    // the still-open receiver — shutdown still wins on the
-                    // next iteration since `changed` stays pending.
-                    () = async {
-                        if let Some(rx) = reset.as_mut() {
-                            rx.recv().await;
-                        } else {
-                            std::future::pending::<()>().await;
+                    // routing a reset to them is harmless. Once every sender
+                    // is gone (the HTTP handler's `AppState` dropped), the
+                    // receiver resolves to `None` *immediately and forever*
+                    // — so it is dropped here rather than re-armed, or this
+                    // branch would spin the select, re-advancing the
+                    // schedule without ever fetching again.
+                    reset_alive = async {
+                        match reset.as_mut() {
+                            Some(rx) => rx.recv().await.is_some(),
+                            None => std::future::pending().await,
                         }
                     } => {
-                        schedule.advance(false);
+                        if reset_alive {
+                            schedule.advance(false);
+                        } else {
+                            reset = None;
+                        }
                         continue;
                     }
                 }
@@ -1041,6 +1046,60 @@ mod tests {
         let logs = db.logs(Some("b"), 10).await.unwrap();
         assert_eq!(logs.len(), 1);
         assert!(logs[0].error.is_some());
+    }
+
+    /// Once every schedule-reset sender is gone (the HTTP handler's
+    /// `AppState` dropped at shutdown), the receiver resolves to `None`
+    /// immediately and forever. Re-arming on it spins the `select!` and
+    /// re-advances the schedule on every pass, so the source never fetches
+    /// again — the collector must drop the receiver instead and fall back to
+    /// its normal tick (spec: data-collection — Ingested values reset
+    /// interval schedules).
+    #[tokio::test]
+    async fn a_dropped_reset_sender_does_not_wedge_the_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let src: SourceCfg = toml::from_str(
+            "name = \"cpu\"\ntype = \"query\"\ncommand = \"echo 1\"\ninterval = \"300ms\"\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            sources: vec![src.clone()],
+            ..Config::default()
+        };
+        // A fresh attempt defers the first tick by the full interval, so the
+        // reset branch — ready at once — is the only thing the `select!` can
+        // pick on the first pass. That makes the wedge deterministic rather
+        // than a coin flip.
+        db.insert_log("cpu", 1, None, Some("seed"), Origin::Poll)
+            .await
+            .unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(tx); // every sender gone, exactly as at daemon shutdown
+        let (_keep_alive, shutdown) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(loop_source(
+            db.clone(),
+            src,
+            cfg,
+            Some(shutdown),
+            Some(rx),
+        ));
+
+        let stored = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !db.history("cpu", None, None, None).await.unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        task.abort();
+        assert!(
+            stored.is_ok(),
+            "the collector never fetched: a dead reset channel wedged its schedule"
+        );
     }
 
     /// A stream process whose stdout closes without the process itself

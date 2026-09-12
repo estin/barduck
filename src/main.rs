@@ -133,6 +133,15 @@ fn main() -> Result<()> {
             &mut std::io::stdout(),
         )),
         Cmd::Reset { yes, json } => {
+            // A running daemon holds the database's `DuckDB` lock for its
+            // whole lifetime, so the open below would spend seconds retrying
+            // and then fail with a raw lock error. Say what to do instead.
+            if Db::open_ro(&cfg.database_path)?.is_locked_by_another_process() {
+                anyhow::bail!(
+                    "{} is locked by another process — stop the running daemon before resetting",
+                    cfg.database_path.display()
+                );
+            }
             if !yes
                 && !confirm(&format!(
                     "This will permanently delete all data in {}.",

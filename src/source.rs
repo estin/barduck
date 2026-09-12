@@ -319,16 +319,26 @@ impl StreamProc {
 struct KillGroupOnDrop(Option<i32>);
 
 impl KillGroupOnDrop {
-    /// Fire-and-forget: the negative pid targets the whole process group
-    /// `process_group(0)` put the command in at spawn time. Shared by the
-    /// `Drop` glue (no async context available there) and
-    /// [`StreamProc::shutdown`], which needs the same whole-group kill from
-    /// an async context that can also reap the child afterward.
+    /// The negative pid targets the whole process group `process_group(0)`
+    /// put the command in at spawn time. Shared by the `Drop` glue (no async
+    /// context available there) and [`StreamProc::shutdown`], which needs the
+    /// same whole-group kill from an async context that can also reap the
+    /// child afterward.
+    ///
+    /// `status()`, not `spawn()`: a spawned-and-dropped `std::process::Child`
+    /// is never waited on, so it lingers as a zombie until the whole process
+    /// exits — one per cancelled fetch and per stream shutdown, accumulating
+    /// for the daemon's entire lifetime (spec: data-collection — collector
+    /// resilience). `kill` exits in about a millisecond, so blocking on it
+    /// here (including from a Tokio worker running `Drop`) costs far less
+    /// than leaking the entry.
     fn kill_group(pgid: i32) {
         let _ = std::process::Command::new("kill")
             .arg("-KILL")
             .arg(format!("-{pgid}"))
-            .spawn();
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 
@@ -340,14 +350,25 @@ impl Drop for KillGroupOnDrop {
     }
 }
 
+/// Ceiling on a single command's captured stdout/stderr. A reading is a
+/// dashboard value, not a payload, so anything approaching this is a
+/// misbehaving source (`cat /dev/urandom`, a paging API that never
+/// terminates) — and `wait_with_output` would otherwise buffer it all in the
+/// daemon's memory and then hand it to `INSERT` (spec: data-collection —
+/// collector resilience: one source's misbehavior must not degrade the whole
+/// daemon).
+const MAX_COMMAND_OUTPUT: usize = 1 << 20; // 1 MiB
+
 /// Runs a shell command (working directory `dir` — the config file's own
 /// directory, spec: source-configuration — config-relative working
 /// directory) and returns its trimmed stdout; non-zero exit is an error
 /// carrying stderr. Shared by query sources and setup commands. Spawned in
 /// its own process group so a cancelled/timed-out fetch can be cleaned up
 /// as a whole (see [`KillGroupOnDrop`]) instead of leaving orphans behind.
+/// Output past [`MAX_COMMAND_OUTPUT`] fails the fetch rather than being
+/// buffered without limit.
 pub async fn run_shell(command: &str, dir: &Path) -> Result<String> {
-    let child = tokio::process::Command::new("sh")
+    let mut child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(dir)
@@ -357,16 +378,45 @@ pub async fn run_shell(command: &str, dir: &Path) -> Result<String> {
         .spawn()
         .context("spawning sh")?;
     let mut guard = KillGroupOnDrop(child.id().map(u32::cast_signed));
-    let out = child.wait_with_output().await.context("waiting for sh")?;
+    let stdout = child.stdout.take().context("sh stdout not piped")?;
+    let stderr = child.stderr.take().context("sh stderr not piped")?;
+    // Both pipes must be drained concurrently with the wait: a command that
+    // fills one pipe's buffer blocks until it is read, so reading them in
+    // sequence would deadlock against a command writing to both.
+    let (status, out, err) = tokio::try_join!(
+        async { child.wait().await.context("waiting for sh") },
+        read_capped(stdout, "stdout"),
+        read_capped(stderr, "stderr"),
+    )?;
     guard.0 = None; // exited on its own — nothing left to clean up
-    if !out.status.success() {
+    if !status.success() {
         bail!(
-            "command failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+            "command failed ({status}): {}",
+            String::from_utf8_lossy(&err).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// Reads `r` to EOF, failing once more than [`MAX_COMMAND_OUTPUT`] bytes
+/// have arrived instead of growing the buffer without bound.
+async fn read_capped<R>(r: R, what: &str) -> Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    // One byte over the cap is enough to tell "exactly at the cap" (fine)
+    // from "more to come" (rejected) without reading the rest of it.
+    let read = r
+        .take(MAX_COMMAND_OUTPUT as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .with_context(|| format!("reading command {what}"))?;
+    if read > MAX_COMMAND_OUTPUT {
+        bail!("command {what} exceeded {MAX_COMMAND_OUTPUT} bytes");
+    }
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -428,6 +478,57 @@ mod tests {
             !alive,
             "process group {pid} is still alive after cancellation"
         );
+    }
+
+    /// A command that never stops producing output must fail rather than be
+    /// buffered into the daemon's memory (and then into an `INSERT`) without
+    /// limit (spec: data-collection — collector resilience).
+    #[tokio::test]
+    async fn runaway_command_output_is_capped_not_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_shell(
+            &format!("yes x | head -c {}", MAX_COMMAND_OUTPUT + 4096),
+            dir.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("exceeded"),
+            "error should name the cap: {err:#}"
+        );
+    }
+
+    /// Output at or just under the cap is still returned in full — the limit
+    /// must not quietly truncate ordinary values.
+    #[tokio::test]
+    async fn output_within_the_cap_is_returned_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_shell("printf 'x%.0s' $(seq 1 1000)", dir.path())
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1000);
+    }
+
+    /// A command writing heavily to *both* pipes must not deadlock: the two
+    /// are drained concurrently with the wait, not one after the other.
+    #[tokio::test]
+    async fn a_command_filling_both_pipes_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let finished = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_shell(
+                "yes out | head -c 200000; yes err | head -c 200000 >&2",
+                dir.path(),
+            ),
+        )
+        .await;
+        assert!(
+            finished.is_ok(),
+            "run_shell deadlocked on a command writing to both pipes"
+        );
+        // Trimmed, so a byte-exact length isn't meaningful — what matters is
+        // that both pipes drained rather than one blocking the other.
+        assert!(finished.unwrap().unwrap().len() > 190_000);
     }
 
     /// Plain stdout stays a plain value, even when it is valid JSON without

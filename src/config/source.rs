@@ -138,16 +138,28 @@ pub fn validate_thresholds(source: &str, thresholds: &[Threshold]) -> Result<()>
 /// Bands are interpreted ascending by bound ("value ≤ bound"); encoding the
 /// levels green→red or red→green gives either direction.
 /// Returns None for non-numeric readings.
+///
+/// One allocation-free pass rather than sorting a borrowed copy: the answer
+/// is just "the lowest bound at or above `v`, else the highest bound
+/// overall", and this runs once per history-bar segment per panel on every
+/// render (`history_points` × sources), where a per-call `Vec` + sort was
+/// pure overhead.
 #[must_use]
 pub fn level_for(thresholds: &[Threshold], value: &str) -> Option<Level> {
     let v: f64 = value.trim().parse().ok()?;
-    let mut bands: Vec<&Threshold> = thresholds.iter().collect();
-    bands.sort_by(|a, b| a.bound.total_cmp(&b.bound));
-    bands
-        .iter()
-        .find(|t| v <= t.bound)
-        .or_else(|| bands.last())
-        .map(|t| t.level)
+    let mut covering: Option<&Threshold> = None;
+    let mut highest: Option<&Threshold> = None;
+    for t in thresholds {
+        if v <= t.bound && covering.is_none_or(|c| t.bound < c.bound) {
+            covering = Some(t);
+        }
+        // `>=`, so the *last*-declared band wins a tie for the highest
+        // bound — matching what a stable sort + `last()` used to yield.
+        if highest.is_none_or(|h| t.bound >= h.bound) {
+            highest = Some(t);
+        }
+    }
+    covering.or(highest).map(|t| t.level)
 }
 
 /// Resolves the accent color for a source's aggregate/alerting signal (a
@@ -766,6 +778,44 @@ mod tests {
             ts.starts_with("1969-12-31T23:59:58.5"),
             "expected 23:59:58.5, got {ts}"
         );
+    }
+
+    /// Bands are resolved by bound, not by declaration order, in either
+    /// encoding direction; a value above every bound falls to the highest
+    /// band and a non-numeric reading has no band at all (spec:
+    /// source-configuration — Threshold bands).
+    #[test]
+    fn level_for_resolves_bands_independently_of_declaration_order() {
+        let ascending = [
+            Threshold {
+                bound: 60.0,
+                level: Level::Green,
+            },
+            Threshold {
+                bound: 85.0,
+                level: Level::Yellow,
+            },
+            Threshold {
+                bound: 100.0,
+                level: Level::Red,
+            },
+        ];
+        let mut shuffled = ascending.to_vec();
+        shuffled.reverse();
+        for bands in [&ascending[..], &shuffled[..]] {
+            assert_eq!(level_for(bands, "10"), Some(Level::Green));
+            assert_eq!(level_for(bands, "60"), Some(Level::Green), "boundary is ≤");
+            assert_eq!(level_for(bands, "60.5"), Some(Level::Yellow));
+            assert_eq!(level_for(bands, "100"), Some(Level::Red));
+            assert_eq!(
+                level_for(bands, "999"),
+                Some(Level::Red),
+                "above every bound falls to the highest band"
+            );
+            assert_eq!(level_for(bands, "  42  "), Some(Level::Green));
+            assert_eq!(level_for(bands, "n/a"), None);
+        }
+        assert_eq!(level_for(&[], "1"), None);
     }
 
     /// (spec: source-configuration — Ingest source type)
