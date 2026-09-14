@@ -1,9 +1,4 @@
-use crate::{
-    AppState, collector,
-    config::{Threshold, validate_thresholds},
-    db::Origin,
-    health, source,
-};
+use crate::{AppState, collector, db::Origin, health, source};
 use serde::Deserialize;
 use topcoat::{
     Result,
@@ -252,23 +247,16 @@ pub async fn poll(cx: &Cx) -> Result<Response> {
         return Ok(gone());
     };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if tx.send(collector::Control::PollNow(reply_tx)).is_err() {
+    if tx
+        .send(collector::Control::PollNow(source.clone(), reply_tx))
+        .is_err()
+    {
         return Ok(gone());
     }
     match reply_rx.await {
         Ok(outcome) => Ok(json_ok(&outcome)),
         Err(_) => Ok(gone()),
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct IngestBody {
-    source: String,
-    value: serde_json::Value,
-    #[serde(default)]
-    ts: Option<serde_json::Value>,
-    #[serde(default)]
-    thresholds: Option<Vec<Threshold>>,
 }
 
 /// Stores a pushed reading (spec: http-api — HTTP ingest endpoint). Reads
@@ -282,7 +270,7 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
     let start = std::time::Instant::now();
     #[allow(clippy::cast_possible_truncation)] // handler-measured, fits easily
     let elapsed_ms = || start.elapsed().as_millis() as i64;
-    let req: IngestBody = match serde_json::from_slice(&body) {
+    let req: source::IngestItem = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return Ok(json_err(
@@ -297,32 +285,10 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
             &format!("unknown source `{}`", req.source),
         ));
     };
-    // Plain-text values stay as-is; JSON values are compacted to their
-    // canonical form so numbers and objects store deterministically.
-    let value = match &req.value {
-        serde_json::Value::String(s) => s.clone(),
-        v => v.to_string(),
-    };
-    if let Some(bands) = &req.thresholds
-        && let Err(e) = validate_thresholds(src.name(), bands)
-    {
-        return Ok(json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")));
-    }
     let arrival = crate::db::now();
-    let (ts_epoch, ts) = match resolve_ingest_ts(req.ts.as_ref(), arrival, src.name()) {
-        Ok(t) => t,
+    let parsed = match source::resolve_ingest_item(&req, arrival, src.effective_value_type()) {
+        Ok(p) => p,
         Err(e) => return Ok(json_err(StatusCode::BAD_REQUEST, &e)),
-    };
-    // Pre-validate so a value the source's type rejects is a 400 recording
-    // nothing — `store_parsed_value` would log it as a failed attempt.
-    if let Err(e) = source::convert_value_type(&value, src.effective_value_type()) {
-        return Ok(json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")));
-    }
-    let parsed = source::ParsedOutput {
-        value: value.clone(),
-        ts_epoch,
-        ts: ts.clone(),
-        threshold: req.thresholds.clone(),
     };
     let _ = collector::store_parsed_value(
         &st.db,
@@ -343,107 +309,18 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
     }
     Ok(json_ok(&serde_json::json!({
         "source": src.name(),
-        "value": value,
-        "ts_epoch": ts_epoch,
-        "ts": ts,
+        "value": parsed.value,
+        "ts_epoch": parsed.ts_epoch,
+        "ts": parsed.ts,
         "unit": src.unit(),
         "origin": Origin::Push,
     })))
-}
-
-/// Strict ingest `ts`: epoch number or RFC 3339 string; anything else is a
-/// caller error naming the problem (unlike row `ts`, which degrades to
-/// arrival time).
-fn resolve_ingest_ts(
-    raw: Option<&serde_json::Value>,
-    arrival: (f64, String),
-    source: &str,
-) -> std::result::Result<(f64, String), String> {
-    let Some(v) = raw else {
-        return Ok(arrival);
-    };
-    match v {
-        serde_json::Value::Null => Ok(arrival),
-        serde_json::Value::Number(n) => match n.as_f64() {
-            Some(secs) => epoch_to_ts(secs, source),
-            None => Err(format!("ingest `ts` for `{source}` is not a finite number")),
-        },
-        serde_json::Value::String(s) => {
-            chrono::DateTime::parse_from_rfc3339(s).map_or_else(
-                |_| Err(format!("ingest `ts` for `{source}` is not RFC 3339: `{s}`")),
-                |d| {
-                    #[allow(clippy::cast_precision_loss)] // epoch millis fit exactly enough
-                    let epoch = d.timestamp_millis() as f64 / 1000.0;
-                    Ok((epoch, d.to_rfc3339()))
-                },
-            )
-        }
-        _ => Err(format!(
-            "ingest `ts` for `{source}` must be epoch seconds or RFC 3339"
-        )),
-    }
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn epoch_to_ts(secs: f64, source: &str) -> std::result::Result<(f64, String), String> {
-    if !secs.is_finite() {
-        return Err(format!("ingest `ts` for `{source}` is not a finite number"));
-    }
-    // `floor`, not `trunc`: for a pre-epoch fractional value (e.g. `-1.5`),
-    // `trunc` rounds toward zero (`-1.0`), and an `.abs()` on the negative
-    // remainder that follows would flip it positive, landing exactly one
-    // second late. Flooring keeps `secs - whole` in `[0, 1)` for either
-    // sign, so the remainder is already the correct positive nanosecond
-    // offset with no `.abs()` needed.
-    let whole = secs.floor();
-    let nanos = ((secs - whole) * 1_000_000_000.0).round() as u32;
-    match chrono::DateTime::from_timestamp(whole as i64, nanos) {
-        Some(d) => {
-            #[allow(clippy::cast_precision_loss)]
-            let epoch = d.timestamp_millis() as f64 / 1000.0;
-            Ok((epoch, d.to_rfc3339()))
-        }
-        None => Err(format!("ingest `ts` for `{source}` is out of range")),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-
-    /// A pre-epoch fractional `ts` (e.g. `-1.5`, half a second before
-    /// 1969-12-31T23:59:59Z) must resolve to that exact instant, not one
-    /// second off (spec: http-api — HTTP ingest endpoint).
-    #[test]
-    fn epoch_to_ts_handles_pre_epoch_fractional_seconds() {
-        let (epoch, ts) = epoch_to_ts(-1.5, "s").unwrap();
-        assert!((epoch - (-1.5)).abs() < 0.001, "got epoch {epoch}");
-        assert!(
-            ts.starts_with("1969-12-31T23:59:58.5"),
-            "expected 23:59:58.5, got {ts}"
-        );
-    }
-
-    #[test]
-    fn epoch_to_ts_handles_positive_fractional_seconds() {
-        let (epoch, ts) = epoch_to_ts(1.5, "s").unwrap();
-        assert!((epoch - 1.5).abs() < 0.001, "got epoch {epoch}");
-        assert!(ts.starts_with("1970-01-01T00:00:01.5"), "got {ts}");
-    }
-
-    #[test]
-    fn epoch_to_ts_handles_whole_seconds_either_side_of_the_epoch() {
-        assert!((epoch_to_ts(-1.0, "s").unwrap().0 - (-1.0)).abs() < 0.001);
-        assert!((epoch_to_ts(0.0, "s").unwrap().0).abs() < 0.001);
-        assert!((epoch_to_ts(1.0, "s").unwrap().0 - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn epoch_to_ts_rejects_non_finite() {
-        assert!(epoch_to_ts(f64::NAN, "s").is_err());
-        assert!(epoch_to_ts(f64::INFINITY, "s").is_err());
-    }
 
     /// A repeated `source` key is how both the HTTP API and `barduck logs
     /// --daemon --source` express a multi-source filter; deserializing the

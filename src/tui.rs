@@ -256,6 +256,127 @@ async fn fetch(backend: &Backend, cfg: &Config) -> Outcome {
     }
 }
 
+/// A composite source's declared children, in order, each built into a
+/// `table`-section `Panel` exactly as a manually-authored `{ table = [...] }`
+/// member would be — filtered to this view like any other source (spec: tui
+/// — A composite root renders as a table panel). Empty when `name` isn't a
+/// composite source.
+fn composite_table_panels(
+    cfg: &Config,
+    latest: &[crate::db::ReadingRow],
+    healths: &[crate::health::SourceHealth],
+    name: &str,
+) -> Vec<Panel> {
+    crate::config::composite_children(cfg, name)
+        .into_iter()
+        .filter(|c| c.visible_in(View::Tui))
+        .map(|c| build_panel(cfg, latest, healths, c.name(), None))
+        .collect()
+}
+
+/// A single-source cell (`Cell::Source`/`Cell::Pane`) naming a composite
+/// root renders its children as a `table` section instead of an ordinary
+/// single-value `main` panel, with a title that falls back to the root's own
+/// `title`/name (spec: tui — A composite root renders as a table panel).
+/// `None` when `name` isn't a composite root.
+fn composite_cell_parts(
+    cfg: &Config,
+    latest: &[crate::db::ReadingRow],
+    healths: &[crate::health::SourceHealth],
+    name: &str,
+    title_override: Option<&str>,
+) -> Option<(Vec<Panel>, String)> {
+    let composite = composite_table_panels(cfg, latest, healths, name);
+    if composite.is_empty() {
+        return None;
+    }
+    let title = title_override.unwrap_or_else(|| {
+        cfg.sources
+            .iter()
+            .find(|s| s.name() == name)
+            .and_then(crate::config::SourceCfg::display_title)
+            .unwrap_or(name)
+    });
+    Some((composite, title.to_string()))
+}
+
+/// One cell's built panel data: `(main, secondary, table, group_title,
+/// text)`. A source hidden from this view (spec: source-configuration —
+/// per-source view visibility) is simply omitted here, so the cell falls
+/// through to the same empty-slot rendering as an explicit `space` cell
+/// (spec: tui — hidden sources render as space in the TUI).
+type TuiCellParts = (Option<Panel>, Vec<Panel>, Vec<Panel>, Option<String>, Option<String>);
+
+fn build_tui_cell_parts(
+    cfg: &Config,
+    latest: &[crate::db::ReadingRow],
+    healths: &[crate::health::SourceHealth],
+    cell: &crate::config::Cell,
+) -> TuiCellParts {
+    let panel = |item: &crate::config::GroupItem| {
+        build_panel(cfg, latest, healths, item.id(), item.explicit_label())
+    };
+    match cell {
+        crate::config::Cell::Group {
+            title,
+            main,
+            secondary,
+            table,
+            ..
+        } => {
+            // A composite `main` has no single value of its own to show —
+            // its children join the table section instead (spec: tui — A
+            // composite root renders as a table panel).
+            let main_composite = main.as_ref().and_then(|item| {
+                let panels = composite_table_panels(cfg, latest, healths, item.id());
+                (!panels.is_empty()).then_some(panels)
+            });
+            let main_panel = if main_composite.is_some() {
+                None
+            } else {
+                main.as_ref()
+                    .filter(|item| crate::config::source_visible_in(cfg, item.id(), View::Tui))
+                    .map(&panel)
+            };
+            let secondary_panels = crate::config::visible_items(cfg, secondary, View::Tui)
+                .into_iter()
+                .map(&panel)
+                .collect();
+            let mut table_out: Vec<Panel> = main_composite.unwrap_or_default();
+            table_out.extend(
+                crate::config::visible_items(cfg, table, View::Tui)
+                    .into_iter()
+                    .map(&panel),
+            );
+            (main_panel, secondary_panels, table_out, title.clone(), None)
+        }
+        crate::config::Cell::Source(name) => {
+            if let Some((table, title)) = composite_cell_parts(cfg, latest, healths, name, None) {
+                (None, Vec::new(), table, Some(title), None)
+            } else {
+                let main = crate::config::source_visible_in(cfg, name, View::Tui)
+                    .then(|| build_panel(cfg, latest, healths, name, None));
+                (main, Vec::new(), Vec::new(), None, None)
+            }
+        }
+        crate::config::Cell::Pane { id, title, .. } => {
+            if let Some((table, resolved_title)) =
+                composite_cell_parts(cfg, latest, healths, id, title.as_deref())
+            {
+                (None, Vec::new(), table, Some(resolved_title), None)
+            } else {
+                let main = crate::config::source_visible_in(cfg, id, View::Tui)
+                    .then(|| build_panel(cfg, latest, healths, id, title.as_deref()));
+                (main, Vec::new(), Vec::new(), None, None)
+            }
+        }
+        crate::config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None),
+        crate::config::Cell::Text { title, text, .. } => {
+            (None, Vec::new(), Vec::new(), title.clone(), Some(text.clone()))
+        }
+    }
+}
+
 fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
     match outcome {
         Outcome::Data(latest, healths) => {
@@ -265,87 +386,8 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
                 for row_cells in &layout.rows {
                     let mut slots = Vec::new();
                     for cell in row_cells {
-                        // A source hidden from this view (spec: source-configuration —
-                        // per-source view visibility) is simply omitted here, so the
-                        // cell falls through to the same empty-slot rendering as an
-                        // explicit `space` cell (spec: tui — hidden sources render as
-                        // space in the TUI).
-                        let (main, secondary, table, group_title, text) = match cell {
-                            crate::config::Cell::Group {
-                                title,
-                                main,
-                                secondary,
-                                table,
-                                ..
-                            } => (
-                                main.as_ref()
-                                    .filter(|item| {
-                                        crate::config::source_visible_in(cfg, item.id(), View::Tui)
-                                    })
-                                    .map(|item| {
-                                        build_panel(
-                                            cfg,
-                                            &latest,
-                                            &healths,
-                                            item.id(),
-                                            item.explicit_label(),
-                                        )
-                                    }),
-                                crate::config::visible_items(cfg, secondary, View::Tui)
-                                    .iter()
-                                    .map(|item| {
-                                        build_panel(
-                                            cfg,
-                                            &latest,
-                                            &healths,
-                                            item.id(),
-                                            item.explicit_label(),
-                                        )
-                                    })
-                                    .collect(),
-                                crate::config::visible_items(cfg, table, View::Tui)
-                                    .iter()
-                                    .map(|item| {
-                                        build_panel(
-                                            cfg,
-                                            &latest,
-                                            &healths,
-                                            item.id(),
-                                            item.explicit_label(),
-                                        )
-                                    })
-                                    .collect(),
-                                title.clone(),
-                                None,
-                            ),
-                            crate::config::Cell::Source(name) => (
-                                crate::config::source_visible_in(cfg, name, View::Tui)
-                                    .then(|| build_panel(cfg, &latest, &healths, name, None)),
-                                Vec::new(),
-                                Vec::new(),
-                                None,
-                                None,
-                            ),
-                            crate::config::Cell::Pane { id, title, .. } => (
-                                crate::config::source_visible_in(cfg, id, View::Tui).then(|| {
-                                    build_panel(cfg, &latest, &healths, id, title.as_deref())
-                                }),
-                                Vec::new(),
-                                Vec::new(),
-                                None,
-                                None,
-                            ),
-                            crate::config::Cell::Space { .. } => {
-                                (None, Vec::new(), Vec::new(), None, None)
-                            }
-                            crate::config::Cell::Text { title, text, .. } => (
-                                None,
-                                Vec::new(),
-                                Vec::new(),
-                                title.clone(),
-                                Some(text.clone()),
-                            ),
-                        };
+                        let (main, secondary, table, group_title, text) =
+                            build_tui_cell_parts(cfg, &latest, &healths, cell);
                         slots.push(Slot {
                             span: cell.span(),
                             group_title,
@@ -1813,6 +1855,68 @@ mod tests {
                 && slot.table.is_empty()
                 && slot.text.is_none()
         );
+    }
+
+    fn composite_cfg_from(toml: &str) -> Config {
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        crate::config::expand_composites(&mut cfg).unwrap();
+        crate::config::validate(&cfg).unwrap();
+        cfg
+    }
+
+    /// A bare layout cell naming a composite root renders as a table with
+    /// one row per declared child, titled after the root's own name (spec:
+    /// tui — A composite root renders as a table panel).
+    #[test]
+    fn composite_root_bare_cell_renders_as_a_children_table() {
+        let cfg = composite_cfg_from(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"1h\"\n\
+             [[sources.children]]\nname = \"1m\"\n\
+             [[sources.children]]\nname = \"5m\"\n\
+             [[layouts]]\ntitle = \"L\"\nrows = [[\"load\"]]\n",
+        );
+        let slot = only_slot(&cfg);
+        assert!(slot.main.is_none(), "the root has no scalar value of its own");
+        assert_eq!(slot.table.len(), 2, "one row per declared child");
+        assert_eq!(slot.table[0].name, "load::1m");
+        assert_eq!(slot.table[1].name, "load::5m");
+        assert_eq!(slot.group_title.as_deref(), Some("load"));
+    }
+
+    /// A generalized pane's `main` naming a composite root renders the
+    /// children table instead of a single scalar value, alongside the
+    /// pane's own other declared members (spec: tui — A composite root
+    /// renders as a table panel).
+    #[test]
+    fn composite_root_as_pane_main_renders_children_table() {
+        let cfg = composite_cfg_from(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"1h\"\n\
+             [[sources.children]]\nname = \"1m\"\n\
+             [[sources]]\nname = \"note\"\ntype = \"query\"\ncommand = \"echo hi\"\n\
+             [[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"Server\", main = \"load\", table = [\"note\"] }]]\n",
+        );
+        let slot = only_slot(&cfg);
+        assert!(slot.main.is_none());
+        assert_eq!(slot.table.len(), 2, "the composite child plus the pane's own table member");
+        assert_eq!(slot.table[0].name, "load::1m");
+        assert_eq!(slot.table[1].name, "note");
+        assert_eq!(slot.group_title.as_deref(), Some("Server"));
+    }
+
+    /// A composite's child referenced individually elsewhere in the layout
+    /// still renders as an ordinary single-source panel (spec: tui — A
+    /// composite root renders as a table panel).
+    #[test]
+    fn composite_child_referenced_individually_renders_normally() {
+        let cfg = composite_cfg_from(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"1h\"\n\
+             [[sources.children]]\nname = \"1m\"\n\
+             [[layouts]]\ntitle = \"L\"\nrows = [[\"load::1m\"]]\n",
+        );
+        let slot = only_slot(&cfg);
+        assert!(slot.table.is_empty());
+        let main = slot.main.expect("load::1m should render as a plain panel");
+        assert_eq!(main.name, "load::1m");
     }
 
     /// Hiding a source from the TUI does not change the layout's column

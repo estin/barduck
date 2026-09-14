@@ -159,6 +159,9 @@ pub async fn print_fetch(cfg: &Config, source: &str, json: bool) -> Result<()> {
         bail!("unknown source `{source}`");
     };
     let rows = match src {
+        crate::config::SourceCfg::Query { .. } if src.is_composite() => {
+            crate::source::debug_composite(cfg, src, None).await?
+        }
         crate::config::SourceCfg::Query { .. } => {
             vec![crate::source::debug_query(cfg, src).await?]
         }
@@ -166,13 +169,21 @@ pub async fn print_fetch(cfg: &Config, source: &str, json: bool) -> Result<()> {
         crate::config::SourceCfg::Ingest { .. } => {
             bail!("ingest sources receive data via HTTP push, not fetch");
         }
+        crate::config::SourceCfg::Child { parent, .. } => {
+            let Some(root) = cfg.sources.iter().find(|s| s.name() == parent) else {
+                bail!("composite root `{parent}` not found");
+            };
+            crate::source::debug_composite(cfg, root, Some(source)).await?
+        }
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {
         header(&format!("debug fetch for `{source}` (no database writes)"));
         for (i, row) in rows.iter().enumerate() {
-            if rows.len() > 1 {
+            if let Some(name) = &row.name {
+                println!("--- {name} ---");
+            } else if rows.len() > 1 {
                 println!("--- line {} ---", i + 1);
             }
             print_debug_row(row);
@@ -438,6 +449,69 @@ mod tests {
         assert_eq!(rows[1]["source"], "ok");
         assert_eq!(rows[1]["success"], true);
         assert_eq!(rows[1]["value"], "42");
+    }
+
+    fn composite_poll_config(db_path: &std::path::Path) -> Config {
+        let mut cfg: Config = toml::from_str(&format!(
+            "database_path = \"{db}\"\n\
+             [[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"echo '[{{\\\"source\\\":\\\"load::1m\\\",\\\"value\\\":\\\"0.1\\\"}},{{\\\"source\\\":\\\"load::5m\\\",\\\"value\\\":\\\"0.2\\\"}}]'\"\ninterval = \"1h\"\n\
+             [[sources.children]]\nname = \"1m\"\n\
+             [[sources.children]]\nname = \"5m\"\n",
+            db = db_path.display(),
+        ))
+        .unwrap();
+        crate::config::expand_composites(&mut cfg).unwrap();
+        cfg
+    }
+
+    /// `poll --source <composite-root>` fans out to every declared child and
+    /// reports the root's own command/parse outcome; `poll --source <child>`
+    /// fans out identically and reports that child's own outcome (spec: cli
+    /// — Poll and fetch accept composite roots and children).
+    #[tokio::test]
+    async fn poll_on_composite_root_and_child_both_fan_out() {
+        use crate::db::Db;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.duckdb");
+        let cfg = composite_poll_config(&db_path);
+        drop(Db::open_rw(&db_path).unwrap());
+        let backend = Backend::new(&cfg, false).unwrap();
+
+        let mut buf = Vec::new();
+        print_poll(&backend, &cfg, &["load".into()], false, &mut buf)
+            .await
+            .unwrap();
+        let db = Db::open_rw(&db_path).unwrap();
+        assert_eq!(
+            db.latest_values()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.source == "load::1m")
+                .unwrap()
+                .value,
+            "0.1"
+        );
+        assert_eq!(
+            db.latest_values()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.source == "load::5m")
+                .unwrap()
+                .value,
+            "0.2"
+        );
+        drop(db);
+
+        let mut buf = Vec::new();
+        print_poll(&backend, &cfg, &["load::1m".into()], true, &mut buf)
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(rows[0]["source"], "load::1m");
+        assert_eq!(rows[0]["success"], true);
+        assert_eq!(rows[0]["value"], "0.1");
     }
 
     /// `logs` renders one row per attempt with its origin (spec: cli —

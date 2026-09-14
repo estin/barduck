@@ -10,8 +10,11 @@
 Single-binary home dashboard: collects values from config-defined shell
 sources (oneshot `query` commands on a schedule, continuous `stream`
 commands emitting JSON lines), stores them in DuckDB, and shows them via a
-live web UI, TUI, CLI, and JSON API. See [demo/README.md](demo/README.md) for
-a runnable tour.
+live web UI, TUI, CLI, and JSON API. A `query` source can also declare
+`children`, turning one command's JSON-array output into several
+independently-displayed, independently-healthed values (a composite
+source — see [SKILL.md](SKILL.md#composite-sources)). See
+[demo/README.md](demo/README.md) for a runnable tour.
 
 - Config: TOML (`sources`, `layouts`) — adding a data point needs no code
 - Storage: embedded DuckDB, one file, plain SQL accessible

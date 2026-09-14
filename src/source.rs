@@ -24,6 +24,16 @@ pub fn build(cfg: &SourceCfg) -> Result<SourceKind> {
             command: require_command(cfg, "stream")?,
         }),
         SourceCfg::Ingest { .. } => Ok(SourceKind::Ingest),
+        // A child never fetches on its own — its composite root's command
+        // fans out to it (spec: data-collection — Composite source command
+        // output). Callers reaching a child here would be a routing bug:
+        // `collectible`/`control_channels` never spawn a task for one.
+        SourceCfg::Child { .. } => {
+            bail!(
+                "source `{}` is a composite child and has no fetch of its own",
+                cfg.name()
+            )
+        }
     }
 }
 
@@ -98,6 +108,182 @@ pub struct ParsedOutput {
     pub threshold: Option<Vec<Threshold>>,
 }
 
+/// One item of an ingest payload (spec: http-api — HTTP ingest endpoint):
+/// shared by `POST /api/ingest` (one item per request body) and a composite
+/// source's fan-out (spec: data-collection — Composite source command
+/// output), whose command output is a JSON array of these, one per declared
+/// child.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct IngestItem {
+    pub source: String,
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub ts: Option<serde_json::Value>,
+    #[serde(default)]
+    pub thresholds: Option<Vec<Threshold>>,
+}
+
+/// Converts one ingest item into a storable [`ParsedOutput`], applying the
+/// same rules `POST /api/ingest` uses: a string value is stored as-is, other
+/// JSON is compacted to its canonical text; declared thresholds are
+/// validated; `ts` is strict (epoch seconds or RFC 3339), unlike the lenient
+/// `jsonl` fallback a `query` row gets. `value_type` is the target source's
+/// own — `Ok` only once the value has also been confirmed to convert to it.
+/// Shared by the ingest endpoint and a composite source's fan-out so the two
+/// can never drift (spec: data-collection — Composite source command
+/// output).
+pub fn resolve_ingest_item(
+    item: &IngestItem,
+    arrival: (f64, String),
+    value_type: ValueType,
+) -> std::result::Result<ParsedOutput, String> {
+    let value = match &item.value {
+        serde_json::Value::String(s) => s.clone(),
+        v => v.to_string(),
+    };
+    if let Some(bands) = &item.thresholds {
+        crate::config::validate_thresholds(&item.source, bands).map_err(|e| format!("{e:#}"))?;
+    }
+    let (ts_epoch, ts) = resolve_ingest_ts(item.ts.as_ref(), arrival, &item.source)?;
+    convert_value_type(&value, value_type).map_err(|e| format!("{e:#}"))?;
+    Ok(ParsedOutput {
+        value,
+        ts_epoch,
+        ts,
+        threshold: item.thresholds.clone(),
+    })
+}
+
+/// Strict ingest `ts`: epoch number or RFC 3339 string; anything else is a
+/// caller error naming the problem (unlike row `ts`, which degrades to
+/// arrival time).
+pub(crate) fn resolve_ingest_ts(
+    raw: Option<&serde_json::Value>,
+    arrival: (f64, String),
+    source: &str,
+) -> std::result::Result<(f64, String), String> {
+    let Some(v) = raw else {
+        return Ok(arrival);
+    };
+    match v {
+        serde_json::Value::Null => Ok(arrival),
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(secs) => epoch_to_ts(secs, source),
+            None => Err(format!("ingest `ts` for `{source}` is not a finite number")),
+        },
+        serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s).map_or_else(
+            |_| Err(format!("ingest `ts` for `{source}` is not RFC 3339: `{s}`")),
+            |d| {
+                #[allow(clippy::cast_precision_loss)] // epoch millis fit exactly enough
+                let epoch = d.timestamp_millis() as f64 / 1000.0;
+                Ok((epoch, d.to_rfc3339()))
+            },
+        ),
+        _ => Err(format!(
+            "ingest `ts` for `{source}` must be epoch seconds or RFC 3339"
+        )),
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn epoch_to_ts(secs: f64, source: &str) -> std::result::Result<(f64, String), String> {
+    if !secs.is_finite() {
+        return Err(format!("ingest `ts` for `{source}` is not a finite number"));
+    }
+    // `floor`, not `trunc`: for a pre-epoch fractional value (e.g. `-1.5`),
+    // `trunc` rounds toward zero (`-1.0`), and an `.abs()` on the negative
+    // remainder that follows would flip it positive, landing exactly one
+    // second late. Flooring keeps `secs - whole` in `[0, 1)` for either
+    // sign, so the remainder is already the correct positive nanosecond
+    // offset with no `.abs()` needed.
+    let whole = secs.floor();
+    let nanos = ((secs - whole) * 1_000_000_000.0).round() as u32;
+    match chrono::DateTime::from_timestamp(whole as i64, nanos) {
+        Some(d) => {
+            #[allow(clippy::cast_precision_loss)]
+            let epoch = d.timestamp_millis() as f64 / 1000.0;
+            Ok((epoch, d.to_rfc3339()))
+        }
+        None => Err(format!("ingest `ts` for `{source}` is out of range")),
+    }
+}
+
+/// Runs a composite source's command once and returns one [`DebugRow`] per
+/// declared child (or just `only`, when given), labeled with that child's
+/// full name. Writes nothing anywhere (spec: cli — Poll and fetch accept
+/// composite roots and children).
+pub async fn debug_composite(
+    cfg: &Config,
+    root: &SourceCfg,
+    only: Option<&str>,
+) -> Result<Vec<DebugRow>> {
+    let out = tokio::time::timeout(root.timeout(), run_shell(root.command(), &cfg.config_dir))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out after {}",
+                humantime::format_duration(root.timeout())
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    let items: Vec<IngestItem> = serde_json::from_str(&out).map_err(|e| {
+        anyhow::anyhow!("composite output is not a JSON array of ingest items: {e}")
+    })?;
+    let arrival = crate::db::now();
+    let mut rows = Vec::new();
+    for child in crate::config::composite_children(cfg, root.name()) {
+        if only.is_some_and(|o| o != child.name()) {
+            continue;
+        }
+        let found = items.iter().find(|it| it.source == child.name());
+        rows.push(match found {
+            Some(item) => {
+                match resolve_ingest_item(item, arrival.clone(), child.effective_value_type()) {
+                    Ok(parsed) => {
+                        let (value_bigint, value_double, value_json) =
+                            convert_value_type(&parsed.value, child.effective_value_type())
+                                .unwrap_or_default();
+                        DebugRow {
+                            name: Some(child.name().to_string()),
+                            value: parsed.value,
+                            ts_epoch: parsed.ts_epoch,
+                            ts: parsed.ts,
+                            threshold: parsed.threshold,
+                            value_bigint,
+                            value_double,
+                            value_json,
+                            error: None,
+                        }
+                    }
+                    Err(e) => DebugRow {
+                        name: Some(child.name().to_string()),
+                        value: String::new(),
+                        ts_epoch: arrival.0,
+                        ts: arrival.1.clone(),
+                        threshold: None,
+                        value_bigint: None,
+                        value_double: None,
+                        value_json: None,
+                        error: Some(e),
+                    },
+                }
+            }
+            None => DebugRow {
+                name: Some(child.name().to_string()),
+                value: String::new(),
+                ts_epoch: arrival.0,
+                ts: arrival.1.clone(),
+                threshold: None,
+                value_bigint: None,
+                value_double: None,
+                value_json: None,
+                error: Some("missing from composite output".into()),
+            },
+        });
+    }
+    Ok(rows)
+}
+
 /// Splits oneshot command output into plain vs structural: a trimmed
 /// stdout that parses as a JSON object containing a `value` key is a
 /// `jsonl` row (applied via [`parse_jsonl_row`]); anything else — plain
@@ -145,6 +331,12 @@ async fn fetch_query(command: &str, dir: &Path) -> Result<String> {
 /// conversion); transport failures (spawn error, timeout) are `Err`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DebugRow {
+    /// The child's full name, for a composite source's fan-out debug fetch
+    /// (spec: cli — Poll and fetch accept composite roots and children).
+    /// `None` for an ordinary `query`/`stream` dry-run, which has only one
+    /// unnamed value (or line) to report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub value: String,
     pub ts_epoch: f64,
     pub ts: String,
@@ -164,6 +356,7 @@ fn debug_parse(src: &SourceCfg, text: &str, arrival: (f64, String)) -> DebugRow 
         Ok(p) => p,
         Err(e) => {
             return DebugRow {
+                name: None,
                 value: String::new(),
                 ts_epoch: arrival.0,
                 ts: arrival.1,
@@ -177,6 +370,7 @@ fn debug_parse(src: &SourceCfg, text: &str, arrival: (f64, String)) -> DebugRow 
     };
     match convert_value_type(&parsed.value, src.effective_value_type()) {
         Ok((value_bigint, value_double, value_json)) => DebugRow {
+            name: None,
             value: parsed.value,
             ts_epoch: parsed.ts_epoch,
             ts: parsed.ts,
@@ -187,6 +381,7 @@ fn debug_parse(src: &SourceCfg, text: &str, arrival: (f64, String)) -> DebugRow 
             error: None,
         },
         Err(e) => DebugRow {
+            name: None,
             value: parsed.value,
             ts_epoch: parsed.ts_epoch,
             ts: parsed.ts,
@@ -424,6 +619,39 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use std::time::Duration;
+
+    /// A pre-epoch fractional `ts` (e.g. `-1.5`, half a second before
+    /// 1969-12-31T23:59:59Z) must resolve to that exact instant, not one
+    /// second off (spec: http-api — HTTP ingest endpoint).
+    #[test]
+    fn epoch_to_ts_handles_pre_epoch_fractional_seconds() {
+        let (epoch, ts) = epoch_to_ts(-1.5, "s").unwrap();
+        assert!((epoch - (-1.5)).abs() < 0.001, "got epoch {epoch}");
+        assert!(
+            ts.starts_with("1969-12-31T23:59:58.5"),
+            "expected 23:59:58.5, got {ts}"
+        );
+    }
+
+    #[test]
+    fn epoch_to_ts_handles_positive_fractional_seconds() {
+        let (epoch, ts) = epoch_to_ts(1.5, "s").unwrap();
+        assert!((epoch - 1.5).abs() < 0.001, "got epoch {epoch}");
+        assert!(ts.starts_with("1970-01-01T00:00:01.5"), "got {ts}");
+    }
+
+    #[test]
+    fn epoch_to_ts_handles_whole_seconds_either_side_of_the_epoch() {
+        assert!((epoch_to_ts(-1.0, "s").unwrap().0 - (-1.0)).abs() < 0.001);
+        assert!((epoch_to_ts(0.0, "s").unwrap().0).abs() < 0.001);
+        assert!((epoch_to_ts(1.0, "s").unwrap().0 - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn epoch_to_ts_rejects_non_finite() {
+        assert!(epoch_to_ts(f64::NAN, "s").is_err());
+        assert!(epoch_to_ts(f64::INFINITY, "s").is_err());
+    }
 
     fn process_alive(pid: &str) -> bool {
         std::process::Command::new("kill")
@@ -665,5 +893,69 @@ mod tests {
         let rows = debug_stream(&cfg, find(&cfg, "s")).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, "a");
+    }
+
+    fn composite_debug_cfg(command: &str, children: &[&str]) -> crate::config::Config {
+        let mut children_toml = String::new();
+        for c in children {
+            use std::fmt::Write as _;
+            let _ = write!(children_toml, "[[sources.children]]\nname = \"{c}\"\n");
+        }
+        let escaped = command.replace('"', "\\\"");
+        let mut cfg = debug_cfg(&format!(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"{escaped}\"\ninterval = \"1h\"\n{children_toml}"
+        ));
+        crate::config::expand_composites(&mut cfg).unwrap();
+        cfg
+    }
+
+    /// `debug_composite` prints (writes nothing) one row per declared child,
+    /// each labeled with its full name (spec: cli — Poll and fetch accept
+    /// composite roots and children).
+    #[tokio::test]
+    async fn debug_composite_returns_one_row_per_child() {
+        let cfg = composite_debug_cfg(
+            r#"echo '[{"source":"load::1m","value":"0.1"},{"source":"load::5m","value":"0.2"}]'"#,
+            &["1m", "5m"],
+        );
+        let root = find(&cfg, "load");
+        let rows = debug_composite(&cfg, root, None).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name.as_deref(), Some("load::1m"));
+        assert_eq!(rows[0].value, "0.1");
+        assert_eq!(rows[1].name.as_deref(), Some("load::5m"));
+        assert_eq!(rows[1].value, "0.2");
+        assert!(!std::path::Path::new("/nonexistent-debug-db/db.duckdb").exists());
+    }
+
+    /// Fetching a specific child filters to just that child's own row from
+    /// the same single command run (spec: cli — Poll and fetch accept
+    /// composite roots and children).
+    #[tokio::test]
+    async fn debug_composite_filters_to_one_child_when_only_is_given() {
+        let cfg = composite_debug_cfg(
+            r#"echo '[{"source":"load::1m","value":"0.1"},{"source":"load::5m","value":"0.2"}]'"#,
+            &["1m", "5m"],
+        );
+        let root = find(&cfg, "load");
+        let rows = debug_composite(&cfg, root, Some("load::5m")).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name.as_deref(), Some("load::5m"));
+        assert_eq!(rows[0].value, "0.2");
+    }
+
+    /// A declared child missing from the array reports as an error row
+    /// rather than panicking or being silently omitted (spec:
+    /// data-collection — Composite fan-out error handling).
+    #[tokio::test]
+    async fn debug_composite_reports_missing_child_as_error_row() {
+        let cfg = composite_debug_cfg(
+            r#"echo '[{"source":"load::1m","value":"0.1"}]'"#,
+            &["1m", "5m"],
+        );
+        let root = find(&cfg, "load");
+        let rows = debug_composite(&cfg, root, None).await.unwrap();
+        let missing = rows.iter().find(|r| r.name.as_deref() == Some("load::5m")).unwrap();
+        assert!(missing.error.as_deref().is_some_and(|e| e.contains("missing")));
     }
 }

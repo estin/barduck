@@ -14,9 +14,9 @@ mod validation;
 
 pub use layout::{Cell, LayoutCfg, TuiWidth, VALUE_FORMATS, ValueFormat};
 pub use source::{
-    GroupItem, JsonlRow, JsonlTs, Level, SourceCfg, SourceType, Threshold, ValueType, View,
-    accent_color, level_for, parse_jsonl_row, source_visible_in, status_color, validate_thresholds,
-    visible_items, worst_color,
+    ChildDecl, GroupItem, JsonlRow, JsonlTs, Level, SourceCfg, SourceType, Threshold, ValueType,
+    View, accent_color, composite_children, expand_composites, level_for, parse_jsonl_row,
+    source_visible_in, status_color, validate_thresholds, visible_items, worst_color,
 };
 
 use defaults::{
@@ -111,6 +111,7 @@ fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Con
     if cfg.database_path.is_relative() {
         cfg.database_path = cfg.config_dir.join(&cfg.database_path);
     }
+    source::expand_composites(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
 }

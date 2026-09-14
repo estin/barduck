@@ -55,6 +55,10 @@ pub enum SourceType {
     Query,
     Stream,
     Ingest,
+    /// A composite source's declared child (spec: source-configuration —
+    /// Composite source children). Never written directly in config: it
+    /// only ever exists as [`expand_composites`]'s own output.
+    Child,
 }
 
 impl SourceType {
@@ -64,6 +68,7 @@ impl SourceType {
             SourceType::Query => "query",
             SourceType::Stream => "stream",
             SourceType::Ingest => "ingest",
+            SourceType::Child => "child",
         }
     }
 }
@@ -114,6 +119,28 @@ pub enum View {
     All,
     Tui,
     Web,
+}
+
+/// One declared child of a composite `query` source (spec:
+/// source-configuration — Composite source children): a bare name, unique
+/// among its own siblings, plus the same per-value fields an ordinary source
+/// declares. Deliberately excludes `command`, `interval`/`cron`, `timeout`,
+/// `setup`, and `retry_interval` — those stay on the parent, so declaring one
+/// here is a parse-time "unknown field" error via `deny_unknown_fields`
+/// rather than a runtime check.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildDecl {
+    pub name: String,
+    pub title: Option<String>,
+    pub unit: Option<String>,
+    pub format: Option<ValueFormat>,
+    #[serde(default)]
+    pub thresholds: Vec<Threshold>,
+    pub history_points: Option<u32>,
+    pub show_history: Option<bool>,
+    pub show_in: Option<View>,
+    pub value_type: Option<ValueType>,
 }
 
 /// One coloring band for a source's numeric value. `Serialize` supports
@@ -269,6 +296,16 @@ pub enum SourceCfg {
         /// stored value type).
         value_type: Option<ValueType>,
         command: String,
+        /// Declared children, forming a composite source (spec:
+        /// source-configuration — Composite source children): when present
+        /// and non-empty, this source's command output is a JSON array
+        /// fanned out to these children instead of a single value.
+        /// `Some(vec![])` (an explicitly empty list) is invalid — distinct
+        /// from `None` (an ordinary, non-composite query source) precisely
+        /// so an empty list can be rejected instead of silently behaving
+        /// like no `children` field at all.
+        #[serde(default)]
+        children: Option<Vec<ChildDecl>>,
     },
     /// Long-running shell command whose stdout is a stream of `jsonl` rows,
     /// one JSON object per line, each producing one reading. No schedule:
@@ -322,6 +359,34 @@ pub enum SourceCfg {
         show_in: Option<View>,
         value_type: Option<ValueType>,
     },
+    /// One composite source's expanded child (spec: source-configuration —
+    /// Composite source children). Never deserialized from a real
+    /// `[[sources]]` entry in practice — [`expand_composites`] is the only
+    /// producer, and rejects any source that already arrived as this variant
+    /// before it runs. `effective_interval`, `cron`, and `timeout` are
+    /// denormalized copies of the parent's own schedule/timeout at expansion
+    /// time, since a child declares none of its own — this keeps every
+    /// accessor below a pure `match self`, needing no lookup into the rest
+    /// of `Config::sources`.
+    Child {
+        name: String,
+        parent: String,
+        title: Option<String>,
+        unit: Option<String>,
+        format: Option<ValueFormat>,
+        #[serde(default)]
+        thresholds: Vec<Threshold>,
+        history_points: Option<u32>,
+        show_history: Option<bool>,
+        show_in: Option<View>,
+        value_type: Option<ValueType>,
+        #[serde(skip, default = "super::defaults::default_interval")]
+        effective_interval: Duration,
+        #[serde(skip)]
+        cron: Option<String>,
+        #[serde(skip, default = "super::defaults::default_timeout")]
+        timeout: Duration,
+    },
 }
 
 impl SourceCfg {
@@ -331,6 +396,7 @@ impl SourceCfg {
             SourceCfg::Query { .. } => SourceType::Query,
             SourceCfg::Stream { .. } => SourceType::Stream,
             SourceCfg::Ingest { .. } => SourceType::Ingest,
+            SourceCfg::Child { .. } => SourceType::Child,
         }
     }
 
@@ -343,24 +409,64 @@ impl SourceCfg {
     pub fn is_ingest(&self) -> bool {
         matches!(self, SourceCfg::Ingest { .. })
     }
+
+    /// Whether this source is a composite root: a `query` source declaring
+    /// one or more children (spec: source-configuration — Composite source
+    /// children). Always `false` for a `Child` itself — nesting isn't
+    /// supported.
+    #[must_use]
+    pub fn is_composite(&self) -> bool {
+        matches!(self, SourceCfg::Query { children: Some(c), .. } if !c.is_empty())
+    }
+
+    /// Whether this source is one composite source's expanded child (spec:
+    /// source-configuration — Composite source children).
+    #[must_use]
+    pub fn is_child(&self) -> bool {
+        matches!(self, SourceCfg::Child { .. })
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            SourceCfg::Query { name, .. } | SourceCfg::Stream { name, .. } | SourceCfg::Ingest { name, .. } => name,
+            SourceCfg::Query { name, .. }
+            | SourceCfg::Stream { name, .. }
+            | SourceCfg::Ingest { name, .. }
+            | SourceCfg::Child { name, .. } => name,
+        }
+    }
+
+    /// The full name of this child's composite root, or `None` for anything
+    /// but a `Child` (spec: source-configuration — Composite source
+    /// children).
+    #[must_use]
+    pub fn parent(&self) -> Option<&str> {
+        match self {
+            SourceCfg::Child { parent, .. } => Some(parent),
+            _ => None,
         }
     }
 
     #[must_use]
     pub fn display_title(&self) -> Option<&str> {
         match self {
-            SourceCfg::Query { title, .. } | SourceCfg::Stream { title, .. } | SourceCfg::Ingest { title, .. } => title.as_deref(),
+            SourceCfg::Query { title, .. }
+            | SourceCfg::Stream { title, .. }
+            | SourceCfg::Ingest { title, .. }
+            | SourceCfg::Child { title, .. } => title.as_deref(),
         }
     }
 
+    /// A child's own `timeout` is denormalized from its parent at expansion
+    /// time: a child has no command of its own, but this is still consulted
+    /// to size a daemon-mode poll request's client timeout (spec: cli — Poll
+    /// and fetch accept composite roots and children).
     #[must_use]
     pub fn timeout(&self) -> Duration {
         match self {
-            SourceCfg::Query { timeout, .. } | SourceCfg::Stream { timeout, .. } => *timeout,
+            SourceCfg::Query { timeout, .. }
+            | SourceCfg::Stream { timeout, .. }
+            | SourceCfg::Child { timeout, .. } => *timeout,
             SourceCfg::Ingest { .. } => super::defaults::default_timeout(),
         }
     }
@@ -368,7 +474,10 @@ impl SourceCfg {
     #[must_use]
     pub fn unit(&self) -> Option<&str> {
         match self {
-            SourceCfg::Query { unit, .. } | SourceCfg::Stream { unit, .. } | SourceCfg::Ingest { unit, .. } => unit.as_deref(),
+            SourceCfg::Query { unit, .. }
+            | SourceCfg::Stream { unit, .. }
+            | SourceCfg::Ingest { unit, .. }
+            | SourceCfg::Child { unit, .. } => unit.as_deref(),
         }
     }
 
@@ -376,57 +485,67 @@ impl SourceCfg {
     pub fn setup(&self) -> Option<&str> {
         match self {
             SourceCfg::Query { setup, .. } | SourceCfg::Stream { setup, .. } => setup.as_deref(),
-            SourceCfg::Ingest { .. } => None,
+            SourceCfg::Ingest { .. } | SourceCfg::Child { .. } => None,
         }
     }
 
     #[must_use]
     pub fn format(&self) -> Option<ValueFormat> {
         match self {
-            SourceCfg::Query { format, .. } | SourceCfg::Stream { format, .. } | SourceCfg::Ingest { format, .. } => *format,
+            SourceCfg::Query { format, .. }
+            | SourceCfg::Stream { format, .. }
+            | SourceCfg::Ingest { format, .. }
+            | SourceCfg::Child { format, .. } => *format,
         }
     }
 
     #[must_use]
     pub fn thresholds(&self) -> &[Threshold] {
         match self {
-            SourceCfg::Query { thresholds, .. } | SourceCfg::Stream { thresholds, .. } | SourceCfg::Ingest { thresholds, .. } => {
-                thresholds
-            }
+            SourceCfg::Query { thresholds, .. }
+            | SourceCfg::Stream { thresholds, .. }
+            | SourceCfg::Ingest { thresholds, .. }
+            | SourceCfg::Child { thresholds, .. } => thresholds,
         }
     }
 
     #[must_use]
     pub fn history_points(&self) -> Option<u32> {
         match self {
-            SourceCfg::Query { history_points, .. } | SourceCfg::Stream { history_points, .. } | SourceCfg::Ingest { history_points, .. } => {
-                *history_points
-            }
+            SourceCfg::Query { history_points, .. }
+            | SourceCfg::Stream { history_points, .. }
+            | SourceCfg::Ingest { history_points, .. }
+            | SourceCfg::Child { history_points, .. } => *history_points,
         }
     }
 
     #[must_use]
     pub fn show_history(&self) -> Option<bool> {
         match self {
-            SourceCfg::Query { show_history, .. } | SourceCfg::Stream { show_history, .. } | SourceCfg::Ingest { show_history, .. } => {
-                *show_history
-            }
+            SourceCfg::Query { show_history, .. }
+            | SourceCfg::Stream { show_history, .. }
+            | SourceCfg::Ingest { show_history, .. }
+            | SourceCfg::Child { show_history, .. } => *show_history,
         }
     }
 
     #[must_use]
     pub fn show_in(&self) -> Option<View> {
         match self {
-            SourceCfg::Query { show_in, .. } | SourceCfg::Stream { show_in, .. } | SourceCfg::Ingest { show_in, .. } => *show_in,
+            SourceCfg::Query { show_in, .. }
+            | SourceCfg::Stream { show_in, .. }
+            | SourceCfg::Ingest { show_in, .. }
+            | SourceCfg::Child { show_in, .. } => *show_in,
         }
     }
 
     #[must_use]
     pub fn value_type(&self) -> Option<ValueType> {
         match self {
-            SourceCfg::Query { value_type, .. } | SourceCfg::Stream { value_type, .. } | SourceCfg::Ingest { value_type, .. } => {
-                *value_type
-            }
+            SourceCfg::Query { value_type, .. }
+            | SourceCfg::Stream { value_type, .. }
+            | SourceCfg::Ingest { value_type, .. }
+            | SourceCfg::Child { value_type, .. } => *value_type,
         }
     }
 
@@ -434,27 +553,31 @@ impl SourceCfg {
     pub fn command(&self) -> &str {
         match self {
             SourceCfg::Query { command, .. } | SourceCfg::Stream { command, .. } => command,
-            SourceCfg::Ingest { .. } => "",
+            SourceCfg::Ingest { .. } | SourceCfg::Child { .. } => "",
         }
     }
 
     /// A query source's `cron` expression, if scheduled by cron. Always
-    /// `None` for streams, which are continuous rather than scheduled.
+    /// `None` for streams, which are continuous rather than scheduled. A
+    /// child returns its composite root's own `cron`, denormalized at
+    /// expansion time (spec: source-configuration — Composite source
+    /// children).
     #[must_use]
     pub fn cron(&self) -> Option<&str> {
         match self {
-            SourceCfg::Query { cron, .. } => cron.as_deref(),
+            SourceCfg::Query { cron, .. } | SourceCfg::Child { cron, .. } => cron.as_deref(),
             SourceCfg::Stream { .. } | SourceCfg::Ingest { .. } => None,
         }
     }
 
     /// A query source's declared `interval`, if scheduled by interval.
-    /// Always `None` for streams.
+    /// Always `None` for streams and children (a child has no schedule of
+    /// its own to report — use [`SourceCfg::effective_interval`] instead).
     #[must_use]
     pub fn interval(&self) -> Option<Duration> {
         match self {
             SourceCfg::Query { interval, .. } => *interval,
-            SourceCfg::Stream { .. } | SourceCfg::Ingest { .. } => None,
+            SourceCfg::Stream { .. } | SourceCfg::Ingest { .. } | SourceCfg::Child { .. } => None,
         }
     }
 
@@ -464,16 +587,16 @@ impl SourceCfg {
             SourceCfg::Query { retry_interval, .. } | SourceCfg::Stream { retry_interval, .. } => {
                 *retry_interval
             }
-            SourceCfg::Ingest { .. } => None,
+            SourceCfg::Ingest { .. } | SourceCfg::Child { .. } => None,
         }
     }
 
     /// A stream source's maximum silence between values. Always `None` for
-    /// queries, which are scheduled rather than continuous.
+    /// queries and children, which are scheduled rather than continuous.
     #[must_use]
     pub fn expected_interval(&self) -> Option<Duration> {
         match self {
-            SourceCfg::Query { .. } => None,
+            SourceCfg::Query { .. } | SourceCfg::Child { .. } => None,
             SourceCfg::Stream {
                 expected_interval, ..
             }
@@ -483,7 +606,10 @@ impl SourceCfg {
 
     /// The interval to schedule a query source on when it has no `cron`
     /// expression: its declared `interval`, or the default when neither is set.
-    /// For streams this is the staleness window, i.e. `expected_interval`.
+    /// For streams this is the staleness window, i.e. `expected_interval`. A
+    /// child returns its composite root's own effective interval,
+    /// denormalized at expansion time (spec: source-configuration —
+    /// Composite source children).
     #[must_use]
     pub fn effective_interval(&self) -> Duration {
         match self {
@@ -492,6 +618,9 @@ impl SourceCfg {
                 expected_interval, ..
             }
             | SourceCfg::Ingest { expected_interval, .. } => *expected_interval,
+            SourceCfg::Child {
+                effective_interval, ..
+            } => *effective_interval,
         }
     }
 
@@ -523,6 +652,107 @@ impl SourceCfg {
     pub fn effective_value_type(&self) -> ValueType {
         self.value_type().unwrap_or_default()
     }
+}
+
+/// Every declared child of the composite source named `name`, in declaration
+/// order, or empty when `name` isn't a composite source (spec: web-ui / tui —
+/// a composite root renders as a table of its children; data-collection —
+/// Force polling a composite source or its children).
+#[must_use]
+pub fn composite_children<'a>(cfg: &'a Config, name: &str) -> Vec<&'a SourceCfg> {
+    cfg.sources
+        .iter()
+        .filter(|s| s.parent() == Some(name))
+        .collect()
+}
+
+/// Expands every composite `query` source's declared `children` into
+/// addressable [`SourceCfg::Child`] entries appended to `cfg.sources`, and
+/// validates the composite shape (spec: source-configuration — Composite
+/// source children; Composite root field restrictions). Must run before
+/// [`super::validate`], whose per-source uniqueness and field checks then
+/// cover the expanded entries for free — [`super::load_from`] does this;
+/// tests exercising composite behavior without going through `load` must
+/// call this explicitly first.
+pub fn expand_composites(cfg: &mut Config) -> Result<()> {
+    // `Child` only ever exists as this function's own output — a config
+    // that already contains one arrived via a hand-authored `type = "child"`
+    // entry, bypassing every check below.
+    for s in &cfg.sources {
+        if let SourceCfg::Child { name, .. } = s {
+            bail!(
+                "source `{name}`: `child` is not a valid source `type` (children are declared under a parent's `children` list)"
+            );
+        }
+    }
+    let mut expanded = Vec::new();
+    for s in &cfg.sources {
+        let SourceCfg::Query {
+            name,
+            children: Some(children),
+            unit,
+            thresholds,
+            value_type,
+            format,
+            show_history,
+            ..
+        } = s
+        else {
+            continue;
+        };
+        if children.is_empty() {
+            bail!("composite source `{name}` declares an empty `children` list");
+        }
+        if unit.is_some() {
+            bail!("composite source `{name}` must not declare `unit`");
+        }
+        if !thresholds.is_empty() {
+            bail!("composite source `{name}` must not declare `thresholds`");
+        }
+        if value_type.is_some() {
+            bail!("composite source `{name}` must not declare `value_type`");
+        }
+        if format.is_some() {
+            bail!("composite source `{name}` must not declare `format`");
+        }
+        if show_history.is_some() {
+            bail!("composite source `{name}` must not declare `show_history`");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in children {
+            if c.name.is_empty()
+                || !c
+                    .name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
+                bail!(
+                    "composite source `{name}` child `{}` name must contain only ASCII letters, digits, `_`, or `-`",
+                    c.name
+                );
+            }
+            if !seen.insert(c.name.clone()) {
+                bail!("composite source `{name}` has duplicate child `{}`", c.name);
+            }
+            expanded.push(SourceCfg::Child {
+                name: format!("{name}::{}", c.name),
+                parent: name.clone(),
+                title: c.title.clone(),
+                unit: c.unit.clone(),
+                format: c.format,
+                thresholds: c.thresholds.clone(),
+                history_points: c.history_points,
+                show_history: c.show_history,
+                show_in: c.show_in,
+                value_type: c.value_type,
+                effective_interval: s.effective_interval(),
+                cron: s.cron().map(str::to_string),
+                timeout: s.timeout(),
+            });
+        }
+    }
+    cfg.sources.extend(expanded);
+    Ok(())
 }
 
 /// One structured output row: a single-line JSON object carrying a new
@@ -841,5 +1071,166 @@ type = "ingest""#,
         )
         .unwrap_err();
         assert!(err.to_string().contains("expected_interval"));
+    }
+
+    fn composite_cfg(root_extra: &str, children: &str) -> Config {
+        toml::from_str(&format!(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"10s\"\n{root_extra}\n{children}"
+        ))
+        .unwrap()
+    }
+
+    fn child_toml(name: &str, extra: &str) -> String {
+        format!("[[sources.children]]\nname = \"{name}\"\n{extra}\n")
+    }
+
+    /// (spec: source-configuration — Composite source children)
+    #[test]
+    fn composite_expands_children_into_addressable_sources() {
+        let mut cfg = composite_cfg(
+            "",
+            &(child_toml("1m", "") + &child_toml("5m", "") + &child_toml("15m", "")),
+        );
+        expand_composites(&mut cfg).unwrap();
+        assert_eq!(cfg.sources.len(), 4);
+        for full in ["load::1m", "load::5m", "load::15m"] {
+            let child = cfg.sources.iter().find(|s| s.name() == full).unwrap();
+            assert!(child.is_child());
+            assert_eq!(child.parent(), Some("load"));
+        }
+        assert!(cfg.sources[0].is_composite());
+    }
+
+    /// (spec: source-configuration — Composite source children)
+    #[test]
+    fn composite_child_declaring_command_is_rejected() {
+        let err = toml::from_str::<Config>(&format!(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"10s\"\n{}",
+            child_toml("1m", "command = \"echo 0\"")
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("command"), "{err}");
+    }
+
+    /// (spec: source-configuration — Composite source children)
+    #[test]
+    fn composite_child_declaring_schedule_field_is_rejected() {
+        for field in ["interval = \"5s\"", "timeout = \"5s\"", "setup = \"true\"", "retry_interval = \"5s\""] {
+            let err = toml::from_str::<Config>(&format!(
+                "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"10s\"\n{}",
+                child_toml("1m", field)
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains(field.split(' ').next().unwrap()), "{err}");
+        }
+    }
+
+    /// (spec: source-configuration — Composite source children)
+    #[test]
+    fn composite_duplicate_full_name_is_rejected() {
+        let mut cfg: Config = toml::from_str(&format!(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"10s\"\n{}\n[[sources]]\nname = \"load::1m\"\ntype = \"query\"\ncommand = \"echo 0\"\ninterval = \"10s\"\n",
+            child_toml("1m", "")
+        ))
+        .unwrap();
+        expand_composites(&mut cfg).unwrap();
+        let err = super::super::validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("load::1m"), "{err}");
+    }
+
+    /// (spec: source-configuration — Composite source children)
+    #[test]
+    fn composite_child_name_with_separator_is_rejected() {
+        let mut cfg = composite_cfg("", &child_toml("1m::x", ""));
+        let err = expand_composites(&mut cfg).unwrap_err();
+        assert!(err.to_string().contains("1m::x"), "{err}");
+    }
+
+    /// (spec: source-configuration — Composite source children)
+    #[test]
+    fn composite_children_on_stream_is_rejected() {
+        let err = toml::from_str::<Config>(&format!(
+            "[[sources]]\nname = \"s\"\ntype = \"stream\"\ncommand = \"cat\"\nexpected_interval = \"1m\"\n{}",
+            child_toml("1m", "")
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("children"), "{err}");
+    }
+
+    /// (spec: source-configuration — Composite source children)
+    #[test]
+    fn composite_empty_children_list_is_rejected() {
+        let mut cfg: Config = toml::from_str(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"10s\"\nchildren = []\n",
+        )
+        .unwrap();
+        let err = expand_composites(&mut cfg).unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    /// (spec: source-configuration — Composite root field restrictions)
+    #[test]
+    fn composite_root_declaring_per_value_field_is_rejected() {
+        for extra in [
+            "unit = \"x\"",
+            "thresholds = [{bound = 1.0, level = \"green\"}, {bound = 2.0, level = \"red\"}]",
+            "value_type = \"double\"",
+            "format = \"markdown\"",
+            "show_history = false",
+        ] {
+            let mut cfg = composite_cfg(extra, &child_toml("1m", ""));
+            let err = expand_composites(&mut cfg).unwrap_err();
+            assert!(err.to_string().contains("must not declare"), "{err}");
+        }
+    }
+
+    /// (spec: source-configuration — Composite root field restrictions)
+    #[test]
+    fn composite_root_operational_fields_remain_valid() {
+        let mut cfg = composite_cfg(
+            "title = \"Load\"\nshow_in = \"tui\"\ntimeout = \"5s\"",
+            &child_toml("1m", ""),
+        );
+        expand_composites(&mut cfg).unwrap();
+        super::super::validate(&cfg).unwrap();
+    }
+
+    /// A hand-authored `type = "child"` entry bypasses every composite
+    /// check `expand_composites` runs, so it must never be accepted as a
+    /// real source declaration (spec: source-configuration — Composite
+    /// source children).
+    #[test]
+    fn explicit_child_type_is_rejected() {
+        let mut cfg: Config =
+            toml::from_str("[[sources]]\nname = \"x\"\ntype = \"child\"\nparent = \"load\"\n")
+                .unwrap();
+        let err = expand_composites(&mut cfg).unwrap_err();
+        assert!(err.to_string().contains("child"), "{err}");
+    }
+
+    /// A child has no schedule of its own — it reports its composite root's
+    /// (spec: source-configuration — Composite source children).
+    #[test]
+    fn composite_children_denormalize_parent_schedule_and_timeout() {
+        let mut cfg = composite_cfg("timeout = \"7s\"", &child_toml("1m", ""));
+        expand_composites(&mut cfg).unwrap();
+        let child = cfg.sources.iter().find(|s| s.name() == "load::1m").unwrap();
+        assert_eq!(child.effective_interval(), Duration::from_secs(10));
+        assert_eq!(child.timeout(), Duration::from_secs(7));
+        assert_eq!(child.cron(), None);
+        assert_eq!(child.interval(), None, "a child reports no schedule of its own");
+
+        let mut cron_cfg: Config = toml::from_str(&format!(
+            "[[sources]]\nname = \"backup\"\ntype = \"query\"\ncommand = \"cat\"\ncron = \"0 0 3 * * *\"\n{}",
+            child_toml("a", "")
+        ))
+        .unwrap();
+        expand_composites(&mut cron_cfg).unwrap();
+        let child = cron_cfg
+            .sources
+            .iter()
+            .find(|s| s.name() == "backup::a")
+            .unwrap();
+        assert_eq!(child.cron(), Some("0 0 3 * * *"));
     }
 }

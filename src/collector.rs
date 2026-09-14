@@ -147,11 +147,17 @@ pub enum Control {
     /// data-collection — Ingested values reset interval schedules). A no-op
     /// for a cron schedule.
     ResetSchedule,
-    /// Fetch now regardless of the schedule, and reply with the outcome
-    /// (spec: data-collection — Forced polls are serialized with a source's
-    /// schedule). A dropped reply channel is fine: the fetch still ran and
-    /// was recorded, only nobody is listening for the result any more.
-    PollNow(tokio::sync::oneshot::Sender<PollOutcome>),
+    /// Fetch now regardless of the schedule, and reply with the outcome for
+    /// the named source (spec: data-collection — Forced polls are
+    /// serialized with a source's schedule). For an ordinary source this is
+    /// always that source's own name; a composite root and every one of its
+    /// children share one task and one channel, so the name says which of
+    /// them the caller actually asked about — the fetch itself always runs
+    /// the whole family exactly once regardless (spec: data-collection —
+    /// Force polling a composite source or its children). A dropped reply
+    /// channel is fine: the fetch still ran and was recorded, only nobody is
+    /// listening for the result any more.
+    PollNow(String, tokio::sync::oneshot::Sender<PollOutcome>),
 }
 
 pub type ControlSender = tokio::sync::mpsc::UnboundedSender<Control>;
@@ -185,18 +191,25 @@ pub fn unpollable_reason(src: &SourceCfg) -> Option<&'static str> {
     }
 }
 
-/// Sources the collector drives with a task: every source except `ingest`,
-/// which has no schedule and receives data only via HTTP push, so it never
-/// reaches [`loop_source`] (spec: data-collection — Ingest sources have no
-/// collector task). Shared by every entry point that iterates `cfg.sources`
-/// so the exclusion lives in exactly one place.
+/// Sources the collector drives with a task: every source except `ingest`
+/// (which has no schedule and receives data only via HTTP push, spec:
+/// data-collection — Ingest sources have no collector task) and a composite
+/// source's `Child` entries, which have no command or schedule of their
+/// own — their composite root's task fetches for the whole family (spec:
+/// source-configuration — Composite source children). Shared by every entry
+/// point that iterates `cfg.sources` so the exclusion lives in exactly one
+/// place.
 fn collectible(cfg: &Config) -> impl Iterator<Item = &SourceCfg> {
-    cfg.sources.iter().filter(|src| !src.is_ingest())
+    cfg.sources.iter().filter(|src| !src.is_ingest() && !src.is_child())
 }
 
 /// Builds the [`ControlHub`] for a config. Fails on a source whose kind
 /// cannot be built, mirroring what its collector task would report at
-/// startup.
+/// startup. A composite root's channel is also registered under every one
+/// of its children's full names — all pointing at the same task, since
+/// forcing a child fans out to the whole family exactly like forcing the
+/// root does (spec: data-collection — Force polling a composite source or
+/// its children).
 pub fn control_channels(cfg: &Config) -> Result<ControlHub> {
     let mut hub = ControlHub {
         txs: HashMap::new(),
@@ -205,8 +218,11 @@ pub fn control_channels(cfg: &Config) -> Result<ControlHub> {
     for src in collectible(cfg) {
         if !matches!(source::build(src)?, source::SourceKind::Stream { .. }) {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            hub.txs.insert(src.name().to_string(), tx);
+            hub.txs.insert(src.name().to_string(), tx.clone());
             hub.rxs.insert(src.name().to_string(), rx);
+            for child in crate::config::composite_children(cfg, src.name()) {
+                hub.txs.insert(child.name().to_string(), tx.clone());
+            }
         }
     }
     Ok(hub)
@@ -318,14 +334,20 @@ async fn loop_source(
                     &mut last_status,
                     &mut setup_done,
                     &mut schedule,
+                    src.name(),
                 )
                 .await;
             }
             // A forced poll runs here, on this source's own task, so it can
             // never overlap that source's scheduled fetch and its schedule
             // restarts from the forced attempt (spec: data-collection —
-            // Forced polls are serialized with a source's schedule).
-            Work::PollNow(reply) => {
+            // Forced polls are serialized with a source's schedule). The
+            // requested name is the caller's own — this source's name for an
+            // ordinary source, or possibly a child's full name when `src` is
+            // a composite root, since a child's control messages arrive on
+            // this same task (spec: data-collection — Force polling a
+            // composite source or its children).
+            Work::PollNow(requested, reply) => {
                 let outcome = attempt(
                     &db,
                     &cfg,
@@ -334,6 +356,7 @@ async fn loop_source(
                     &mut last_status,
                     &mut setup_done,
                     &mut schedule,
+                    &requested,
                 )
                 .await;
                 let _ = reply.send(outcome);
@@ -354,7 +377,7 @@ enum Work {
     /// Every control sender is gone; stop listening on that channel.
     ControlClosed,
     ResetSchedule,
-    PollNow(tokio::sync::oneshot::Sender<PollOutcome>),
+    PollNow(String, tokio::sync::oneshot::Sender<PollOutcome>),
 }
 
 /// Waits for whichever comes first: this source's schedule, a control
@@ -385,7 +408,7 @@ async fn wait_for_work(
             }
         } => match msg {
             Some(Control::ResetSchedule) => Work::ResetSchedule,
-            Some(Control::PollNow(reply)) => Work::PollNow(reply),
+            Some(Control::PollNow(name, reply)) => Work::PollNow(name, reply),
             None => Work::ControlClosed,
         },
     }
@@ -397,6 +420,15 @@ async fn wait_for_work(
 /// `retry_interval` after a failed fetch, `interval` otherwise (setup
 /// retries stay on the normal tick, spec: data-collection — setup gates
 /// first fetch).
+///
+/// `src` is always this task's own source — a composite root's task never
+/// changes what it fetches — but `requested` names whichever of {`src`, one
+/// of its children} the caller actually asked about, so the returned
+/// [`PollOutcome`] is scoped to that name even though the fetch always runs
+/// the whole family (spec: data-collection — Force polling a composite
+/// source or its children). For an ordinary source `requested` is always
+/// `src.name()`.
+#[allow(clippy::too_many_arguments)] // one per piece of task-local schedule/setup state
 async fn attempt(
     db: &Db,
     cfg: &Config,
@@ -405,15 +437,172 @@ async fn attempt(
     last_status: &mut String,
     setup_done: &mut bool,
     schedule: &mut Schedule,
+    requested: &str,
 ) -> PollOutcome {
     if !*setup_done && !try_setup(db, src, cfg).await {
         schedule.advance(false);
-        return PollOutcome::failed(src.name(), "setup command failed".into());
+        return PollOutcome::failed(requested, "setup command failed".into());
     }
     *setup_done = true;
-    let outcome = fetch_once(db, cfg, src, kind, last_status).await;
-    schedule.advance(!outcome.success);
-    outcome
+    if src.is_composite() {
+        let result = composite_fetch_once(db, cfg, src, last_status).await;
+        schedule.advance(!result.root.success);
+        if requested == src.name() {
+            result.root
+        } else {
+            result.children.get(requested).cloned().unwrap_or_else(|| {
+                PollOutcome::failed(requested, "not a declared child of this composite".into())
+            })
+        }
+    } else {
+        let outcome = fetch_once(db, cfg, src, kind, last_status).await;
+        schedule.advance(!outcome.success);
+        outcome
+    }
+}
+
+/// Both halves of one composite fetch (spec: data-collection — Composite
+/// source command output): the root's own command/parse outcome, and every
+/// declared child's resulting outcome, keyed by full name.
+struct CompositeResult {
+    root: PollOutcome,
+    children: HashMap<String, PollOutcome>,
+}
+
+/// Runs a composite source's command once, parses its stdout as a JSON array
+/// of ingest-shaped items, and stores each declared child's value exactly as
+/// `POST /api/ingest` would for it (spec: data-collection — Composite source
+/// command output). An item naming an id that isn't a declared child fails
+/// the whole attempt; a declared child simply absent from the array fails
+/// only that child (spec: data-collection — Composite fan-out error
+/// handling). Marks the root and every declared child polling for the
+/// duration of the one command (spec: data-collection — Force polling a
+/// composite source or its children).
+async fn composite_fetch_once(
+    db: &Db,
+    cfg: &Config,
+    root: &SourceCfg,
+    last_status: &mut String,
+) -> CompositeResult {
+    let name = root.name();
+    let declared = crate::config::composite_children(cfg, name);
+    let _guards: Vec<_> = std::iter::once(name)
+        .chain(declared.iter().map(|c| c.name()))
+        .map(|n| db.mark_polling(n))
+        .collect();
+
+    let start = Instant::now();
+    let run = tokio::time::timeout(root.timeout(), source::run_shell(root.command(), &cfg.config_dir)).await;
+    #[allow(clippy::cast_possible_truncation)] // durations fit easily
+    let ms = start.elapsed().as_millis() as i64;
+
+    let failed_children = |msg: &str| {
+        declared
+            .iter()
+            .map(|c| (c.name().to_string(), PollOutcome::failed(c.name(), msg.to_string())))
+            .collect()
+    };
+
+    let stdout = match run {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            let msg = format!("{e:#}");
+            record_failure(db, name, ms, &msg).await;
+            refresh_health(db, cfg, name, last_status).await;
+            return CompositeResult {
+                root: PollOutcome::failed(name, msg),
+                children: failed_children("composite command failed"),
+            };
+        }
+        Err(_) => {
+            let msg = format!(
+                "timed out after {}",
+                humantime::format_duration(root.timeout())
+            );
+            record_failure(db, name, ms, &msg).await;
+            refresh_health(db, cfg, name, last_status).await;
+            return CompositeResult {
+                root: PollOutcome::failed(name, msg),
+                children: failed_children("composite command timed out"),
+            };
+        }
+    };
+
+    let items: Vec<source::IngestItem> = match serde_json::from_str(&stdout) {
+        Ok(items) => items,
+        Err(e) => {
+            let msg = format!("composite output is not a JSON array of ingest items: {e}");
+            record_failure(db, name, ms, &msg).await;
+            refresh_health(db, cfg, name, last_status).await;
+            return CompositeResult {
+                root: PollOutcome::failed(name, msg),
+                children: failed_children("composite output was malformed"),
+            };
+        }
+    };
+
+    if let Some(bad) = items.iter().find(|it| !declared.iter().any(|c| c.name() == it.source)) {
+        let msg = format!("composite output names unknown child `{}`", bad.source);
+        record_failure(db, name, ms, &msg).await;
+        refresh_health(db, cfg, name, last_status).await;
+        return CompositeResult {
+            root: PollOutcome::failed(name, msg),
+            children: failed_children("a sibling entry failed validation"),
+        };
+    }
+
+    if let Err(e) = db.insert_log(name, ms, None, None, Origin::Poll).await {
+        tracing::error!("insert log `{name}`: {e:#}");
+    }
+    refresh_health(db, cfg, name, last_status).await;
+
+    CompositeResult {
+        root: PollOutcome::composite_root_ok(name),
+        children: store_composite_children(db, cfg, &declared, &items, ms).await,
+    }
+}
+
+/// Stores each declared child's value from a composite fetch's already-parsed
+/// items — one `PollOutcome` per child, keyed by full name (spec:
+/// data-collection — Composite fan-out error handling). A child present in
+/// `items` is converted, validated, and stored exactly as `POST /api/ingest`
+/// would; a declared child absent from `items` is recorded as a failed
+/// attempt for just that child.
+async fn store_composite_children(
+    db: &Db,
+    cfg: &Config,
+    declared: &[&SourceCfg],
+    items: &[source::IngestItem],
+    ms: i64,
+) -> HashMap<String, PollOutcome> {
+    let arrival = crate::db::now();
+    let mut children = HashMap::new();
+    for child in declared {
+        let cname = child.name();
+        let Some(item) = items.iter().find(|it| it.source == cname) else {
+            let msg = "missing from composite output".to_string();
+            record_failure(db, cname, ms, &msg).await;
+            refresh_health_opt(db, cfg, cname, None).await;
+            children.insert(cname.to_string(), PollOutcome::failed(cname, msg));
+            continue;
+        };
+        let outcome = match source::resolve_ingest_item(item, arrival.clone(), child.effective_value_type())
+        {
+            Ok(parsed) => {
+                match store_parsed_value(db, cfg, child, None, &parsed, ms, Origin::Poll).await {
+                    Ok(()) => PollOutcome::stored(cname, &parsed),
+                    Err(e) => PollOutcome::failed(cname, e),
+                }
+            }
+            Err(e) => {
+                record_failure(db, cname, ms, &e).await;
+                refresh_health_opt(db, cfg, cname, None).await;
+                PollOutcome::failed(cname, e)
+            }
+        };
+        children.insert(cname.to_string(), outcome);
+    }
+    children
 }
 
 /// Continuous ingest for one stream source (spec: data-collection — Stream
@@ -723,8 +912,37 @@ pub async fn collect_once(db: &Db, cfg: &Config) {
 /// serialize against. Under a running daemon the source's own collector
 /// task does this instead (spec: data-collection — Forced polls are
 /// serialized with a source's schedule).
+///
+/// `src` may be a composite root, one of its children, or an ordinary
+/// source. A child's own command is its composite root's — this runs that
+/// root's command once, fans out to every declared child, and returns just
+/// `src`'s own resulting outcome (spec: data-collection — Force polling a
+/// composite source or its children).
 pub async fn poll_once(db: &Db, cfg: &Config, src: &SourceCfg) -> PollOutcome {
     let name = src.name();
+    if let Some(parent) = src.parent() {
+        let Some(root) = cfg.sources.iter().find(|s| s.name() == parent) else {
+            return PollOutcome::failed(name, format!("composite root `{parent}` not found"));
+        };
+        let mut last_status = db
+            .last_health(parent)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "healthy".into());
+        let mut result = composite_fetch_once(db, cfg, root, &mut last_status).await;
+        return result
+            .children
+            .remove(name)
+            .unwrap_or_else(|| PollOutcome::failed(name, "child missing from composite result".into()));
+    }
+    if src.is_composite() {
+        let mut last_status = db
+            .last_health(name)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "healthy".into());
+        return composite_fetch_once(db, cfg, src, &mut last_status).await.root;
+    }
     let kind = match source::build(src) {
         Ok(k) => k,
         Err(e) => return PollOutcome::failed(name, format!("{e:#}")),
@@ -812,6 +1030,20 @@ impl PollOutcome {
             value: None,
             ts: None,
             error: Some(error),
+        }
+    }
+
+    /// A composite root's own outcome: its command ran and its stdout parsed
+    /// as the expected JSON array. Carries no `value`/`ts` — the root itself
+    /// never stores a reading, only its declared children do (spec:
+    /// data-collection — Composite source command output).
+    fn composite_root_ok(source: &str) -> Self {
+        Self {
+            source: source.to_string(),
+            success: true,
+            value: None,
+            ts: None,
+            error: None,
         }
     }
 }
@@ -1408,5 +1640,201 @@ mod tests {
             logs[0].error.is_some(),
             "newest (the bad row) should have failed"
         );
+    }
+
+    /// `[[sources.children]]` under a `[[sources]]` table, expanded via
+    /// `config::expand_composites` exactly like `config::load` would.
+    fn composite_cfg(command: &str, children: &[&str]) -> Config {
+        let mut children_toml = String::new();
+        for c in children {
+            use std::fmt::Write as _;
+            let _ = write!(children_toml, "[[sources.children]]\nname = \"{c}\"\n");
+        }
+        let escaped = command.replace('"', "\\\"");
+        let mut cfg: Config = toml::from_str(&format!(
+            "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"{escaped}\"\ninterval = \"1h\"\n{children_toml}"
+        ))
+        .unwrap();
+        crate::config::expand_composites(&mut cfg).unwrap();
+        cfg
+    }
+
+    fn find_child<'a>(cfg: &'a Config, full: &str) -> &'a SourceCfg {
+        cfg.sources.iter().find(|s| s.name() == full).unwrap()
+    }
+
+    /// A well-formed array stores every child exactly as an equivalent
+    /// `/api/ingest` push would (spec: data-collection — Composite source
+    /// command output).
+    #[tokio::test]
+    async fn poll_once_on_composite_root_stores_every_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = composite_cfg(
+            r#"echo '[{"source":"load::1m","value":"0.1"},{"source":"load::5m","value":"0.2"}]'"#,
+            &["1m", "5m"],
+        );
+        let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap();
+
+        let outcome = poll_once(&db, &cfg, root).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(outcome.value.is_none(), "the root itself stores no value");
+
+        assert_eq!(
+            db.latest_values()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.source == "load::1m")
+                .unwrap()
+                .value,
+            "0.1"
+        );
+        assert_eq!(
+            db.latest_values()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.source == "load::5m")
+                .unwrap()
+                .value,
+            "0.2"
+        );
+        assert!(
+            db.logs(Some("load"), 10).await.unwrap()[0].error.is_none(),
+            "root's own log entry records the command/parse success"
+        );
+    }
+
+    /// Forcing a single child fans out to every declared sibling from the
+    /// same command run, and returns just that child's own outcome (spec:
+    /// data-collection — Force polling a composite source or its children).
+    #[tokio::test]
+    async fn poll_once_on_a_child_fans_out_to_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = composite_cfg(
+            r#"echo '[{"source":"load::1m","value":"0.1"},{"source":"load::5m","value":"0.2"}]'"#,
+            &["1m", "5m"],
+        );
+
+        let outcome = poll_once(&db, &cfg, find_child(&cfg, "load::1m")).await;
+        assert!(outcome.success);
+        assert_eq!(outcome.source, "load::1m");
+        assert_eq!(outcome.value.as_deref(), Some("0.1"));
+
+        assert_eq!(
+            db.latest_values()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.source == "load::5m")
+                .unwrap()
+                .value,
+            "0.2",
+            "the sibling not named in the request is refreshed too"
+        );
+    }
+
+    /// A declared child missing from the array fails only that child; the
+    /// root and present siblings succeed normally (spec: data-collection —
+    /// Composite fan-out error handling).
+    #[tokio::test]
+    async fn missing_declared_child_fails_only_that_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = composite_cfg(
+            r#"echo '[{"source":"load::1m","value":"0.1"}]'"#,
+            &["1m", "5m"],
+        );
+        let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap();
+
+        let outcome = poll_once(&db, &cfg, root).await;
+        assert!(outcome.success, "root still succeeds: the command ran and parsed");
+
+        let outcome_5m = poll_once(&db, &cfg, find_child(&cfg, "load::5m")).await;
+        // The above re-runs the command, so re-check via direct log inspection
+        // of the *first* run's effect instead of the second call's outcome.
+        let _ = outcome_5m;
+        assert_eq!(
+            db.latest_values()
+                .await
+                .unwrap()
+                .iter()
+                .find(|r| r.source == "load::1m")
+                .unwrap()
+                .value,
+            "0.1"
+        );
+        let logs_5m = db.logs(Some("load::5m"), 10).await.unwrap();
+        assert!(
+            logs_5m[0].error.as_deref().is_some_and(|e| e.contains("missing")),
+            "{logs_5m:?}"
+        );
+    }
+
+    /// An array entry naming an id that isn't a declared child fails the
+    /// whole attempt: nothing is written for that tick (spec:
+    /// data-collection — Composite fan-out error handling).
+    #[tokio::test]
+    async fn unknown_child_in_output_fails_the_whole_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = composite_cfg(
+            r#"echo '[{"source":"load::1m","value":"0.1"},{"source":"load::nope","value":"9"}]'"#,
+            &["1m"],
+        );
+        let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap();
+
+        let outcome = poll_once(&db, &cfg, root).await;
+        assert!(!outcome.success);
+        assert!(outcome.error.as_deref().is_some_and(|e| e.contains("nope")));
+        assert!(
+            db.latest_values().await.unwrap().is_empty(),
+            "no child should be written when the output names an unknown id"
+        );
+    }
+
+    /// Malformed command output (not a JSON array) fails the whole attempt
+    /// the same way (spec: data-collection — Composite source command
+    /// output).
+    #[tokio::test]
+    async fn malformed_composite_output_fails_the_whole_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = composite_cfg("echo not-json", &["1m"]);
+        let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap();
+
+        let outcome = poll_once(&db, &cfg, root).await;
+        assert!(!outcome.success);
+        assert!(db.latest_values().await.unwrap().is_empty());
+    }
+
+    /// The root and every declared child are reported polling for the
+    /// duration of the one shared command, whichever name triggered it
+    /// (spec: data-collection — Force polling a composite source or its
+    /// children).
+    #[tokio::test]
+    async fn composite_fetch_marks_root_and_every_child_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = composite_cfg(
+            r#"sleep 0.3; echo '[{"source":"load::1m","value":"0.1"},{"source":"load::5m","value":"0.2"}]'"#,
+            &["1m", "5m"],
+        );
+        let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap().clone();
+        let db2 = db.clone();
+        let cfg2 = cfg.clone();
+        let handle = tokio::spawn(async move { poll_once(&db2, &cfg2, &root).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(db.is_polling("load"), "root should be polling");
+        assert!(db.is_polling("load::1m"), "child 1m should be polling");
+        assert!(db.is_polling("load::5m"), "child 5m should be polling");
+
+        handle.await.unwrap();
+        assert!(!db.is_polling("load"));
+        assert!(!db.is_polling("load::1m"));
+        assert!(!db.is_polling("load::5m"));
     }
 }

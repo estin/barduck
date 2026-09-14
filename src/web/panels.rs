@@ -502,6 +502,47 @@ type CellParts = (
     Option<BTreeMap<String, String>>,
 );
 
+/// A composite source's declared children, in order, each built into a
+/// `table`-section `Panel` exactly as a manually-authored `{ table = [...] }`
+/// member would be — filtered to this view like any other source (spec:
+/// web-ui — A composite root renders as a table of its children). Empty when
+/// `name` isn't a composite source, so callers can tell "no children" from
+/// "not a composite" only by checking `composite_children` themselves first.
+fn composite_table_panels(st: &AppState, data: &RenderData, name: &str) -> Vec<Panel> {
+    config::composite_children(&st.cfg, name)
+        .into_iter()
+        .filter(|c| c.visible_in(config::View::Web))
+        .map(|c| build_panel(st, data, c.name(), None))
+        .collect()
+}
+
+/// A single-source cell (`Cell::Source`/`Cell::Pane`) naming a composite
+/// root renders its children as a `table` section instead of an ordinary
+/// single-value `main` panel, with a pane title that falls back to the
+/// root's own `title`/name (spec: web-ui — A composite root renders as a
+/// table of its children). `None` when `name` isn't a composite root, so
+/// the caller falls through to its ordinary single-panel handling.
+fn composite_cell_parts(
+    st: &AppState,
+    data: &RenderData,
+    name: &str,
+    title_override: Option<&str>,
+) -> Option<(Vec<Panel>, String)> {
+    let composite = composite_table_panels(st, data, name);
+    if composite.is_empty() {
+        return None;
+    }
+    let title = title_override.unwrap_or_else(|| {
+        st.cfg
+            .sources
+            .iter()
+            .find(|s| s.name() == name)
+            .and_then(config::SourceCfg::display_title)
+            .unwrap_or(name)
+    });
+    Some((composite, title.to_string()))
+}
+
 /// Builds one cell's panel data, dispatching on its config variant. A source
 /// hidden from this view (spec: source-configuration — per-source view
 /// visibility) is simply omitted here, so the cell falls through to the same
@@ -518,21 +559,36 @@ fn build_cell_parts(st: &AppState, data: &RenderData, cell: &config::Cell) -> Ce
             style: group_style,
             ..
         } => {
-            let main = main
+            // A composite `main` has no single value of its own to show — its
+            // children join the table section instead (spec: web-ui — A
+            // composite root renders as a table of its children).
+            let main_composite = main
                 .as_ref()
-                .filter(|item| config::source_visible_in(&st.cfg, item.id(), config::View::Web))
-                .map(&panel);
+                .map(|item| composite_table_panels(st, data, item.id()))
+                .filter(|panels| !panels.is_empty());
+            let main_panel = if main_composite.is_some() {
+                None
+            } else {
+                main.as_ref()
+                    .filter(|item| config::source_visible_in(&st.cfg, item.id(), config::View::Web))
+                    .map(&panel)
+            };
             let secondary_panels = config::visible_items(&st.cfg, secondary, config::View::Web)
                 .into_iter()
                 .map(&panel)
                 .collect();
-            let table_out = config::visible_items(&st.cfg, cell_table, config::View::Web)
-                .into_iter()
-                .map(&panel)
-                .collect();
-            (main, secondary_panels, table_out, title.clone(), None, group_style.clone())
+            let mut table_out: Vec<Panel> = main_composite.unwrap_or_default();
+            table_out.extend(
+                config::visible_items(&st.cfg, cell_table, config::View::Web)
+                    .into_iter()
+                    .map(&panel),
+            );
+            (main_panel, secondary_panels, table_out, title.clone(), None, group_style.clone())
         }
         config::Cell::Source(name) => {
+            if let Some((table, title)) = composite_cell_parts(st, data, name, None) {
+                return (None, Vec::new(), table, Some(title), None, None);
+            }
             let main = if config::source_visible_in(&st.cfg, name, config::View::Web) {
                 Some(build_panel(st, data, name, None))
             } else {
@@ -541,6 +597,11 @@ fn build_cell_parts(st: &AppState, data: &RenderData, cell: &config::Cell) -> Ce
             (main, Vec::new(), Vec::new(), None, None, None)
         }
         config::Cell::Pane { id, title, style: pane_style } => {
+            if let Some((table, resolved_title)) =
+                composite_cell_parts(st, data, id, title.as_deref())
+            {
+                return (None, Vec::new(), table, Some(resolved_title), None, pane_style.clone());
+            }
             let main = if config::source_visible_in(&st.cfg, id, config::View::Web) {
                 Some(build_panel(st, data, id, title.as_deref()))
             } else {

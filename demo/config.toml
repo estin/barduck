@@ -87,6 +87,36 @@ type = "query"
 command = "sh scripts/load-average.sh"
 interval = "10s"
 
+# A composite source (spec: source-configuration — Composite source
+# children): one command run parses `uptime`'s three load averages and
+# fans them out to three independently-displayed, independently-healthed
+# children instead of needing three separate `[[sources]]` entries. Each
+# child is addressed as `load-averages::1m`, `load-averages::5m`,
+# `load-averages::15m`; referencing the root's bare name in a layout (see
+# below) auto-renders a table of all three.
+[[sources]]
+name = "load-averages"
+type = "query"
+command = "sh scripts/load-averages.sh"
+interval = "10s"
+
+[[sources.children]]
+name = "1m"
+unit = "avg"
+
+[[sources.children]]
+name = "5m"
+unit = "avg"
+
+[[sources.children]]
+name = "15m"
+unit = "avg"
+thresholds = [
+    { bound = 2.0, level = "green" },
+    { bound = 4.0, level = "yellow" },
+    { bound = 8.0, level = "red" },
+]
+
 [[sources]]
 name = "status-json"
 type = "query"
@@ -216,4 +246,7 @@ rows = [
 """ },
     ],
     ["status-json", "load-average", "quiet-stream", "dead-service"],
+    # The bare "load-averages" reference auto-renders as a table of its
+    # three children (1m/5m/15m) — no need to list them out.
+    ["load-averages"],
 ]

@@ -13,10 +13,14 @@ pub(crate) fn validate_source(s: &SourceCfg) -> Result<()> {
     // nowhere, so it's restricted to a safe charset rather than trusted as
     // opaque (spec: source-configuration — source names are URL-safe
     // identifiers); use `title` for a human-friendly display label instead.
-    if !s
-        .name()
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    // A child's full name (`<parent>::<bare>`) is exempt here — both halves
+    // are already charset-checked separately: the parent through its own
+    // `validate_source` call, the bare child name by `expand_composites`.
+    if !s.is_child()
+        && !s
+            .name()
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         bail!(
             "source `{}` name must contain only ASCII letters, digits, `_`, or `-`",
@@ -86,6 +90,11 @@ pub(crate) fn validate_source(s: &SourceCfg) -> Result<()> {
                 bail!("ingest source `{}` expected_interval must be > 0", s.name());
             }
         }
+        // A child's shape (no command/schedule/setup of its own, unique full
+        // name, valid bare name) is fully validated by `expand_composites`,
+        // which produced it; the shared threshold/history_points checks
+        // below still apply.
+        SourceCfg::Child { .. } => {}
     }
     for t in s.thresholds() {
         if !t.bound.is_finite() {

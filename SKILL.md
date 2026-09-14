@@ -15,6 +15,53 @@ When a user asks to add a data source, translate their request into a TOML `[[so
 
 **`ingest`** — A push-based source that receives data via HTTP POST. Use this for webhooks, event buses, or any producer that pushes values to barduck's `/api/ingest` endpoint. Has no `command`; data arrives via push. Reports `stale` when no push arrives within `expected_interval`.
 
+### Composite Sources
+
+A `query` source may declare `children`, turning it into a **composite source**: one command run that reports several independently-displayed, independently-healthed values instead of one. Use this when a single cheap command naturally produces a small family of related numbers — load averages for 1/5/15 minutes, per-partition disk usage, multi-sensor readings — instead of writing one `[[sources]]` entry (and spawning one process) per number.
+
+```toml
+[[sources]]
+name = "load"
+type = "query"
+command = "sh scripts/load-average.sh"
+interval = "10s"
+
+[[sources.children]]
+name = "1m"
+unit = "avg"
+
+[[sources.children]]
+name = "5m"
+unit = "avg"
+
+[[sources.children]]
+name = "15m"
+unit = "avg"
+thresholds = [
+  { bound = 2.0, level = "green" },
+  { bound = 4.0, level = "yellow" },
+  { bound = 8.0, level = "red" },
+]
+```
+
+Each child becomes an ordinary, independently addressable source named `<parent>::<child>` (here `load::1m`, `load::5m`, `load::15m`) with its own `title`, `unit`, `format`, `thresholds`, `show_history`, `show_in`, `value_type`, and `history_points` — but **no** `command`, `interval`/`cron`, `timeout`, `setup`, or `retry_interval` of its own: those stay on the parent, which runs on its own schedule exactly like any other `query` source.
+
+**Output contract:** instead of a single value, the composite root's command must print a JSON array of items shaped like an `/api/ingest` payload — `source` (the child's full name), `value`, and optionally `ts` and `thresholds`:
+
+```json
+[
+  {"source": "load::1m", "value": "0.42"},
+  {"source": "load::5m", "value": "0.38"},
+  {"source": "load::15m", "value": "0.31"}
+]
+```
+
+Each entry is stored to its named child exactly as an equivalent `/api/ingest` push would be. The root itself never stores a scalar reading — its own fetch log only reflects whether the command ran and its output parsed as the array above. A declared child missing from the array fails just that child (logged as its own failed attempt); an entry naming an id that isn't a declared child fails the whole attempt for that tick, since it signals a misconfigured or drifted script.
+
+**Validation:** the composite root's own `unit`, `thresholds`, `value_type`, `format`, and `show_history` are rejected at config load — they'd never apply to a value the root itself doesn't produce. `title`, `show_in`, and the root's own schedule fields remain valid. `children` must be non-empty when declared; a bare child name must be unique among its siblings and must not contain `::`. Composite sources are `query`-only — `stream` and `ingest` sources cannot declare `children`, and a child cannot itself have children (no nesting).
+
+**Force polling and display:** forcing a poll of the root or of any one child runs the parent's command once and refreshes every declared child from that single run (`poll --source load` and `poll --source load::1m` are equivalent in what they trigger, differing only in whose outcome is reported back). A layout cell that references the composite root's own name (not a child) auto-renders as a table listing every child's current value, in declared order — the same shape a manually-authored `{ table = [...] }` cell already produces — so referencing `"load"` directly shows all three averages without listing them out. Children remain individually referenceable in any layout cell too.
+
 ### Configuration Format
 
 Sources are defined in `config.toml` using `[[sources]]` tables. Each source is deserialized through a per-type enum — cross-type fields fail at parse time.
@@ -86,6 +133,7 @@ format = "json"
 |-------|----------|-------------|
 | `interval` or `cron` | Yes | Schedule (mutually exclusive) |
 | `history_points` | No | Override web UI history point count |
+| `children` | No | Declares this a composite source (see [Composite Sources](#composite-sources)); each `[[sources.children]]` entry takes `name` plus a child's own `title`/`unit`/`format`/`thresholds`/`history_points`/`show_history`/`show_in`/`value_type` |
 
 ### Value Types
 
@@ -157,6 +205,7 @@ rows = [
   - `{ table = ["src1", "src2"] }` — sources in a table view
   - `{ main = "src", secondary = ["other"], title = "Label" }` — named group with secondary sources
   - `{ kind = "space", colspan = 2 }` — empty spacer cell spanning 2 columns
+- Referencing a [composite source](#composite-sources)'s own name (bare, or as a cell's `main`) auto-renders a table of its children — no need to list them out with `table = [...]`; its children remain individually referenceable too
 ### Web UI Style Overrides
 
 Layouts and cells can have a `style` field with CSS property overrides rendered as inline styles in the web dashboard.
@@ -233,6 +282,15 @@ status. This is a live shared signal: every viewer sees it, not just whoever
 triggered the poll, so there's no separate progress or failure popup — a
 failed attempt shows up the normal way, through the source's health and
 fetch log.
+
+Both `poll` and `fetch` accept a [composite source](#composite-sources)'s own
+name or one of its children's full `<parent>::<child>` name. Either way runs
+the parent's command exactly once and refreshes every declared child from
+that one run — `poll --source load` and `poll --source load::1m` trigger the
+same fetch, differing only in whose outcome is printed; `fetch --source
+load` prints every child's parsed entry, `fetch --source load::1m` just that
+child's. All of {root, every child} show the shared polling marker for the
+duration of that one command.
 
 ### Query Modes
 

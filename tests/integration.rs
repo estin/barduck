@@ -417,7 +417,7 @@ fn request_poll(
 ) -> tokio::sync::oneshot::Receiver<collector::PollOutcome> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     txs[source]
-        .send(collector::Control::PollNow(reply_tx))
+        .send(collector::Control::PollNow(source.to_string(), reply_tx))
         .unwrap();
     reply_rx
 }
@@ -771,6 +771,79 @@ async fn api_force_poll_stores_a_reading_and_reports_it() {
     assert_eq!(rows[0].origin, Origin::Poll);
     assert!(rows[0].error.is_none());
     assert_eq!(db.history("ok", None, None, None).await.unwrap()[0].value, "42");
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+fn composite_poll_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 5
+[[sources]]
+name = "load"
+type = "query"
+command = "echo '[{{\"source\":\"load::1m\",\"value\":\"0.1\"}},{{\"source\":\"load::5m\",\"value\":\"0.2\"}}]'"
+interval = "1h"
+[[sources.children]]
+name = "1m"
+[[sources.children]]
+name = "5m"
+"#,
+        db = db_path.display(),
+    );
+    let mut cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::expand_composites(&mut cfg).unwrap();
+    config::validate(&cfg).unwrap();
+    cfg
+}
+
+/// Forcing either a composite root or one of its children over HTTP fans
+/// out to the whole family from one command run, and each response is
+/// scoped to whichever name was requested (spec: http-api — Force poll
+/// endpoint accepts composite roots and children; data-collection — Force
+/// polling a composite source or its children).
+#[tokio::test]
+async fn api_force_poll_accepts_composite_root_and_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = composite_poll_config(&db_path);
+    let db = Db::open_rw(&db_path).unwrap();
+    let (base, shutdown_tx, tasks) = start_daemon_with_collectors(&cfg, &db).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/sources/load/poll"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["source"], "load");
+    assert_eq!(body["success"], true);
+    assert!(body["value"].is_null(), "the root itself stores no value");
+    assert_eq!(
+        db.latest_values()
+            .await
+            .unwrap()
+            .iter()
+            .find(|r| r.source == "load::5m")
+            .unwrap()
+            .value,
+        "0.2",
+        "forcing the root already refreshed every child"
+    );
+
+    let resp = client
+        .post(format!("{base}/api/sources/load::1m/poll"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["source"], "load::1m");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["value"], "0.1");
 
     stop_collectors(shutdown_tx, tasks).await;
 }
@@ -1304,6 +1377,151 @@ rows = [
         panic!("invalid group pane config: {e:#}");
     }
     cfg
+}
+
+/// A composite source `load` with children `1m`/`5m`, plus a plain source
+/// `note`, laid out so `load` is referenced bare (auto-table) and `load::5m`
+/// is *also* referenced individually elsewhere (spec: web-ui — A composite
+/// root renders as a table of its children).
+fn composite_layout_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "load"
+title = "Load Average"
+type = "query"
+command = "echo '[{{\"source\":\"load::1m\",\"value\":\"0.42\"}},{{\"source\":\"load::5m\",\"value\":\"0.31\"}}]'"
+
+[[sources.children]]
+name = "1m"
+unit = "avg"
+
+[[sources.children]]
+name = "5m"
+unit = "avg"
+
+[[layouts]]
+title = "System"
+rows = [
+  ["load"],
+  ["load::5m"],
+]
+"#,
+        db = db_path.display(),
+    );
+    let mut cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::expand_composites(&mut cfg).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid composite layout config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn web_ui_composite_root_renders_as_a_table_of_its_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = composite_layout_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // The bare `"load"` cell renders as a table pane titled after the root's
+    // own `title`, not a single scalar value.
+    assert!(
+        html.contains(">Load Average</span>"),
+        "composite root's title expected on its auto-rendered pane"
+    );
+    assert!(html.contains("0.42 avg"), "child 1m's value expected");
+    assert!(html.contains("0.31 avg"), "child 5m's value expected");
+    // `load::5m` is also referenced individually elsewhere in the layout —
+    // that cell still renders as an ordinary single-source panel (spec:
+    // web-ui — A composite root renders as a table of its children).
+    assert!(
+        html.contains(r#"id="panel-load::5m""#),
+        "load::5m's own single-source panel expected: {html}"
+    );
+}
+
+/// A generalized pane whose `main` names a composite root: it must render
+/// the children table in place of a single scalar value (spec: web-ui — A
+/// composite root renders as a table of its children).
+fn composite_main_pane_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "load"
+type = "query"
+command = "echo '[{{\"source\":\"load::1m\",\"value\":\"0.42\"}},{{\"source\":\"load::5m\",\"value\":\"0.31\"}}]'"
+
+[[sources.children]]
+name = "1m"
+unit = "avg"
+
+[[sources.children]]
+name = "5m"
+unit = "avg"
+
+[[sources]]
+name = "note"
+type = "query"
+command = "echo hi"
+
+[[layouts]]
+title = "System"
+rows = [
+  [{{ title = "Server", main = "load", table = ["note"] }}],
+]
+"#,
+        db = db_path.display(),
+    );
+    let mut cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::expand_composites(&mut cfg).unwrap();
+    if let Err(e) = config::validate(&cfg) {
+        panic!("invalid composite main-pane config: {e:#}");
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn web_ui_composite_as_pane_main_renders_children_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = composite_main_pane_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(html.contains(">Server</span>"), "pane's own title expected");
+    assert!(html.contains("0.42 avg"), "composite child 1m expected in the table");
+    assert!(html.contains("0.31 avg"), "composite child 5m expected in the table");
+    assert!(html.contains("hi"), "the pane's own table member is unaffected");
 }
 
 #[tokio::test]
