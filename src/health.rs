@@ -39,6 +39,14 @@ pub struct SourceHealth {
     /// these so overrides apply everywhere without extra plumbing.
     #[serde(default)]
     pub thresholds: Vec<crate::config::Threshold>,
+    /// Whether a fetch for this source — scheduled or forced — is running
+    /// right now (spec: data-collection — Poll-in-progress is visible).
+    /// Independent of `status`: a source can be `polling` while its last
+    /// known status is healthy, failing, or stale — this says nothing about
+    /// the *outcome*, only that an attempt is currently in flight. `false`
+    /// in direct mode, where no collector task exists to ever set it.
+    #[serde(default)]
+    pub polling: bool,
 }
 
 /// Derives live health for one source from its recent fetch logs and the age
@@ -132,6 +140,7 @@ fn assemble(
         consecutive_failures: failures,
         last_success_ts: last_success.map(|l| l.ts.clone()),
         thresholds,
+        polling: db.is_polling(source),
     }
 }
 
@@ -307,6 +316,7 @@ mod tests {
             );
             assert_eq!(batch.last_success_ts, one.last_success_ts);
             assert_eq!(batch.thresholds, one.thresholds);
+            assert_eq!(batch.polling, one.polling, "polling for `{}`", s.name());
         }
         let status_of = |name: &str| {
             batched
@@ -346,5 +356,30 @@ mod tests {
         let h = compute(&db, &cfg, "s").await.unwrap();
         assert_eq!(h.thresholds.len(), 1);
         assert_eq!(h.thresholds[0].level, Level::Yellow);
+    }
+
+    /// `polling` reflects the live [`Db::mark_polling`] flag, independent of
+    /// the source's last known status — a healthy source can be mid-fetch
+    /// too (spec: data-collection — Poll-in-progress is visible).
+    #[tokio::test]
+    async fn polling_flag_tracks_the_live_marker() {
+        use crate::db::Origin;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg: Config = toml::from_str(
+            "[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\n",
+        )
+        .unwrap();
+        db.insert_log("s", 1, None, Some("1"), Origin::Poll)
+            .await
+            .unwrap();
+
+        assert!(!compute(&db, &cfg, "s").await.unwrap().polling);
+        let guard = db.mark_polling("s");
+        let h = compute(&db, &cfg, "s").await.unwrap();
+        assert!(h.polling);
+        assert_eq!(h.status, Health::Healthy, "polling doesn't change status");
+        drop(guard);
+        assert!(!compute(&db, &cfg, "s").await.unwrap().polling);
     }
 }

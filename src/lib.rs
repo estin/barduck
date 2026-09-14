@@ -25,10 +25,13 @@ use topcoat::{
 pub struct AppState {
     pub db: Db,
     pub cfg: Arc<Config>,
-    /// Schedule-reset senders, one per interval-scheduled query source
-    /// (spec: data-collection — Ingested values reset interval schedules).
-    /// Empty in tests and one-shot callers, which never reset schedules.
-    pub resets: std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Control senders, one per pollable source: the handlers' way to ask a
+    /// source's collector task to re-arm its schedule (spec: data-collection
+    /// — Ingested values reset interval schedules) or to fetch right now
+    /// (spec: data-collection — Forced polls are serialized with a source's
+    /// schedule). Empty in tests and one-shot callers, which have no
+    /// collector tasks to talk to.
+    pub controls: std::collections::HashMap<String, collector::ControlSender>,
 }
 
 /// Daemon mode: collector + HTTP server (API and web UI) in one process.
@@ -47,7 +50,7 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
         .with_context(|| format!("binding {}", cfg.listen))?;
     warn_if_listen_not_loopback(&cfg.listen);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut hub = collector::reset_channels(&cfg)?;
+    let mut hub = collector::control_channels(&cfg)?;
     let txs = std::mem::take(&mut hub.txs);
     let mut tasks = collector::spawn_graceful(&db, &cfg, &shutdown_rx, hub);
     if let Some(retention) = cfg.retention {
@@ -56,7 +59,7 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
     let state = AppState {
         db,
         cfg: Arc::new(cfg.clone()),
-        resets: txs,
+        controls: txs,
     };
     println!(
         "barduck daemon listening on http://{} (web UI at /)",

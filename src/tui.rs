@@ -90,6 +90,10 @@ struct Panel {
     /// thresholds configured (spec: tui — threshold band coloring).
     level: Option<Level>,
     ts_epoch: f64,
+    /// Whether a fetch for this source — scheduled or forced, from this TUI
+    /// or anywhere else — is running right now (spec: tui — poll-in-progress
+    /// is visible). Independent of `status`.
+    polling: bool,
 }
 
 /// One grid slot: a spacer (`main`/`secondary`/`table`/`text` all empty), a
@@ -139,16 +143,15 @@ fn build_panel(
             .then(|| crate::config::level_for(bands, &r.value))
             .flatten()
     });
+    let health = healths.iter().find(|h| h.source == name);
     Panel {
         name: label.to_string(),
         value: row.map_or_else(|| "—".into(), |r| r.value.clone()),
         unit: row.and_then(|r| r.unit.clone()).unwrap_or_default(),
-        status: healths
-            .iter()
-            .find(|h| h.source == name)
-            .map_or(Health::Stale, |h| h.status),
+        status: health.map_or(Health::Stale, |h| h.status),
         level,
         ts_epoch: row.map_or(0.0, |r| r.ts_epoch),
+        polling: health.is_some_and(|h| h.polling),
     }
 }
 
@@ -383,6 +386,13 @@ fn plain_label(status: Health) -> String {
     }
 }
 
+/// Plain "(polling)" suffix shown while a fetch for this source is running
+/// — independent of `status`, since a healthy, failing, or stale source can
+/// all be mid-fetch (spec: tui — poll-in-progress is visible).
+fn polling_label(polling: bool) -> &'static str {
+    if polling { " (polling)" } else { "" }
+}
+
 /// Comfortable width (terminal columns) for one column of panels in
 /// `"auto"` sizing — enough for a value, unit, and "updated Xs ago".
 const AUTO_COLUMN_WIDTH: u16 = 30;
@@ -568,7 +578,11 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
                 .borders(Borders::ALL)
                 .border_style(style)
                 .title(Span::styled(
-                    format!(" {title} [{}] ", p.status.as_str()),
+                    format!(
+                        " {title} [{}]{} ",
+                        p.status.as_str(),
+                        polling_label(p.polling)
+                    ),
                     style,
                 )),
         )
@@ -592,31 +606,7 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
             lines.push(main_or_secondary_line(p, now, Modifier::empty()));
         }
         for p in &slot.table {
-            let style = status_style(p.level, p.status);
-            // Only show the age when the value is lagging (stale) — a
-            // table line otherwise omits it to stay compact.
-            let updated = if p.status == Health::Stale {
-                crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"))
-            } else {
-                String::new()
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{}: ", p.name),
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-                Span::styled(p.value.clone(), style.add_modifier(Modifier::BOLD)),
-                Span::raw(if p.unit.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", p.unit)
-                }),
-                Span::styled(
-                    plain_label(p.status),
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-                Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
-            ]));
+            lines.push(table_line(p, now));
         }
         Paragraph::new(lines).block(
             Block::default()
@@ -643,6 +633,44 @@ fn main_or_secondary_line(p: &Panel, now: f64, value_modifier: Modifier) -> Line
         }),
         Span::styled(
             plain_label(p.status),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            polling_label(p.polling),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
+    ])
+}
+
+/// One `table` line within a generalized pane: `label: value`, age shown
+/// only when the value is lagging (stale) — a table line otherwise omits it
+/// to stay compact (spec: tui — group panes show multiple labeled,
+/// independently colored values).
+fn table_line(p: &Panel, now: f64) -> Line<'_> {
+    let style = status_style(p.level, p.status);
+    let updated = if p.status == Health::Stale {
+        crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"))
+    } else {
+        String::new()
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{}: ", p.name),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(p.value.clone(), style.add_modifier(Modifier::BOLD)),
+        Span::raw(if p.unit.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", p.unit)
+        }),
+        Span::styled(
+            plain_label(p.status),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            polling_label(p.polling),
             Style::default().add_modifier(Modifier::DIM),
         ),
         Span::styled(updated, Style::default().add_modifier(Modifier::DIM)),
@@ -858,6 +886,7 @@ mod tests {
                             status: Health::Healthy,
                             level: None,
                             ts_epoch: 0.0,
+                            polling: false,
                         }),
                         secondary: Vec::new(),
                         table: Vec::new(),
@@ -873,6 +902,7 @@ mod tests {
                             status: Health::Healthy,
                             level: None,
                             ts_epoch: 0.0,
+                            polling: false,
                         }),
                         secondary: Vec::new(),
                         table: Vec::new(),
@@ -898,6 +928,7 @@ mod tests {
                             status: Health::Failing,
                             level: None,
                             ts_epoch: 0.0,
+                            polling: false,
                         }),
                         secondary: Vec::new(),
                         table: Vec::new(),
@@ -953,6 +984,7 @@ mod tests {
                         status: Health::Stale,
                         level: Some(Level::Red),
                         ts_epoch: now - 629.0,
+                        polling: false,
                     },
                     Panel {
                         name: "balance".into(),
@@ -961,6 +993,7 @@ mod tests {
                         status: Health::Healthy,
                         level: Some(Level::Green),
                         ts_epoch: now,
+                        polling: false,
                     },
                 ],
                 text: None,
@@ -975,13 +1008,14 @@ mod tests {
             .draw(|f| draw(f, &state, &TuiWidth::Fixed(38)))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
-        let text: String = (0..buf.area().height)
+        let rows: Vec<String> = (0..buf.area().height)
             .map(|y| {
                 (0..buf.area().width)
                     .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect();
+        let text = rows.concat();
         assert!(text.contains("ihor"), "group title missing");
         assert!(text.contains("days left"), "first member label missing");
         assert!(text.contains('5'), "first member value missing");
@@ -993,13 +1027,6 @@ mod tests {
         );
 
         // A member that isn't lagging shows no age at all.
-        let rows: Vec<String> = (0..buf.area().height)
-            .map(|y| {
-                (0..buf.area().width)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect();
         let balance_row = rows
             .iter()
             .find(|r| r.contains("balance"))
@@ -1072,6 +1099,7 @@ mod tests {
                         status: Health::Healthy,
                         level: Some(Level::Green),
                         ts_epoch: 0.0,
+                        polling: false,
                     },
                     Panel {
                         name: "flaky".into(),
@@ -1080,6 +1108,7 @@ mod tests {
                         status: Health::Failing,
                         level: None,
                         ts_epoch: 0.0,
+                        polling: false,
                     },
                 ],
                 text: None,
@@ -1152,6 +1181,7 @@ mod tests {
                     status: Health::Healthy,
                     level: Some(Level::Yellow),
                     ts_epoch: 0.0,
+                    polling: false,
                 }),
                 secondary: Vec::new(),
                 table: Vec::new(),
@@ -1210,6 +1240,7 @@ mod tests {
                     status: Health::Healthy,
                     level: Some(Level::Green),
                     ts_epoch: 0.0,
+                    polling: false,
                 }),
                 secondary: vec![Panel {
                     name: "mem-used".into(),
@@ -1218,6 +1249,7 @@ mod tests {
                     status: Health::Failing,
                     level: None,
                     ts_epoch: 0.0,
+                    polling: false,
                 }],
                 table: vec![Panel {
                     name: "days left".into(),
@@ -1226,6 +1258,7 @@ mod tests {
                     status: Health::Healthy,
                     level: Some(Level::Green),
                     ts_epoch: 0.0,
+                    polling: false,
                 }],
                 text: None,
             }]],
@@ -1430,6 +1463,7 @@ mod tests {
                     status: Health::Healthy,
                     level: None,
                     ts_epoch: 0.0,
+                    polling: false,
                 }),
                 secondary: Vec::new(),
                 table: Vec::new(),
@@ -1507,6 +1541,122 @@ mod tests {
         assert_eq!(plain_label(Health::Healthy), "");
         assert_eq!(plain_label(Health::Failing), " [failing]");
         assert_eq!(plain_label(Health::Stale), " [stale]");
+    }
+
+    /// (spec: tui — poll-in-progress is visible)
+    #[test]
+    fn polling_label_only_when_polling() {
+        assert_eq!(polling_label(false), "");
+        assert_eq!(polling_label(true), " (polling)");
+    }
+
+    /// A source mid-fetch shows a "(polling)" marker on its panel title
+    /// regardless of its last known health — polling is orthogonal to
+    /// status (spec: tui — poll-in-progress is visible).
+    #[test]
+    fn single_source_panel_title_shows_polling_marker() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: None,
+                main: Some(Panel {
+                    name: "cpu".into(),
+                    value: "42".into(),
+                    unit: String::new(),
+                    status: Health::Healthy,
+                    level: None,
+                    ts_epoch: 0.0,
+                    polling: true,
+                }),
+                secondary: Vec::new(),
+                table: Vec::new(),
+                text: None,
+            }]],
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Named("auto".into())))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            text.contains("[healthy] (polling)"),
+            "polling marker missing from title:\n{text}"
+        );
+    }
+
+    /// A group pane's table row shows the same marker for a member that's
+    /// mid-fetch, independent of the other members (spec: tui —
+    /// poll-in-progress is visible; group panes).
+    #[test]
+    fn group_pane_table_row_shows_polling_marker() {
+        let state = UiState {
+            error: None,
+            rows: vec![vec![Slot {
+                span: 1,
+                group_title: Some("ihor".into()),
+                main: None,
+                secondary: Vec::new(),
+                table: vec![
+                    Panel {
+                        name: "days-left".into(),
+                        value: "5".into(),
+                        unit: "d".into(),
+                        status: Health::Healthy,
+                        level: None,
+                        ts_epoch: 0.0,
+                        polling: true,
+                    },
+                    Panel {
+                        name: "balance".into(),
+                        value: "90".into(),
+                        unit: "USD".into(),
+                        status: Health::Healthy,
+                        level: None,
+                        ts_epoch: 0.0,
+                        polling: false,
+                    },
+                ],
+                text: None,
+            }]],
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Fixed(38)))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let days_left_row = rows
+            .iter()
+            .find(|r| r.contains("days-left"))
+            .expect("days-left line missing");
+        assert!(
+            days_left_row.contains("(polling)"),
+            "polling member should show the marker: {days_left_row:?}"
+        );
+        let balance_row = rows
+            .iter()
+            .find(|r| r.contains("balance"))
+            .expect("balance line missing");
+        assert!(
+            !balance_row.contains("(polling)"),
+            "non-polling member should show no marker: {balance_row:?}"
+        );
     }
 
     /// (spec: tui — configurable TUI content width)

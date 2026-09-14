@@ -141,14 +141,48 @@ async fn first_interval_tick(
     })
 }
 
-/// Schedule-reset wiring between the HTTP ingest handler and collector
-/// tasks (spec: data-collection — Ingested values reset interval
-/// schedules): one channel per interval-scheduled query source. Cron and
-/// stream sources are excluded — ingest stores and logs for them but never
-/// moves their schedule.
-pub struct ResetHub {
-    pub txs: HashMap<String, tokio::sync::mpsc::UnboundedSender<()>>,
-    pub rxs: HashMap<String, tokio::sync::mpsc::UnboundedReceiver<()>>,
+/// A message to one source's collector task.
+pub enum Control {
+    /// Re-arm an interval wait from now, as an ingested value does (spec:
+    /// data-collection — Ingested values reset interval schedules). A no-op
+    /// for a cron schedule.
+    ResetSchedule,
+    /// Fetch now regardless of the schedule, and reply with the outcome
+    /// (spec: data-collection — Forced polls are serialized with a source's
+    /// schedule). A dropped reply channel is fine: the fetch still ran and
+    /// was recorded, only nobody is listening for the result any more.
+    PollNow(tokio::sync::oneshot::Sender<PollOutcome>),
+}
+
+pub type ControlSender = tokio::sync::mpsc::UnboundedSender<Control>;
+pub type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<Control>;
+
+/// Control wiring between the HTTP handlers and collector tasks: one
+/// channel per *pollable* source — every query source, interval- or
+/// cron-scheduled. Stream and ingest sources are excluded: neither has a
+/// fetch a message could ask for (a stream is a continuously running
+/// process, an ingest source receives data only by HTTP push), which makes
+/// "has no channel" the one place that knows a source cannot be polled.
+pub struct ControlHub {
+    pub txs: HashMap<String, ControlSender>,
+    pub rxs: HashMap<String, ControlReceiver>,
+}
+
+/// Why this source cannot be force-polled, or `None` when it can (spec: cli
+/// — Force poll rejects sources with nothing to fetch). An `ingest` source
+/// receives data only by HTTP push; a `stream` source is one continuously
+/// running process rather than a per-tick fetch. Shared by the HTTP
+/// endpoint and the CLI so both reject the same sources for the same
+/// stated reason.
+#[must_use]
+pub fn unpollable_reason(src: &SourceCfg) -> Option<&'static str> {
+    if src.is_ingest() {
+        Some("receives data via HTTP push, not by fetching")
+    } else if src.is_stream() {
+        Some("is collected continuously, not by fetching")
+    } else {
+        None
+    }
 }
 
 /// Sources the collector drives with a task: every source except `ingest`,
@@ -160,18 +194,16 @@ fn collectible(cfg: &Config) -> impl Iterator<Item = &SourceCfg> {
     cfg.sources.iter().filter(|src| !src.is_ingest())
 }
 
-/// Builds the [`ResetHub`] for a config. Fails on a source whose kind
+/// Builds the [`ControlHub`] for a config. Fails on a source whose kind
 /// cannot be built, mirroring what its collector task would report at
 /// startup.
-pub fn reset_channels(cfg: &Config) -> Result<ResetHub> {
-    let mut hub = ResetHub {
+pub fn control_channels(cfg: &Config) -> Result<ControlHub> {
+    let mut hub = ControlHub {
         txs: HashMap::new(),
         rxs: HashMap::new(),
     };
     for src in collectible(cfg) {
-        let is_interval_query = src.cron().is_none()
-            && !matches!(source::build(src)?, source::SourceKind::Stream { .. });
-        if is_interval_query {
+        if !matches!(source::build(src)?, source::SourceKind::Stream { .. }) {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             hub.txs.insert(src.name().to_string(), tx);
             hub.rxs.insert(src.name().to_string(), rx);
@@ -203,14 +235,14 @@ pub fn spawn_all(db: &Db, cfg: &Config) {
 /// hard-killed by process exit mid-fetch/mid-write (spec: data-collection —
 /// daemon shutdown lets in-flight collection finish). Returns the tasks'
 /// handles so the daemon can await them after the HTTP server's own graceful
-/// shutdown completes. Consumes the [`ResetHub`]'s receivers, one per
-/// interval-scheduled query source.
+/// shutdown completes. Consumes the [`ControlHub`]'s receivers, one per
+/// pollable source.
 #[must_use]
 pub fn spawn_graceful(
     db: &Db,
     cfg: &Config,
     shutdown: &tokio::sync::watch::Receiver<bool>,
-    hub: ResetHub,
+    hub: ControlHub,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut rxs = hub.rxs;
     collectible(cfg)
@@ -219,10 +251,10 @@ pub fn spawn_graceful(
             let src = src.clone();
             let cfg = cfg.clone();
             let shutdown = shutdown.clone();
-            let reset = rxs.remove(src.name());
+            let control = rxs.remove(src.name());
             tokio::spawn(async move {
                 let name = src.name().to_string();
-                if let Err(e) = loop_source(db, src, cfg, Some(shutdown), reset).await {
+                if let Err(e) = loop_source(db, src, cfg, Some(shutdown), control).await {
                     tracing::error!("collector for `{name}` stopped: {e:#}");
                 }
             })
@@ -237,7 +269,7 @@ async fn loop_source(
     src: SourceCfg,
     cfg: Config,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
-    mut reset: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    mut control: Option<ControlReceiver>,
 ) -> Result<()> {
     let kind = source::build(&src)?;
     // Re-derive the last known status so restarts don't duplicate transitions.
@@ -265,54 +297,123 @@ async fn loop_source(
 
     let mut schedule = Schedule::new(&db, &src).await?;
     loop {
-        match &mut shutdown {
-            Some(sd) => {
-                tokio::select! {
-                    () = schedule.tick() => {}
-                    res = sd.changed() => {
-                        // `Err` means every sender was dropped, which
-                        // `spawn_graceful` never does before the daemon
-                        // exits — but never busy-loop on it regardless.
-                        if res.is_err() || *sd.borrow() {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    // An ingested value resets the interval wait to the
-                    // success path (spec: data-collection — Ingested values
-                    // reset interval schedules). `advance` is a no-op for
-                    // cron, and stream sources never reach this loop, so
-                    // routing a reset to them is harmless. Once every sender
-                    // is gone (the HTTP handler's `AppState` dropped), the
-                    // receiver resolves to `None` *immediately and forever*
-                    // — so it is dropped here rather than re-armed, or this
-                    // branch would spin the select, re-advancing the
-                    // schedule without ever fetching again.
-                    reset_alive = async {
-                        match reset.as_mut() {
-                            Some(rx) => rx.recv().await.is_some(),
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        if reset_alive {
-                            schedule.advance(false);
-                        } else {
-                            reset = None;
-                        }
-                        continue;
-                    }
-                }
+        match wait_for_work(&mut schedule, &mut shutdown, &mut control).await {
+            Work::Stop => return Ok(()),
+            Work::Nothing => {}
+            // Once every sender is gone (the HTTP handlers' `AppState`
+            // dropped), the receiver resolves to `None` *immediately and
+            // forever* — so it is dropped rather than re-armed, or that
+            // branch would spin the select.
+            Work::ControlClosed => control = None,
+            // An ingested value moves the interval wait to the success path
+            // without fetching (spec: data-collection — Ingested values
+            // reset interval schedules). `advance` is a no-op for cron.
+            Work::ResetSchedule => schedule.advance(false),
+            Work::Tick => {
+                attempt(
+                    &db,
+                    &cfg,
+                    &src,
+                    &kind,
+                    &mut last_status,
+                    &mut setup_done,
+                    &mut schedule,
+                )
+                .await;
             }
-            None => schedule.tick().await,
+            // A forced poll runs here, on this source's own task, so it can
+            // never overlap that source's scheduled fetch and its schedule
+            // restarts from the forced attempt (spec: data-collection —
+            // Forced polls are serialized with a source's schedule).
+            Work::PollNow(reply) => {
+                let outcome = attempt(
+                    &db,
+                    &cfg,
+                    &src,
+                    &kind,
+                    &mut last_status,
+                    &mut setup_done,
+                    &mut schedule,
+                )
+                .await;
+                let _ = reply.send(outcome);
+            }
         }
-        if !setup_done && !try_setup(&db, &src, &cfg).await {
-            schedule.advance(false);
-            continue;
-        }
-        setup_done = true;
-        let success = fetch_once(&db, &cfg, &src, &kind, &mut last_status).await;
-        schedule.advance(!success);
     }
+}
+
+/// What [`loop_source`] woke up to do.
+enum Work {
+    /// The schedule came due.
+    Tick,
+    /// Shut down after this.
+    Stop,
+    /// Woke for something that needs no action (a shutdown channel that
+    /// changed without becoming `true`).
+    Nothing,
+    /// Every control sender is gone; stop listening on that channel.
+    ControlClosed,
+    ResetSchedule,
+    PollNow(tokio::sync::oneshot::Sender<PollOutcome>),
+}
+
+/// Waits for whichever comes first: this source's schedule, a control
+/// message, or shutdown. A `None` shutdown/control (one-shot callers, which
+/// have neither) simply never fires.
+async fn wait_for_work(
+    schedule: &mut Schedule,
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    control: &mut Option<ControlReceiver>,
+) -> Work {
+    tokio::select! {
+        () = schedule.tick() => Work::Tick,
+        stop = async {
+            match shutdown.as_mut() {
+                // `Err` means every sender was dropped, which
+                // `spawn_graceful` never does before the daemon exits — but
+                // never busy-loop on it regardless.
+                Some(sd) => sd.changed().await.is_err() || *sd.borrow(),
+                None => std::future::pending().await,
+            }
+        } => {
+            if stop { Work::Stop } else { Work::Nothing }
+        }
+        msg = async {
+            match control.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        } => match msg {
+            Some(Control::ResetSchedule) => Work::ResetSchedule,
+            Some(Control::PollNow(reply)) => Work::PollNow(reply),
+            None => Work::ControlClosed,
+        },
+    }
+}
+
+/// One attempt at a source, shared by its scheduled ticks and its forced
+/// polls so the two cannot drift: run the declared setup command first if it
+/// hasn't succeeded yet, then fetch, then re-arm the schedule from now —
+/// `retry_interval` after a failed fetch, `interval` otherwise (setup
+/// retries stay on the normal tick, spec: data-collection — setup gates
+/// first fetch).
+async fn attempt(
+    db: &Db,
+    cfg: &Config,
+    src: &SourceCfg,
+    kind: &source::SourceKind,
+    last_status: &mut String,
+    setup_done: &mut bool,
+    schedule: &mut Schedule,
+) -> PollOutcome {
+    if !*setup_done && !try_setup(db, src, cfg).await {
+        schedule.advance(false);
+        return PollOutcome::failed(src.name(), "setup command failed".into());
+    }
+    *setup_done = true;
+    let outcome = fetch_once(db, cfg, src, kind, last_status).await;
+    schedule.advance(!outcome.success);
+    outcome
 }
 
 /// Continuous ingest for one stream source (spec: data-collection — Stream
@@ -493,7 +594,7 @@ async fn ingest_stream_line(
             return;
         }
     };
-    store_parsed_value(
+    let _ = store_parsed_value(
         db,
         cfg,
         src,
@@ -507,8 +608,10 @@ async fn ingest_stream_line(
 
 /// Converts, stores, and logs one already-parsed value (shared by
 /// [`fetch_once`] and [`ingest_stream_line`]); applies a valid threshold
-/// override and refreshes health. Returns whether the round trip counts
-/// as successful for scheduling purposes.
+/// override and refreshes health. `Ok` means the round trip counts as
+/// successful for scheduling purposes; `Err` carries the same message that
+/// was recorded as the attempt's failure, so a caller reporting the outcome
+/// (a forced poll) doesn't have to reconstruct it.
 pub(crate) async fn store_parsed_value(
     db: &Db,
     cfg: &Config,
@@ -517,7 +620,7 @@ pub(crate) async fn store_parsed_value(
     parsed: &source::ParsedOutput,
     ms: i64,
     origin: Origin,
-) -> bool {
+) -> std::result::Result<(), String> {
     let name = src.name();
     match source::convert_value_type(&parsed.value, src.effective_value_type()) {
         Ok((value_bigint, value_double, value_json)) => {
@@ -548,20 +651,21 @@ pub(crate) async fn store_parsed_value(
                         db.set_session_bands(name, bands);
                     }
                     refresh_health_opt(db, cfg, name, last_status).await;
-                    true
+                    Ok(())
                 }
                 Err(e) => {
-                    record_failure(db, name, ms, &format!("fetched but failed to store: {e:#}"))
-                        .await;
+                    let msg = format!("fetched but failed to store: {e:#}");
+                    record_failure(db, name, ms, &msg).await;
                     refresh_health_opt(db, cfg, name, last_status).await;
-                    false
+                    Err(msg)
                 }
             }
         }
         Err(e) => {
-            record_failure(db, name, ms, &format!("{e:#}")).await;
+            let msg = format!("{e:#}");
+            record_failure(db, name, ms, &msg).await;
             refresh_health_opt(db, cfg, name, last_status).await;
-            false
+            Err(msg)
         }
     }
 }
@@ -608,19 +712,32 @@ pub(crate) async fn refresh_health_opt(
 /// continuous processes, not per-tick fetches.
 pub async fn collect_once(db: &Db, cfg: &Config) {
     for src in collectible(cfg).filter(|src| !src.is_stream()) {
-        let Ok(kind) = source::build(src) else {
-            continue;
-        };
-        if !try_setup(db, src, cfg).await {
-            continue;
-        }
-        let mut last_status = db
-            .last_health(src.name())
-            .await
-            .unwrap_or(None)
-            .unwrap_or_else(|| "healthy".into());
-        fetch_once(db, cfg, src, &kind, &mut last_status).await;
+        poll_once(db, cfg, src).await;
     }
+}
+
+/// Fetches one source now, ignoring its schedule, and stores the result the
+/// way a scheduled fetch does (spec: cli — Force poll command). This is the
+/// direct-mode CLI's path: no collector task exists in that process, and
+/// the database file lock excludes every other one, so there is nothing to
+/// serialize against. Under a running daemon the source's own collector
+/// task does this instead (spec: data-collection — Forced polls are
+/// serialized with a source's schedule).
+pub async fn poll_once(db: &Db, cfg: &Config, src: &SourceCfg) -> PollOutcome {
+    let name = src.name();
+    let kind = match source::build(src) {
+        Ok(k) => k,
+        Err(e) => return PollOutcome::failed(name, format!("{e:#}")),
+    };
+    if !try_setup(db, src, cfg).await {
+        return PollOutcome::failed(name, "setup command failed".into());
+    }
+    let mut last_status = db
+        .last_health(name)
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| "healthy".into());
+    fetch_once(db, cfg, src, &kind, &mut last_status).await
 }
 
 /// Runs a source's setup command. Returns true when setup is satisfied
@@ -659,20 +776,69 @@ async fn try_setup(db: &Db, src: &SourceCfg, cfg: &Config) -> bool {
     }
 }
 
-/// Runs one fetch attempt, logging its outcome and updating health. Returns
-/// whether the round trip should be treated as successful for scheduling
-/// purposes (spec: data-collection — per-source schedules): the upstream
-/// fetch succeeded *and* the reading was durably stored. A fetch that
-/// succeeds but fails to persist is recorded as a failed attempt, not a
-/// silent success — otherwise health would report "healthy" for data that
-/// was never actually written.
+/// One fetch attempt's result, as reported to whoever asked for it (spec:
+/// http-api — Force poll endpoint; cli — Force poll command). The same
+/// shape crosses the HTTP boundary and is built locally by a direct-mode
+/// CLI poll, so both transports report a poll identically — and a caller
+/// can always tell a *fetch* that ran and failed (`success: false`, with
+/// `error`) from a daemon it could not reach at all (a transport error).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PollOutcome {
+    pub source: String,
+    pub success: bool,
+    /// The stored value, on success.
+    pub value: Option<String>,
+    /// The stored reading's timestamp, on success.
+    pub ts: Option<String>,
+    /// Why the attempt failed, on failure.
+    pub error: Option<String>,
+}
+
+impl PollOutcome {
+    fn stored(source: &str, parsed: &source::ParsedOutput) -> Self {
+        Self {
+            source: source.to_string(),
+            success: true,
+            value: Some(parsed.value.clone()),
+            ts: Some(parsed.ts.clone()),
+            error: None,
+        }
+    }
+
+    pub(crate) fn failed(source: &str, error: String) -> Self {
+        Self {
+            source: source.to_string(),
+            success: false,
+            value: None,
+            ts: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Runs one fetch attempt, logging its outcome and updating health. The
+/// returned outcome's `success` is whether the round trip should be treated
+/// as successful for scheduling purposes (spec: data-collection —
+/// per-source schedules): the upstream fetch succeeded *and* the reading was
+/// durably stored. A fetch that succeeds but fails to persist is recorded as
+/// a failed attempt, not a silent success — otherwise health would report
+/// "healthy" for data that was never actually written.
+///
+/// This is the single place both a scheduled tick (via `attempt`) and a
+/// direct-mode forced poll (via `poll_once`) run a source's command, so it's
+/// also the single place that marks the source "polling" for the web
+/// dashboard and TUI to show (spec: data-collection — Poll-in-progress is
+/// visible). The mark covers the command itself, not `try_setup` — setup
+/// only runs once per source's lifetime and failing it is already visible
+/// as a failed fetch log entry, so it doesn't need its own indicator.
 pub async fn fetch_once(
     db: &Db,
     cfg: &Config,
     src: &SourceCfg,
     kind: &source::SourceKind,
     last_status: &mut String,
-) -> bool {
+) -> PollOutcome {
+    let _polling = db.mark_polling(src.name());
     let start = Instant::now();
     let outcome = tokio::time::timeout(src.timeout(), kind.fetch(&cfg.config_dir)).await;
     #[allow(clippy::cast_possible_truncation)] // durations fit easily
@@ -683,34 +849,43 @@ pub async fn fetch_once(
             let (arr_epoch, arr_ts) = crate::db::now();
             match source::parse_output(name, output, (arr_epoch, arr_ts)) {
                 Ok(parsed) => {
-                    store_parsed_value(db, cfg, src, Some(last_status), &parsed, ms, Origin::Poll)
-                        .await
+                    match store_parsed_value(
+                        db,
+                        cfg,
+                        src,
+                        Some(last_status),
+                        &parsed,
+                        ms,
+                        Origin::Poll,
+                    )
+                    .await
+                    {
+                        Ok(()) => PollOutcome::stored(name, &parsed),
+                        Err(e) => PollOutcome::failed(name, e),
+                    }
                 }
                 Err(e) => {
-                    record_failure(db, name, ms, &format!("{e:#}")).await;
+                    let msg = format!("{e:#}");
+                    record_failure(db, name, ms, &msg).await;
                     refresh_health(db, cfg, name, last_status).await;
-                    false
+                    PollOutcome::failed(name, msg)
                 }
             }
         }
         Ok(Err(e)) => {
-            record_failure(db, name, ms, &format!("{e:#}")).await;
+            let msg = format!("{e:#}");
+            record_failure(db, name, ms, &msg).await;
             refresh_health(db, cfg, name, last_status).await;
-            false
+            PollOutcome::failed(name, msg)
         }
         Err(_) => {
-            record_failure(
-                db,
-                name,
-                ms,
-                &format!(
-                    "timed out after {}",
-                    humantime::format_duration(src.timeout())
-                ),
-            )
-            .await;
+            let msg = format!(
+                "timed out after {}",
+                humantime::format_duration(src.timeout())
+            );
+            record_failure(db, name, ms, &msg).await;
             refresh_health(db, cfg, name, last_status).await;
-            false
+            PollOutcome::failed(name, msg)
         }
     }
 }
@@ -728,6 +903,38 @@ async fn record_failure(db: &Db, name: &str, ms: i64, error: &str) {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// `PollOutcome`'s field names are what the HTTP endpoint writes and
+    /// what a daemon-mode CLI reads back (spec: http-api — Force poll
+    /// endpoint), so they are part of the contract rather than an
+    /// implementation detail — including that a failed *fetch* still
+    /// round-trips as a complete outcome.
+    #[test]
+    fn poll_outcome_serializes_the_documented_fields() {
+        let parsed = source::ParsedOutput {
+            value: "42".into(),
+            ts_epoch: 1000.5,
+            ts: "2024-01-01T00:00:00+00:00".into(),
+            threshold: None,
+        };
+        let ok = serde_json::to_value(PollOutcome::stored("cpu", &parsed)).unwrap();
+        assert_eq!(ok["source"], "cpu");
+        assert_eq!(ok["success"], true);
+        assert_eq!(ok["value"], "42");
+        assert_eq!(ok["ts"], "2024-01-01T00:00:00+00:00");
+        assert!(ok["error"].is_null());
+
+        let failed = PollOutcome::failed("cpu", "boom".into());
+        let wire = serde_json::to_value(&failed).unwrap();
+        assert_eq!(wire["success"], false);
+        assert_eq!(wire["error"], "boom");
+        assert!(wire["value"].is_null());
+
+        let back: PollOutcome = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.source, "cpu");
+        assert!(!back.success);
+        assert_eq!(back.error.as_deref(), Some("boom"));
+    }
 
     /// (spec: data-collection — cron-scheduled source ignores fetch outcome)
     #[test]
@@ -785,8 +992,8 @@ mod tests {
             let src = query_source(name, command, Some(value_type));
             let kind = source::build(&src).unwrap();
             let mut status = "healthy".to_string();
-            let ok = fetch_once(&db, &cfg, &src, &kind, &mut status).await;
-            assert!(ok, "{name} fetch should succeed");
+            let outcome = fetch_once(&db, &cfg, &src, &kind, &mut status).await;
+            assert!(outcome.success, "{name} fetch should succeed");
         }
 
         let conn = duckdb::Connection::open(dir.path().join("t.duckdb")).unwrap();
@@ -816,9 +1023,12 @@ mod tests {
         let kind = source::build(&src).unwrap();
         let mut status = "healthy".to_string();
 
-        let ok = fetch_once(&db, &cfg, &src, &kind, &mut status).await;
+        let outcome = fetch_once(&db, &cfg, &src, &kind, &mut status).await;
 
-        assert!(!ok, "a non-convertible value must fail the fetch");
+        assert!(
+            !outcome.success,
+            "a non-convertible value must fail the fetch"
+        );
         assert!(
             db.latest_values().await.unwrap().is_empty(),
             "no reading should be recorded"
@@ -1017,7 +1227,7 @@ mod tests {
         let kind = source::build(&src).unwrap();
         let mut status = "healthy".to_string();
 
-        assert!(fetch_once(&db, &cfg, &src, &kind, &mut status).await);
+        assert!(fetch_once(&db, &cfg, &src, &kind, &mut status).await.success);
 
         let rows = db.history("b", None, None, None).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -1041,7 +1251,7 @@ mod tests {
         let kind = source::build(&src).unwrap();
         let mut status = "healthy".to_string();
 
-        assert!(!fetch_once(&db, &cfg, &src, &kind, &mut status).await);
+        assert!(!fetch_once(&db, &cfg, &src, &kind, &mut status).await.success);
         assert!(db.latest_values().await.unwrap().is_empty());
         let logs = db.logs(Some("b"), 10).await.unwrap();
         assert_eq!(logs.len(), 1);

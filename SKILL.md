@@ -108,7 +108,7 @@ thresholds = [
 
 ### Validation
 
-Validate a source configuration before applying it using `barduck fetch --source <name>` to run the command once without writing to the database. Check that:
+Validate a source configuration before applying it using `barduck fetch --source <name>` to run the command once without writing to the database (`barduck poll --source <name>` runs it and *does* write). Check that:
 - The command executes successfully
 - Output parses correctly for the declared `value_type`
 - `thresholds` bands are valid (at least two bands for numeric sources)
@@ -203,8 +203,36 @@ All commands support a `--config` flag (default: `config.toml`).
 | `barduck latest` | Latest value per source | `--json`, `--source`, `--no-text` |
 | `barduck logs` | Recent fetch logs | `--limit`, `--json`, `--source` |
 | `barduck reset` | Permanently delete all data | `--yes`, `--json` |
-| `barduck fetch` | Run one source once (debug) | `--source`, `--json` |
+| `barduck poll` | Fetch sources now and store the results | `--source` (repeatable, required), `--json`, `--daemon` |
+| `barduck fetch` | Run one source once, writing nothing (debug) | `--source`, `--json` |
 | `barduck skill` | Print this skill document | — |
+
+### `poll` vs `fetch`
+
+Both run a source's command once, off-schedule. They differ in what they
+leave behind:
+
+- `barduck poll --source <name>` **writes**: a reading, a fetch-log entry
+  with origin `poll`, a health refresh — exactly what a scheduled fetch
+  records. Use it to refresh a stale panel now. Repeatable `--source`; exits
+  non-zero if any attempt failed, after attempting all of them.
+- `barduck fetch --source <name>` **writes nothing**: it prints the parsed
+  result (extracted value, resolved timestamp, thresholds, type conversion)
+  so a new source's command can be validated before it goes live.
+
+`poll` needs no daemon: with none running it fetches in-process and writes to
+the database file; with one running it routes through that daemon's API
+automatically, since only one process can hold the database. In the web UI
+the same action is the "poll now" control on each panel and log view.
+
+While a source's fetch is actually running — scheduled or forced, triggered
+from anywhere — both the web dashboard and the TUI show it as currently
+polling (the web control becomes a plain "polling…" marker; the TUI panel
+title/line gets a "(polling)" suffix), independent of that source's health
+status. This is a live shared signal: every viewer sees it, not just whoever
+triggered the poll, so there's no separate progress or failure popup — a
+failed attempt shows up the normal way, through the source's health and
+fetch log.
 
 ### Query Modes
 
@@ -215,6 +243,7 @@ All commands support a `--config` flag (default: `config.toml`).
 
 1. **Query latest values**: `barduck latest` to see current readings
 2. **Debug a source**: `barduck fetch --source <name>` to test a command
+   without writing; `barduck poll --source <name>` to fetch *and* store
 3. **Check logs**: `barduck logs --source <name>` to view fetch history
 4. **Use `--json`** for machine-readable output in scripts
 

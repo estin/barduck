@@ -1,5 +1,6 @@
 use crate::{
-    config::Config,
+    collector::{self, PollOutcome},
+    config::{Config, SourceCfg},
     db::{self, Db},
     health,
 };
@@ -102,6 +103,32 @@ impl Backend {
         }
     }
 
+    /// Fetches one source now, ignoring its schedule, and reports the
+    /// attempt (spec: cli — Force poll command). In direct mode the fetch
+    /// runs here, in the CLI process, writing through a short-lived
+    /// read-write handle — `Backend::Direct`'s own handle is read-only and
+    /// must stay that way, since every other caller (the TUI, the query
+    /// commands) must not take a write lock. Under a running daemon the
+    /// request goes to it instead, and its collector task does the work.
+    pub async fn poll(&self, cfg: &Config, src: &SourceCfg) -> Result<PollOutcome> {
+        match self {
+            Backend::Direct(_) => {
+                let db = Db::open_rw(&cfg.database_path)?;
+                Ok(collector::poll_once(&db, cfg, src).await)
+            }
+            Backend::Daemon { base, client } => {
+                let url = format!("{base}/api/sources/{}/poll", src.name());
+                let resp = client
+                    .post(&url)
+                    .timeout(poll_timeout(src.timeout()))
+                    .send()
+                    .await
+                    .with_context(|| format!("connecting to daemon at {url}"))?;
+                read_json(resp, &url).await
+            }
+        }
+    }
+
     pub async fn logs(&self, sources: &[String], limit: i64) -> Result<Vec<db::LogRow>> {
         match self {
             Backend::Direct(db) => db.logs_for_sources(sources, limit).await,
@@ -116,12 +143,32 @@ impl Backend {
     }
 }
 
+/// How long a daemon-mode forced poll waits for its answer. The daemon runs
+/// the source's own command — bounded by that source's configured timeout —
+/// and the request can first queue behind one already-running fetch of the
+/// same source (spec: data-collection — Forced polls are serialized with a
+/// source's schedule). So: two of those, plus the ordinary request budget
+/// for everything that isn't the fetch. Reads keep
+/// [`DAEMON_REQUEST_TIMEOUT`] unchanged — this is the one request that can
+/// legitimately outlast it.
+fn poll_timeout(source_timeout: std::time::Duration) -> std::time::Duration {
+    source_timeout
+        .saturating_mul(2)
+        .saturating_add(DAEMON_REQUEST_TIMEOUT)
+}
+
 async fn get<T: serde::de::DeserializeOwned>(client: &reqwest::Client, url: &str) -> Result<T> {
     let resp = client
         .get(url)
         .send()
         .await
         .with_context(|| format!("connecting to daemon at {url}"))?;
+    read_json(resp, url).await
+}
+
+/// Shared response handling for both verbs: a non-success status is an
+/// error naming what the daemon said, a success decodes into `T`.
+async fn read_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response, url: &str) -> Result<T> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -134,4 +181,28 @@ async fn get<T: serde::de::DeserializeOwned>(client: &reqwest::Client, url: &str
 
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DAEMON_REQUEST_TIMEOUT, poll_timeout};
+    use std::time::Duration;
+
+    /// A forced poll's budget has to cover the source's own command, not the
+    /// query default it would otherwise inherit (spec: cli — Force poll
+    /// command).
+    #[test]
+    fn poll_timeout_covers_two_source_timeouts_plus_the_request_budget() {
+        assert_eq!(
+            poll_timeout(Duration::from_secs(30)),
+            Duration::from_secs(70)
+        );
+        assert!(
+            poll_timeout(Duration::from_secs(1)) > DAEMON_REQUEST_TIMEOUT,
+            "even a fast source gets more than the read budget"
+        );
+        // A pathological configured timeout saturates rather than panicking
+        // on overflow.
+        assert!(poll_timeout(Duration::MAX) > DAEMON_REQUEST_TIMEOUT);
+    }
 }

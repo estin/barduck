@@ -157,7 +157,7 @@ async fn start_daemon(cfg: &config::Config, db: &Db) -> String {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -275,8 +275,13 @@ async fn ingest_stores_value_and_rejects_bad_requests() {
     assert_eq!(rows[0].value.as_deref(), Some("8"));
 }
 
+/// A control channel exists for every source that *can* be polled — every
+/// query source, interval- or cron-scheduled — and for nothing else, so
+/// "has no channel" is what tells the API a source cannot be force-polled
+/// (spec: data-collection — Forced polls are serialized with a source's
+/// schedule).
 #[test]
-fn reset_channels_cover_only_interval_query_sources() {
+fn control_channels_cover_pollable_sources() {
     let toml = r#"
 database_path = "/tmp/reset-cfg-check.duckdb"
 [[sources]]
@@ -294,13 +299,18 @@ name = "stream_me"
 type = "stream"
 command = "cat"
 expected_interval = "30s"
+[[sources]]
+name = "pushed_me"
+type = "ingest"
+expected_interval = "30s"
 "#;
     let cfg: config::Config = toml::from_str(toml).unwrap();
     config::validate(&cfg).unwrap();
-    let hub = collector::reset_channels(&cfg).unwrap();
+    let hub = collector::control_channels(&cfg).unwrap();
     assert!(hub.txs.contains_key("poll_me"));
-    assert!(!hub.txs.contains_key("cron_me"));
+    assert!(hub.txs.contains_key("cron_me"));
     assert!(!hub.txs.contains_key("stream_me"));
+    assert!(!hub.txs.contains_key("pushed_me"));
 }
 
 #[tokio::test]
@@ -328,14 +338,14 @@ retry_interval = "2s"
         .await
         .unwrap();
 
-    let mut hub = collector::reset_channels(&cfg).unwrap();
+    let mut hub = collector::control_channels(&cfg).unwrap();
     let txs = std::mem::take(&mut hub.txs);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = collector::spawn_graceful(&db, &cfg, &shutdown_rx, hub);
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: txs,
+        controls: txs,
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -371,6 +381,764 @@ retry_interval = "2s"
     }
 }
 
+/// Spawns collector tasks wired to a control hub, exactly as the daemon
+/// does, and hands back the senders the HTTP handlers would hold.
+fn spawn_with_controls(
+    db: &Db,
+    cfg: &config::Config,
+) -> (
+    std::collections::HashMap<String, collector::ControlSender>,
+    tokio::sync::watch::Sender<bool>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let mut hub = collector::control_channels(cfg).unwrap();
+    let txs = std::mem::take(&mut hub.txs);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tasks = collector::spawn_graceful(db, cfg, &shutdown_rx, hub);
+    (txs, shutdown_tx, tasks)
+}
+
+async fn stop_collectors(
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+) {
+    shutdown_tx.send(true).unwrap();
+    for task in tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+fn request_poll(
+    txs: &std::collections::HashMap<String, collector::ControlSender>,
+    source: &str,
+) -> tokio::sync::oneshot::Receiver<collector::PollOutcome> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    txs[source]
+        .send(collector::Control::PollNow(reply_tx))
+        .unwrap();
+    reply_rx
+}
+
+async fn force_poll(
+    txs: &std::collections::HashMap<String, collector::ControlSender>,
+    source: &str,
+) -> collector::PollOutcome {
+    tokio::time::timeout(std::time::Duration::from_secs(30), request_poll(txs, source))
+        .await
+        .expect("forced poll timed out")
+        .expect("collector dropped the reply")
+}
+
+/// A forced poll fetches now and re-arms the interval from *that* attempt,
+/// so the pre-existing deadline it pre-empted never fires (spec:
+/// data-collection — Forced polls are serialized with a source's schedule).
+#[tokio::test]
+async fn forced_poll_stores_a_reading_and_restarts_the_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 5
+[[sources]]
+name = "flaky"
+type = "query"
+command = "echo hi"
+interval = "1h"
+retry_interval = "2s"
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+    // A fresh failure puts the next scheduled tick ~2s out.
+    db.insert_log("flaky", 1, Some("boom"), None, Origin::Poll)
+        .await
+        .unwrap();
+
+    let (txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
+    // Well inside the 2s window, so the forced poll pre-empts a deadline
+    // that was about to fire.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let outcome = force_poll(&txs, "flaky").await;
+    assert!(outcome.success, "forced poll failed: {:?}", outcome.error);
+    assert_eq!(outcome.value.as_deref(), Some("hi"));
+    assert!(outcome.ts.is_some());
+
+    // Three seconds past the original deadline: had the forced poll left the
+    // old schedule alone, a second fetch would have fired by now.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let rows = db.logs(Some("flaky"), 10).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected only the seeded failure and the forced poll, got {rows:?}"
+    );
+    assert_eq!(rows[0].origin, Origin::Poll);
+    assert!(rows[0].error.is_none());
+    assert_eq!(
+        db.latest_values().await.unwrap()[0].value,
+        "hi",
+        "the forced poll must store a reading"
+    );
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// A forced poll is carried out by the source's own collector task, so it
+/// waits for an in-flight fetch of that source instead of running beside it
+/// (spec: data-collection — Forced polls are serialized with a source's
+/// schedule).
+#[tokio::test]
+async fn forced_poll_never_overlaps_an_in_flight_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let runs = dir.path().join("runs.log");
+    let release = dir.path().join("release");
+    // Records its own start and end around a wait for the release file, so
+    // the log proves whether two runs ever overlapped.
+    let toml = format!(
+        r#"
+database_path = "{db}"
+[[sources]]
+name = "slow"
+type = "query"
+command = "echo start >> {runs}; while [ ! -f {release} ]; do sleep 0.02; done; echo end >> {runs}; echo 1"
+interval = "1h"
+"#,
+        db = db_path.display(),
+        runs = runs.display(),
+        release = release.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+
+    // No prior log, so the scheduled fetch is due immediately and is already
+    // blocking when the forced poll arrives.
+    let (txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut reply = request_poll(&txs, "slow");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        reply.try_recv().is_err(),
+        "the forced poll ran while a fetch was already in flight"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&runs).unwrap_or_default(),
+        "start\n",
+        "a second fetch started before the first finished"
+    );
+
+    std::fs::write(&release, "go").unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), reply)
+        .await
+        .expect("forced poll never completed")
+        .expect("collector dropped the reply");
+    assert!(outcome.success, "forced poll failed: {:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(&runs).unwrap(),
+        "start\nend\nstart\nend\n",
+        "the two fetches must not interleave"
+    );
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// The "polling" flag a real collector task sets is visible on the same
+/// `Db` handle passed to `spawn_with_controls` while a fetch — scheduled or
+/// forced — is running, and clears once it finishes (spec: data-collection
+/// — Poll-in-progress is visible).
+#[tokio::test]
+async fn is_polling_reflects_a_real_in_flight_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let release = dir.path().join("release");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+[[sources]]
+name = "slow"
+type = "query"
+command = "while [ ! -f {release} ]; do sleep 0.02; done; echo 1"
+interval = "1h"
+"#,
+        db = db_path.display(),
+        release = release.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+    assert!(!db.is_polling("slow"));
+
+    // No prior log, so the scheduled fetch is due immediately.
+    let (_txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
+    let became_true = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !db.is_polling("slow") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(became_true.is_ok(), "is_polling never turned on");
+
+    std::fs::write(&release, "go").unwrap();
+    let became_false = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while db.is_polling("slow") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(became_false.is_ok(), "is_polling never cleared");
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// A cron source has no interval to restart, so a forced poll must leave its
+/// next occurrence exactly where it was (spec: data-collection — Forced
+/// polls are serialized with a source's schedule).
+#[tokio::test]
+async fn forced_poll_leaves_a_cron_schedule_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+[[sources]]
+name = "ticker"
+type = "query"
+command = "echo 1"
+cron = "* * * * * *"
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+
+    let (txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
+    let outcome = force_poll(&txs, "ticker").await;
+    assert!(outcome.success, "forced poll failed: {:?}", outcome.error);
+    let after_poll = db.logs(Some("ticker"), 100).await.unwrap().len();
+
+    // The per-second cron keeps firing on its own occurrences.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let later = db.logs(Some("ticker"), 100).await.unwrap().len();
+    assert!(
+        later > after_poll,
+        "the cron schedule stopped firing after a forced poll ({after_poll} then {later})"
+    );
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// A forced poll that fails re-arms the source on `retry_interval`, the same
+/// as a failed scheduled fetch (spec: data-collection — Forced polls are
+/// serialized with a source's schedule).
+#[tokio::test]
+async fn failed_forced_poll_rearms_on_the_retry_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 5
+[[sources]]
+name = "broken"
+type = "query"
+command = "exit 7"
+interval = "1h"
+retry_interval = "2s"
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+    // A fresh success puts the next scheduled tick a full hour out, so
+    // anything that fires soon came from the forced poll's re-arming.
+    db.insert_log("broken", 1, None, Some("ok"), Origin::Poll)
+        .await
+        .unwrap();
+
+    let (txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
+    let outcome = force_poll(&txs, "broken").await;
+    assert!(!outcome.success);
+    assert!(outcome.error.is_some());
+
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let rows = db.logs(Some("broken"), 10).await.unwrap();
+    assert!(
+        rows.len() >= 3,
+        "a failed forced poll must re-arm on retry_interval, not interval: {rows:?}"
+    );
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// Serves the API with live collector tasks behind it, so the force-poll
+/// endpoint has a collector to talk to (unlike [`start_daemon`], whose
+/// control map is empty).
+async fn start_daemon_with_collectors(
+    cfg: &config::Config,
+    db: &Db,
+) -> (
+    String,
+    tokio::sync::watch::Sender<bool>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let (txs, shutdown_tx, tasks) = spawn_with_controls(db, cfg);
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: txs,
+    };
+    let router = barduck::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+    (base, shutdown_tx, tasks)
+}
+
+fn poll_config(db_path: &std::path::Path) -> config::Config {
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 5
+[[sources]]
+name = "ok"
+type = "query"
+command = "echo 42"
+interval = "1h"
+[[sources]]
+name = "broken"
+type = "query"
+command = "echo nope >&2; exit 3"
+interval = "1h"
+[[sources]]
+name = "ticks"
+type = "stream"
+# Emits nothing and does not exit for the life of the test, so this
+# source's own collector never logs and the "a rejected poll records
+# nothing" assertion below stays about the poll.
+command = "sleep 300"
+expected_interval = "30s"
+[[sources]]
+name = "pushed"
+type = "ingest"
+expected_interval = "30s"
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    cfg
+}
+
+/// (spec: http-api — Force poll endpoint)
+#[tokio::test]
+async fn api_force_poll_stores_a_reading_and_reports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = poll_config(&db_path);
+    let db = Db::open_rw(&db_path).unwrap();
+    // A fresh success defers every scheduled tick an hour out, so anything
+    // recorded below came from the forced poll.
+    for name in ["ok", "broken"] {
+        db.insert_log(name, 1, None, Some("seed"), Origin::Poll)
+            .await
+            .unwrap();
+    }
+    let (base, shutdown_tx, tasks) = start_daemon_with_collectors(&cfg, &db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/sources/ok/poll"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["source"], "ok");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["value"], "42");
+    assert!(body["error"].is_null());
+
+    let rows = db.logs(Some("ok"), 10).await.unwrap();
+    assert_eq!(rows.len(), 2, "expected the seed plus the forced poll");
+    assert_eq!(rows[0].origin, Origin::Poll);
+    assert!(rows[0].error.is_none());
+    assert_eq!(db.history("ok", None, None, None).await.unwrap()[0].value, "42");
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// A fetch that ran and failed is a completed request: success status,
+/// `success: false`, and a recorded failed attempt (spec: http-api — Force
+/// poll endpoint).
+#[tokio::test]
+async fn api_force_poll_reports_a_failed_fetch_without_erroring() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = poll_config(&db_path);
+    let db = Db::open_rw(&db_path).unwrap();
+    db.insert_log("broken", 1, None, Some("seed"), Origin::Poll)
+        .await
+        .unwrap();
+    let (base, shutdown_tx, tasks) = start_daemon_with_collectors(&cfg, &db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/sources/broken/poll"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "a failed fetch is not a server error");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(
+        body["error"].as_str().unwrap().contains('3'),
+        "error should name the exit status: {body}"
+    );
+    let rows = db.logs(Some("broken"), 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].error.is_some());
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// (spec: http-api — Force poll endpoint: unknown and unpollable sources)
+#[tokio::test]
+async fn api_force_poll_rejects_unknown_and_unpollable_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = poll_config(&db_path);
+    let db = Db::open_rw(&db_path).unwrap();
+    let (base, shutdown_tx, tasks) = start_daemon_with_collectors(&cfg, &db).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/sources/nope/poll"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(resp.text().await.unwrap().contains("nope"));
+
+    for (name, needle) in [("ticks", "continuously"), ("pushed", "HTTP push")] {
+        let resp = client
+            .post(format!("{base}/api/sources/{name}/poll"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{name} should be rejected");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains(name) && body.contains(needle), "{body}");
+    }
+
+    for name in ["nope", "ticks", "pushed"] {
+        assert!(
+            db.logs(Some(name), 10).await.unwrap().is_empty(),
+            "a rejected poll must record nothing for `{name}`"
+        );
+    }
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// With no live collector task for the source, the endpoint says so instead
+/// of hanging on a reply that will never come (spec: http-api — Force poll
+/// endpoint).
+#[tokio::test]
+async fn api_force_poll_reports_a_missing_collector() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = poll_config(&db_path);
+    let db = Db::open_rw(&db_path).unwrap();
+    // A control sender whose receiver was dropped: exactly what a collector
+    // task that has exited leaves behind.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(rx);
+    let mut controls = std::collections::HashMap::new();
+    controls.insert("ok".to_string(), tx);
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls,
+    };
+    let router = barduck::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let client = reqwest::Client::new();
+    // Dropped receiver, and (for `broken`) no sender at all.
+    for name in ["ok", "broken"] {
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.post(format!("{base}/api/sources/{name}/poll")).send(),
+        )
+        .await
+        .expect("the endpoint hung waiting for a dead collector")
+        .unwrap();
+        assert_eq!(resp.status(), 503);
+        assert!(resp.text().await.unwrap().contains("no collector"));
+    }
+    assert!(db.logs(None, 10).await.unwrap().is_empty());
+}
+
+/// The dashboard offers a "poll now" control for every source that can be
+/// fetched, and none for the ones that cannot (spec: web-ui — Panels can
+/// force a poll).
+#[tokio::test]
+async fn web_ui_renders_poll_controls_only_for_pollable_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+[[sources]]
+name = "cpu"
+type = "query"
+command = "echo 42"
+interval = "1h"
+[[sources]]
+name = "ticks"
+type = "stream"
+command = "cat"
+expected_interval = "1h"
+[[sources]]
+name = "pushed"
+type = "ingest"
+expected_interval = "1h"
+[[layouts]]
+title = "Overview"
+rows = [["cpu", "ticks", "pushed"]]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(format!("{base}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains(r#"data-bd-poll="cpu""#),
+        "a query source should offer the control:\n{html}"
+    );
+    for name in ["ticks", "pushed"] {
+        assert!(
+            !html.contains(&format!(r#"data-bd-poll="{name}""#)),
+            "`{name}` has no fetch to force, so it must have no control"
+        );
+    }
+    // The control is wired by one delegated handler that survives a shard
+    // re-render, posts to the endpoint, and suppresses the panel's own link.
+    assert!(
+        html.contains("/poll', { method: 'POST' }"),
+        "the script should POST to the force-poll endpoint:\n{html}"
+    );
+    assert!(
+        html.contains("ev.preventDefault()") && html.contains("ev.stopPropagation()"),
+        "the control must not follow the panel's log link"
+    );
+    // No separate progress/failure popup: outcomes surface through the
+    // panel's own live `polling`/health state instead (spec: web-ui —
+    // poll-in-progress is visible).
+    assert!(
+        !html.contains("bd-poll-note"),
+        "the old popup note must be gone"
+    );
+
+    // The log view a panel links to offers the same control.
+    let logs = reqwest::get(format!("{base}/logs/cpu"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(logs.contains(r#"data-bd-poll="cpu""#));
+    let stream_logs = reqwest::get(format!("{base}/logs/ticks"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // (The delegated script mentions `data-bd-poll` on every page, so this
+    // has to look for the attribute on an element, not the bare text.)
+    assert!(!stream_logs.contains(r#"data-bd-poll="ticks""#));
+}
+
+/// A completed poll reaches the panel on the dashboard's own refresh tick:
+/// the grid is a shard that re-reads the database, so no page reload and no
+/// extra plumbing is involved (spec: web-ui — Panels can force a poll).
+#[tokio::test]
+async fn web_ui_panel_shows_a_polled_value_on_the_next_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+[[sources]]
+name = "cpu"
+type = "query"
+command = "echo 42"
+interval = "1h"
+[[layouts]]
+title = "Overview"
+rows = [["cpu"]]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+    // A fresh success holds the schedule an hour out, so the only fetch that
+    // can happen is the forced one.
+    db.insert_log("cpu", 1, None, Some("seed"), Origin::Poll)
+        .await
+        .unwrap();
+
+    let (txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: txs,
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let before = reqwest::get(format!("{base}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!before.contains(">42<"), "no value collected yet");
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/sources/cpu/poll"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The next tick re-renders the grid from the database — same request the
+    // browser's interval makes, no reload.
+    let after = reqwest::get(format!("{base}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        after.contains("42"),
+        "the polled value should be on the panel:\n{after}"
+    );
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
+/// While a source's fetch (here, a forced poll) is actually running, the
+/// dashboard's own panel shows it — no separate popup needed, since every
+/// viewer's page re-reads the same live state (spec: web-ui —
+/// poll-in-progress is visible).
+#[tokio::test]
+async fn web_ui_panel_shows_polling_state_while_a_fetch_is_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let release = dir.path().join("release");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+[[sources]]
+name = "slow"
+type = "query"
+command = "while [ ! -f {release} ]; do sleep 0.02; done; echo 1"
+interval = "1h"
+[[layouts]]
+title = "Overview"
+rows = [["slow"]]
+"#,
+        db = db_path.display(),
+        release = release.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+    // A fresh success holds the schedule an hour out, so the only fetch is
+    // the forced one below — nothing else can flip the flag mid-test.
+    db.insert_log("slow", 1, None, Some("seed"), Origin::Poll)
+        .await
+        .unwrap();
+
+    let (txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: txs,
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    // Bounded by angle brackets so this only matches the rendered span's
+    // text content, not the client script's own `'polling…'` string
+    // literal (single-quoted) that's on every page regardless of state.
+    let polling_marker = ">polling…<";
+
+    let before = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
+    assert!(before.contains(r#"data-bd-poll="slow""#), "control expected before polling");
+    assert!(!before.contains(polling_marker), "not polling yet:\n{before}");
+
+    // The endpoint itself blocks until the fetch finishes, so the request
+    // has to run concurrently with the dashboard fetches that observe it.
+    let poll = tokio::spawn(reqwest::Client::new().post(format!("{base}/api/sources/slow/poll")).send());
+
+    let saw_polling = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let html = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
+            if html.contains(polling_marker) && !html.contains(r#"data-bd-poll="slow""#) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(saw_polling.is_ok(), "dashboard never showed the polling state");
+
+    std::fs::write(&release, "go").unwrap();
+    let resp = poll.await.unwrap().unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let after = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
+    assert!(
+        after.contains(r#"data-bd-poll="slow""#) && !after.contains(polling_marker),
+        "the control should be back once the fetch finished:\n{after}"
+    );
+
+    stop_collectors(shutdown_tx, tasks).await;
+}
+
 fn daemon_base(b: &Backend) -> String {
     match b {
         Backend::Daemon { base, .. } => base.clone(),
@@ -394,7 +1162,7 @@ async fn log_view_renders_push_and_poll_origins() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -419,7 +1187,7 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -550,7 +1318,7 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -622,9 +1390,14 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
         "log links must not open in a new tab"
     );
     // These readings were all just collected, so no row is lagging — no
-    // "updated ago" text should appear anywhere in the group card.
+    // "updated ago" text should appear anywhere in the group card. Bounded
+    // to the rendered markup: the page's inline scripts trail the grid and
+    // have status messages of their own that use the same word.
+    let markup_end = html[id_idx..]
+        .find("<script")
+        .map_or(html.len(), |i| id_idx + i);
     assert!(
-        !html[id_idx..].contains("updated"),
+        !html[id_idx..markup_end].contains("updated"),
         "fresh group rows should show no 'updated ago' text"
     );
     // Only the two banded members (days-left, balance) render a history bar;
@@ -727,7 +1500,7 @@ async fn web_ui_history_bar_reflects_recent_readings() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -797,7 +1570,7 @@ async fn web_ui_unbanded_failing_source_colors_red_with_plain_label() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -877,7 +1650,7 @@ async fn web_ui_show_history_false_hides_bar_for_banded_source() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -948,7 +1721,7 @@ async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1023,7 +1796,7 @@ async fn web_ui_main_only_pane_renders_like_single_source_panel() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1131,7 +1904,7 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1247,7 +2020,7 @@ async fn web_ui_hides_a_tui_only_source_but_keeps_the_unrestricted_one() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1320,7 +2093,7 @@ async fn web_ui_omits_hidden_pane_member_and_collapses_all_hidden_pane() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1400,7 +2173,7 @@ async fn dashboard_includes_connection_indicator() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1439,7 +2212,7 @@ async fn dashboard_includes_offline_banner_and_dim_toggle() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1500,7 +2273,7 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1633,7 +2406,7 @@ rows = [
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1674,7 +2447,7 @@ rows = [
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1753,7 +2526,7 @@ rows = [
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1784,7 +2557,7 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1834,7 +2607,7 @@ async fn web_ui_summary_chip_href_matches_panel_id() {
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2311,7 +3084,7 @@ rows = [["cpu"]]
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2402,7 +3175,7 @@ rows = [["price"]]
     let state = AppState {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
-        resets: std::collections::HashMap::default(),
+        controls: std::collections::HashMap::default(),
     };
     let router = build_router_with_bundle(state, test_asset_bundle());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

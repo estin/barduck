@@ -14,7 +14,7 @@ use topcoat::{
     Result,
     context::{Cx, app_context},
     runtime::shard,
-    view::{attributes, view},
+    view::{attributes, component, view},
 };
 
 pub(super) struct Panel {
@@ -31,6 +31,14 @@ pub(super) struct Panel {
     /// `None` for a neutral/padding segment. Empty when the source has no
     /// threshold bands (spec: web-ui — panel retrospective history bar).
     history: Vec<Option<Level>>,
+    /// Whether this source has a fetch that can be forced (spec: web-ui —
+    /// Panels can force a poll). False for `ingest` and `stream` sources,
+    /// which get no control.
+    pollable: bool,
+    /// Whether a fetch for this source — scheduled or forced, from this
+    /// browser tab or anywhere else — is running right now (spec: web-ui —
+    /// poll-in-progress is visible). Independent of `status`.
+    polling: bool,
 }
 
 impl Panel {
@@ -436,6 +444,50 @@ fn build_panel(
         format: src.and_then(config::SourceCfg::format).unwrap_or_default(),
         ts_epoch: row.map_or(0.0, |r| r.ts_epoch),
         history,
+        pollable: src.is_some_and(|s| crate::collector::unpollable_reason(s).is_none()),
+        polling: health.is_some_and(|h| h.polling),
+    }
+}
+
+/// The per-source "fetch now" control (spec: web-ui — Panels can force a
+/// poll). Deliberately plain markup styled like the adjacent time-ago link
+/// rather than the `button` component, whose smallest size would tower over
+/// a footer built from `text-xs` text.
+///
+/// It carries no click handler of its own: one delegated listener on the
+/// document (`POLL_SCRIPT`) drives every one of these, which is what keeps
+/// them working after the panel shard replaces the grid's DOM on its next
+/// tick.
+///
+/// `polling` — true while a fetch for this source, scheduled or forced,
+/// from any viewer, is actually running (spec: web-ui — poll-in-progress is
+/// visible) — swaps the control for a plain "polling…" marker with no
+/// `data-bd-poll`, so it can't be clicked into starting a second fetch and
+/// needs no separate progress popup: every viewer sees the same state,
+/// live, on the panel itself.
+#[component]
+pub(super) async fn poll_button(source: String, polling: bool) -> Result {
+    if polling {
+        view! {
+            <span
+                aria-live="polite"
+                class="normal-case opacity-60 italic"
+            >
+                "polling…"
+            </span>
+        }
+    } else {
+        view! {
+            <button
+                type="button"
+                data-bd-poll=(source.clone())
+                title=(format!("Fetch {source} now"))
+                aria-label=(format!("Fetch {source} now"))
+                class="normal-case opacity-60 hover:opacity-100 hover:underline cursor-pointer disabled:opacity-30 disabled:cursor-default bg-transparent border-0 p-0 font-inherit text-inherit"
+            >
+                "poll now"
+            </button>
+        }
     }
 }
 
@@ -660,12 +712,17 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                         // of the footer floating directly under the content.
                                         attrs: attributes! { class="mt-auto flex justify-between text-xs uppercase tracking-wide" },
                                         <span>(main.status.as_str())</span>
-                                        <a
-                                            href=(format!("/logs/{}", main.source))
-                                            class="normal-case opacity-60 hover:opacity-100 hover:underline"
-                                        >
-                                            (format!("updated {}", main.updated_ago()))
-                                        </a>
+                                        <span class="flex items-center gap-2">
+                                            if main.pollable {
+                                                poll_button(source: main.source.clone(), polling: main.polling)
+                                            }
+                                            <a
+                                                href=(format!("/logs/{}", main.source))
+                                                class="normal-case opacity-60 hover:opacity-100 hover:underline"
+                                            >
+                                                (format!("updated {}", main.updated_ago()))
+                                            </a>
+                                        </span>
                                     )
                                 )
                             }
@@ -699,6 +756,9 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                                                 >
                                                     (format!("updated {}", main.updated_ago()))
                                                 </a>
+                                                if main.pollable {
+                                                    poll_button(source: main.source.clone(), polling: main.polling)
+                                                }
                                             </div>
                                             if !main.history.is_empty() {
                                                 <div class="mt-1.5 flex h-1">

@@ -17,6 +17,9 @@ a runnable tour.
 - Storage: embedded DuckDB, one file, plain SQL accessible
 - Surfaces: `daemon` (collector + API + web), `tui` (ratatui), query commands,
   all with direct-DB or daemon-backed modes
+- Off-schedule refresh: `barduck poll -s <name>` (or a panel's "poll now"
+  control) fetches and stores immediately; `barduck fetch -s <name>` is the
+  debug counterpart that writes nothing
 - Planning artifacts and specs: [`openspec/`](openspec/)
 
 ## Nix / home-manager

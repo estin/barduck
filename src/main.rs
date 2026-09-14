@@ -63,8 +63,24 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Fetch sources now, ignoring their schedules, and store the results
+    /// exactly as a scheduled fetch does. The writing counterpart to
+    /// `fetch`, which only prints.
+    Poll {
+        /// Source to poll (repeatable; at least one required).
+        #[arg(long, short = 's', required = true)]
+        source: Vec<String>,
+        /// Output JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+        /// Route the poll through the running daemon's HTTP API. Without
+        /// it, a daemon already holding the database is detected and used
+        /// anyway; otherwise the fetch runs in this process.
+        #[arg(long)]
+        daemon: bool,
+    },
     /// Run one source once and print the parsed result without touching
-    /// the database (debug).
+    /// the database (debug; use `poll` to fetch *and* store).
     Fetch {
         /// Which source to run.
         #[arg(long, short = 's')]
@@ -162,6 +178,17 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Poll {
+            source,
+            json,
+            daemon,
+        } => rt()?.block_on(cli_report::print_poll(
+            &Backend::new(&cfg, daemon)?,
+            &cfg,
+            &source,
+            json,
+            &mut std::io::stdout(),
+        )),
         Cmd::Fetch { source, json } => rt()?.block_on(cli_report::print_fetch(&cfg, &source, json)),
         Cmd::Skill => unreachable!(),
     }
@@ -183,7 +210,7 @@ fn multi_rt() -> Result<tokio::runtime::Runtime> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
     /// (spec: cli — Source debug fetch command)
@@ -204,6 +231,21 @@ mod tests {
     }
 
     /// (spec: cli — Reset reports machine-readable result)
+    /// (spec: cli — Force poll command)
+    #[test]
+    fn poll_requires_at_least_one_repeatable_source() {
+        let cli = Cli::try_parse_from(["barduck", "poll", "-s", "a", "-s", "b"]).unwrap();
+        match cli.cmd {
+            Cmd::Poll { source, .. } => assert_eq!(source, ["a", "b"]),
+            _ => panic!("expected poll"),
+        }
+        assert!(Cli::try_parse_from(["barduck", "poll", "--source", "a"]).is_ok());
+        assert!(Cli::try_parse_from(["barduck", "poll", "--json", "--daemon", "-s", "a"]).is_ok());
+        // No source, and a positional in place of the flag, both rejected.
+        assert!(Cli::try_parse_from(["barduck", "poll"]).is_err());
+        assert!(Cli::try_parse_from(["barduck", "poll", "a"]).is_err());
+    }
+
     #[test]
     fn reset_accepts_json_flag() {
         let cli = Cli::try_parse_from(["barduck", "reset", "--json", "--yes"]).unwrap();

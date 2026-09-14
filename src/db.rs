@@ -61,12 +61,42 @@ pub struct Db {
     /// health/renderers, forgotten when the handle is dropped. A fresh
     /// handle (daemon start) therefore always reseeds from config bands.
     session_bands: SessionBands,
+    /// Sources currently mid-fetch, for the current process only (spec:
+    /// data-collection — Poll-in-progress is visible).
+    polling: PollingSet,
 }
 
 /// In-memory threshold overrides keyed by source name. `std` (not Tokio)
 /// lock: holders only clone a small `Vec`, never hold across `.await`.
 pub type SessionBands =
     std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, Vec<Threshold>>>>;
+
+/// Source names currently mid-fetch, for the current process only — the
+/// same "forgotten when the handle is dropped" lifetime as [`SessionBands`],
+/// and for the same reason: this is a *display* signal (spec: data-collection
+/// — Poll-in-progress is visible; web-ui/tui — visualizing it), not a
+/// correctness mechanism, so a fresh daemon restart starting empty is fine.
+/// `std` lock: holders only touch a small `HashSet`, never hold across
+/// `.await`.
+pub type PollingSet = std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>;
+
+/// Marks a source as mid-fetch until dropped (spec: data-collection —
+/// Poll-in-progress is visible). Returned by [`Db::mark_polling`]; holding
+/// it across the fetch and letting normal scope-exit (including an early
+/// `return` or a panic unwind) drop it is what keeps the flag from getting
+/// stuck "on" if a fetch errors out partway.
+pub struct PollingGuard {
+    set: PollingSet,
+    source: String,
+}
+
+impl Drop for PollingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.write() {
+            set.remove(&self.source);
+        }
+    }
+}
 
 struct DbLock(#[allow(dead_code)] File);
 
@@ -619,6 +649,7 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
             writer: None,
             reader: None,
             session_bands: SessionBands::default(),
+            polling: PollingSet::default(),
         };
         let mut conn = match open_daemon_conn(&db) {
             Ok(conn) => conn,
@@ -700,6 +731,7 @@ fn spawn_reader(path: PathBuf, writer: mpsc::UnboundedSender<WriteCmd>) -> mpsc:
             writer: None,
             reader: None,
             session_bands: SessionBands::default(),
+            polling: PollingSet::default(),
         };
         let mut conn = match clone_writer_conn(&handle, &writer) {
             Ok(conn) => conn,
@@ -978,6 +1010,7 @@ impl Db {
             writer: None,
             reader: None,
             session_bands: SessionBands::default(),
+            polling: PollingSet::default(),
         };
         db.with_conn(create_schema)?;
         Ok(db)
@@ -1006,6 +1039,7 @@ impl Db {
             writer: None,
             reader: None,
             session_bands: SessionBands::default(),
+            polling: PollingSet::default(),
         })
     }
 
@@ -1307,6 +1341,33 @@ impl Db {
     #[must_use]
     pub fn session_bands(&self, source: &str) -> Option<Vec<Threshold>> {
         self.session_bands.read().ok()?.get(source).cloned()
+    }
+
+    /// Marks `source` as mid-fetch until the returned guard drops (spec:
+    /// data-collection — Poll-in-progress is visible). Called once, from
+    /// [`crate::collector::fetch_once`], so both a scheduled tick and a
+    /// forced poll — everything that ends up running a source's command —
+    /// are covered from the same place.
+    #[must_use]
+    pub fn mark_polling(&self, source: &str) -> PollingGuard {
+        if let Ok(mut set) = self.polling.write() {
+            set.insert(source.to_string());
+        }
+        PollingGuard {
+            set: self.polling.clone(),
+            source: source.to_string(),
+        }
+    }
+
+    /// Whether `source` is currently mid-fetch in this process (spec:
+    /// data-collection — Poll-in-progress is visible). `false` for every
+    /// source in a direct-mode CLI/TUI process — nothing there runs a
+    /// collector task to ever call [`Db::mark_polling`].
+    #[must_use]
+    pub fn is_polling(&self, source: &str) -> bool {
+        self.polling
+            .read()
+            .is_ok_and(|set| set.contains(source))
     }
 
     pub async fn last_health(&self, source: &str) -> Result<Option<String>> {
@@ -2081,6 +2142,25 @@ mod tests {
         // A fresh handle is a fresh session: overrides are forgotten.
         let restarted = Db::open_rw(&path).unwrap();
         assert!(restarted.session_bands("s").is_none());
+    }
+
+    /// The flag is visible on any clone of the handle while the guard lives,
+    /// and clears itself when the guard drops — including a clone made
+    /// *after* the guard, since both share the same underlying set (spec:
+    /// data-collection — Poll-in-progress is visible).
+    #[test]
+    fn mark_polling_is_visible_on_clones_and_clears_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        assert!(!db.is_polling("s"));
+        let guard = db.mark_polling("s");
+        assert!(db.is_polling("s"));
+        let clone = db.clone();
+        assert!(clone.is_polling("s"), "a later clone shares the same set");
+        assert!(!clone.is_polling("other"), "unrelated sources are unaffected");
+        drop(guard);
+        assert!(!db.is_polling("s"));
+        assert!(!clone.is_polling("s"));
     }
 
     /// Explicit timestamps land on the reading (spec: data-storage —

@@ -213,6 +213,54 @@ pub async fn logs(cx: &Cx) -> Result<Response> {
     }
 }
 
+/// Fetches one source now, regardless of its schedule, and answers with the
+/// attempt's outcome (spec: http-api — Force poll endpoint). The fetch is
+/// carried out by that source's own collector task, so it can never overlap
+/// that source's scheduled fetch and the schedule restarts from the forced
+/// attempt (spec: data-collection — Forced polls are serialized with a
+/// source's schedule).
+///
+/// A fetch that ran and *failed* is a completed request, not a server
+/// error: it answers success with `success: false`, so a caller can tell a
+/// failing source command from a daemon it could not reach at all.
+#[route(POST "/api/sources/{source_name}/poll")]
+pub async fn poll(cx: &Cx) -> Result<Response> {
+    let st = app_context::<AppState>(cx);
+    let source = path_param::<SourceName>(cx)?.clone();
+    let Some(src) = st.cfg.sources.iter().find(|s| s.name() == source) else {
+        return Ok(json_err(
+            StatusCode::NOT_FOUND,
+            &format!("unknown source `{source}`"),
+        ));
+    };
+    if let Some(why) = collector::unpollable_reason(src) {
+        return Ok(json_err(
+            StatusCode::BAD_REQUEST,
+            &format!("source `{source}` {why}"),
+        ));
+    }
+    // No sender, a closed channel, or a dropped reply all mean the same
+    // thing: this source has no live collector task to do the work. Say so
+    // rather than hanging or reporting a fetch that never ran.
+    let gone = || {
+        json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("no collector is running for source `{source}`"),
+        )
+    };
+    let Some(tx) = st.controls.get(src.name()) else {
+        return Ok(gone());
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if tx.send(collector::Control::PollNow(reply_tx)).is_err() {
+        return Ok(gone());
+    }
+    match reply_rx.await {
+        Ok(outcome) => Ok(json_ok(&outcome)),
+        Err(_) => Ok(gone()),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct IngestBody {
     source: String,
@@ -276,7 +324,7 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
         ts: ts.clone(),
         threshold: req.thresholds.clone(),
     };
-    collector::store_parsed_value(
+    let _ = collector::store_parsed_value(
         &st.db,
         &st.cfg,
         src,
@@ -290,8 +338,8 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
     // sources have no sender and are unaffected (spec: data-collection —
     // Ingested values reset interval schedules). A closed channel only
     // means its collector task already exited — the value is still stored.
-    if let Some(tx) = st.resets.get(src.name()) {
-        let _ = tx.send(());
+    if let Some(tx) = st.controls.get(src.name()) {
+        let _ = tx.send(collector::Control::ResetSchedule);
     }
     Ok(json_ok(&serde_json::json!({
         "source": src.name(),

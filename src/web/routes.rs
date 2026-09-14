@@ -8,7 +8,7 @@
 #![allow(clippy::no_effect_underscore_binding)]
 
 use super::{
-    panels::{panels_grid, text_style_for_color},
+    panels::{panels_grid, poll_button, text_style_for_color},
     theme::theme_class,
 };
 use crate::{
@@ -153,6 +153,45 @@ const THEME_TOGGLE_SCRIPT: &str = r"(function () {
     });
 })();";
 
+/// Drives every "poll now" control on the page (spec: web-ui — Panels can
+/// force a poll). One delegated listener rather than per-button handlers:
+/// the panel shard replaces the grid's DOM on every tick, so anything bound
+/// to a particular button would stop working seconds later.
+///
+/// In-flight polls are tracked in a `Set` keyed by source, not by the
+/// button's `disabled` attribute, for the same reason — a re-render would
+/// otherwise hand the user a fresh, enabled button for a poll that is still
+/// running. No separate progress/failure popup: the clicked button itself
+/// flips to "polling…" for the request's own duration (immediate, since the
+/// endpoint doesn't answer until the fetch is done), and the outcome —
+/// success or failure — shows up the same way it does for anyone else
+/// watching, through the shared `polling`/health state every viewer's next
+/// tick re-renders from (spec: web-ui — poll-in-progress is visible).
+const POLL_SCRIPT: &str = r"(function () {
+    var inFlight = new Set();
+    document.addEventListener('click', function (ev) {
+        var btn = ev.target.closest('[data-bd-poll]');
+        if (!btn) return;
+        // The control sits inside the panel's link area; a click on it must
+        // never also follow the log-view link or submit anything.
+        ev.preventDefault();
+        ev.stopPropagation();
+        var source = btn.dataset.bdPoll;
+        if (inFlight.has(source)) return;
+        inFlight.add(source);
+        var label = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'polling…';
+        fetch('/api/sources/' + encodeURIComponent(source) + '/poll', { method: 'POST' })
+            .catch(function () {})
+            .finally(function () {
+                inFlight.delete(source);
+                btn.disabled = false;
+                btn.textContent = label;
+            });
+    });
+})();";
+
 /// Shared shell for both pages (spec: web-ui — header and footer stay pinned
 /// across pages): the pinned header/footer, the connection/favicon/theme
 /// scripts, and the tick signal both content shards read. `view_source`
@@ -164,6 +203,20 @@ const THEME_TOGGLE_SCRIPT: &str = r"(function () {
 #[component]
 pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<String>) -> Result {
     let theme = theme_class(cx);
+    let st = app_context::<AppState>(cx);
+    let pollable = view_source.as_ref().is_some_and(|name| {
+        st.cfg
+            .sources
+            .iter()
+            .find(|s| s.name() == name)
+            .is_some_and(|s| crate::collector::unpollable_reason(s).is_none())
+    });
+    // `page_chrome` is a `#[component]`, fixed once per real request — not a
+    // `#[shard]` that re-renders on the tick like `log_rows` does — so this
+    // reflects "polling as of page load" only, unlike the always-live marker
+    // `panels_grid`'s own panels show (spec: web-ui — poll-in-progress is
+    // visible).
+    let polling = view_source.as_ref().is_some_and(|name| st.db.is_polling(name));
     view! {
         <!DOCTYPE html>
         <html class=(theme)>
@@ -237,8 +290,17 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
                     <div id="bd-panel-wrapper">
                         if let Some(source) = &view_source {
                             <a href="/" class="text-xs opacity-60 hover:opacity-100 hover:underline">"← Back to dashboard"</a>
-                            <h2 class="text-xl font-bold mt-2 mb-4 text-foreground">
+                            <h2 class="text-xl font-bold mt-2 mb-4 text-foreground flex items-center gap-3">
                                 "Fetch logs — "(source.clone())
+                                // Every panel links here, so a source with no
+                                // control of its own on a compact group card
+                                // still has one a click away (spec: web-ui —
+                                // Panels can force a poll).
+                                if pollable {
+                                    <span class="text-xs font-normal">
+                                        poll_button(source: source.clone(), polling: polling)
+                                    </span>
+                                }
                             </h2>
                             log_rows(source: $(source.clone()), tick: $(tick.get()))
                         } else {
@@ -252,6 +314,7 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
                 <script>(Unescaped::new_unchecked(CONNECTION_SCRIPT.to_string()))</script>
                 <script>(Unescaped::new_unchecked(FAVICON_SCRIPT.to_string()))</script>
                 <script>(Unescaped::new_unchecked(THEME_TOGGLE_SCRIPT.to_string()))</script>
+                <script>(Unescaped::new_unchecked(POLL_SCRIPT.to_string()))</script>
             </body>
         </html>
     }

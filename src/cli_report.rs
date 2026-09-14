@@ -187,6 +187,84 @@ pub async fn print_fetch(cfg: &Config, source: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Fetches the named sources now, ignoring their schedules, and reports
+/// each attempt (spec: cli — Force poll command). Unlike [`print_fetch`],
+/// this writes: every attempt is recorded exactly as a scheduled fetch is.
+///
+/// Every name is validated before anything is polled, so a typo in the
+/// third name cannot leave the first two already fetched. A fetch that ran
+/// and failed does not stop the remaining sources — the command reports all
+/// of them and only then exits non-zero.
+pub async fn print_poll(
+    backend: &Backend,
+    cfg: &Config,
+    sources: &[String],
+    json: bool,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    let mut targets = Vec::with_capacity(sources.len());
+    for name in sources {
+        let Some(src) = cfg.sources.iter().find(|s| s.name() == name) else {
+            bail!("unknown source `{name}`");
+        };
+        if let Some(why) = crate::collector::unpollable_reason(src) {
+            bail!("source `{name}` {why}");
+        }
+        targets.push(src);
+    }
+
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for src in targets {
+        outcomes.push(backend.poll(cfg, src).await?);
+    }
+
+    if json {
+        writeln!(out, "{}", serde_json::to_string_pretty(&outcomes)?)?;
+    } else {
+        writeln!(out, "barduck v{VERSION} — forced poll")?;
+        let width = outcomes
+            .iter()
+            .map(|o| o.source.len())
+            .max()
+            .unwrap_or_default();
+        for o in &outcomes {
+            let detail = if o.success {
+                format!(
+                    "{}  {}",
+                    one_line(o.value.as_deref().unwrap_or("")),
+                    o.ts.as_deref().unwrap_or("")
+                )
+            } else {
+                o.error.clone().unwrap_or_else(|| "failed".into())
+            };
+            let status = if o.success { "ok" } else { "FAILED" };
+            writeln!(out, "{:<width$}  {status:<6}  {detail}", o.source)?;
+        }
+    }
+
+    if let Some(failed) = outcomes.iter().find(|o| !o.success) {
+        bail!(
+            "poll failed for `{}`: {}",
+            failed.source,
+            failed.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    Ok(())
+}
+
+/// A value as one table cell: markdown-format sources store prose, and a
+/// multi-line (or very long) value would otherwise tear the row apart. The
+/// full value is always available in `--json`.
+fn one_line(value: &str) -> String {
+    let first = value.lines().next().unwrap_or_default().trim();
+    let truncated: String = first.chars().take(60).collect();
+    if truncated.len() < first.len() || value.lines().nth(1).is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 fn print_debug_row(row: &DebugRow) {
     println!("VALUE      {}", row.value);
     println!("TS         {}", row.ts);
@@ -238,6 +316,128 @@ mod tests {
         assert_eq!(filtered.len(), 1);
 
         assert_eq!(filtered[0].source, "b");
+    }
+
+    #[test]
+    fn one_line_keeps_short_values_and_collapses_prose() {
+        assert_eq!(one_line("42"), "42");
+        assert_eq!(one_line("# Weekly report\n\nHours: 36.5"), "# Weekly report…");
+        assert_eq!(one_line(&"x".repeat(80)), format!("{}…", "x".repeat(60)));
+    }
+
+    fn poll_config(db_path: &std::path::Path) -> Config {
+        toml::from_str(&format!(
+            "database_path = \"{db}\"\n\
+             [[sources]]\nname = \"ok\"\ntype = \"query\"\ncommand = \"echo 42\"\ninterval = \"1h\"\n\
+             [[sources]]\nname = \"bad\"\ntype = \"query\"\ncommand = \"exit 3\"\ninterval = \"1h\"\n\
+             [[sources]]\nname = \"pushed\"\ntype = \"ingest\"\nexpected_interval = \"1h\"\n",
+            db = db_path.display(),
+        ))
+        .unwrap()
+    }
+
+    /// Direct mode runs the fetch in this process and writes it, with no
+    /// daemon anywhere — twice in a row, which is what exercises the
+    /// read-only probe followed by a read-write open (spec: cli — Force poll
+    /// works with and without a daemon).
+    #[tokio::test]
+    async fn poll_writes_directly_and_repeats_within_one_process() {
+        use crate::db::Db;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.duckdb");
+        let cfg = poll_config(&db_path);
+        drop(Db::open_rw(&db_path).unwrap()); // create the schema, release the file
+
+        let backend = Backend::new(&cfg, false).unwrap();
+        let mut buf = Vec::new();
+        for _ in 0..2 {
+            print_poll(&backend, &cfg, &["ok".into()], false, &mut buf)
+                .await
+                .unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("42"), "the stored value is reported:\n{text}");
+
+        let db = Db::open_rw(&db_path).unwrap();
+        let logs = db.logs(Some("ok"), 10).await.unwrap();
+        assert_eq!(logs.len(), 2, "both polls were recorded");
+        assert!(logs.iter().all(|l| l.error.is_none()));
+        assert_eq!(db.latest_values().await.unwrap()[0].value, "42");
+    }
+
+    /// (spec: cli — Force poll command: unknown source rejected before
+    /// polling; Force poll rejects sources with nothing to fetch)
+    #[tokio::test]
+    async fn poll_validates_every_name_before_polling_any() {
+        use crate::db::Db;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.duckdb");
+        let cfg = poll_config(&db_path);
+        drop(Db::open_rw(&db_path).unwrap());
+        let backend = Backend::new(&cfg, false).unwrap();
+
+        let err = print_poll(
+            &backend,
+            &cfg,
+            &["ok".into(), "nope".into()],
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err:#}");
+
+        let err = print_poll(&backend, &cfg, &["pushed".into()], false, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("HTTP push"), "{err:#}");
+
+        let db = Db::open_rw(&db_path).unwrap();
+        assert!(
+            db.logs(None, 10).await.unwrap().is_empty(),
+            "a rejected name must not leave earlier sources already polled"
+        );
+    }
+
+    /// Every named source is attempted even after one fails, and only then
+    /// does the command report failure (spec: cli — Force poll command).
+    #[tokio::test]
+    async fn poll_reports_every_outcome_then_fails() {
+        use crate::db::Db;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.duckdb");
+        let cfg = poll_config(&db_path);
+        drop(Db::open_rw(&db_path).unwrap());
+        let backend = Backend::new(&cfg, false).unwrap();
+        let names = ["bad".to_string(), "ok".to_string()];
+
+        let mut buf = Vec::new();
+        let err = print_poll(&backend, &cfg, &names, false, &mut buf)
+            .await
+            .unwrap_err();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("FAILED"), "{text}");
+        assert!(text.contains("42"), "the later source still ran:\n{text}");
+        assert!(err.to_string().contains("bad"), "{err:#}");
+
+        let db = Db::open_rw(&db_path).unwrap();
+        assert_eq!(db.logs(Some("bad"), 10).await.unwrap().len(), 1);
+        assert_eq!(db.logs(Some("ok"), 10).await.unwrap().len(), 1);
+        drop(db);
+
+        let mut buf = Vec::new();
+        assert!(
+            print_poll(&backend, &cfg, &names, true, &mut buf)
+                .await
+                .is_err()
+        );
+        let rows: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(rows[0]["source"], "bad");
+        assert_eq!(rows[0]["success"], false);
+        assert!(rows[0]["error"].is_string());
+        assert_eq!(rows[1]["source"], "ok");
+        assert_eq!(rows[1]["success"], true);
+        assert_eq!(rows[1]["value"], "42");
     }
 
     /// `logs` renders one row per attempt with its origin (spec: cli —
