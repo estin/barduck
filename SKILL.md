@@ -174,7 +174,7 @@ Validate a source configuration before applying it using `barduck fetch --source
 ### Agent Workflow
 
 1. **Parse the user's request** to identify the data point and source type
-2. **Choose the source type**: `query` for scheduled oneshot commands, `stream` for continuous JSON lines
+2. **Choose the source type**: `query` for scheduled oneshot commands, `stream` for continuous JSON lines, `ingest` for push-based data arriving via HTTP POST
 3. **Write the TOML source configuration** with the appropriate fields, using `name` (not `id`)
 4. **Validate** by running `barduck fetch --source <name>` to test without affecting the database
 5. **Add to config.toml** and restart the daemon (or use the running daemon if supported)

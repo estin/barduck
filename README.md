@@ -44,3 +44,9 @@ nixpkgs' `duckdb` with the web UI's Tailwind assets pre-bundled) and
   };
 }
 ```
+
+## Alternative projects
+
+- [wtfutil](https://wtfutil.com/)
+- [sampler](https://sampler.dev/)
+- [glances](https://nicolargo.github.io/glances/)
