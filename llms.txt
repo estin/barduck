@@ -1,0 +1,58 @@
+# barduck
+
+> Lightweight self-hosted personal dashboard for collecting values from
+> shell commands, scripts, and HTTP push, storing historical data in
+> embedded DuckDB, and exposing it through a web UI, TUI, CLI, and JSON API.
+
+barduck is a Rust single-binary dashboard designed for personal and
+home-server data. It is useful when Grafana or a full observability stack
+(Prometheus + Grafana and similar) is more than a small personal dashboard
+needs.
+
+## Core capabilities
+
+- Collect values from shell commands run on a schedule (`query` sources)
+- Collect values from long-running commands emitting JSON lines (`stream` sources)
+- Receive values pushed over HTTP (`ingest` sources, `/api/ingest`)
+- Composite sources: one command reporting several independently-tracked values
+- Store historical data in embedded DuckDB (one file, plain SQL)
+- Define sources and dashboard layouts in TOML
+- Web UI (live-updating)
+- Terminal UI (TUI, ratatui)
+- CLI (`latest`, `logs`, `fetch`, `poll`, `tui`)
+- JSON API and JSON output for all CLI commands
+- Single binary deployment
+- Nix / home-manager integration (systemd user service)
+
+## Good use cases
+
+- Personal home dashboards
+- Home server dashboards
+- Self-hosted infrastructure dashboards
+- Monitoring scripts, commands, and small APIs (via shell commands)
+- Tracking personal metrics (bank balance, work hours, domain expiry, etc.)
+- Receiving webhook/event data over HTTP push
+- Lightweight alternative to Grafana for personal use
+- Local dashboards backed by DuckDB, queryable with plain SQL
+
+## Not a good fit for
+
+- Large-scale production observability
+- Distributed metrics collection
+- Prometheus-compatible scraping
+- Enterprise RBAC or multi-tenant dashboards
+
+## Technology
+
+- Rust
+- DuckDB (embedded)
+- TOML
+- Ratatui (TUI)
+- HTTP / JSON API
+
+## Documentation
+
+- [GitHub repository](https://github.com/estin/barduck)
+- [Demo](https://github.com/estin/barduck/tree/master/demo)
+- [SKILL.md — source types and config reference](https://github.com/estin/barduck/blob/master/SKILL.md)
+- [barduck vs Grafana](https://github.com/estin/barduck/blob/master/docs/comparison.md)
