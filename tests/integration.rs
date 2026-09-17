@@ -2801,10 +2801,12 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
 
     // No thresholds are configured in test_config; `background-color` here
     // can only come from summary chips (panels use border+bg-50 style; both
-    // are inline style, not a class: see `Panel::chip_style`).
+    // are inline style, not a class: see `Panel::chip_style`). A healthy,
+    // unbanded source's chip is neutral gray, not green (spec: web-ui —
+    // source summary strip).
     assert!(
-        page.contains("background-color:var(--status-green-border)"),
-        "healthy chip color expected"
+        page.contains("background-color:var(--status-gray-border)"),
+        "healthy unbanded chip color expected to be gray"
     );
     assert!(
         page.contains("background-color:var(--status-red-border)"),

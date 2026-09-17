@@ -87,17 +87,24 @@ impl Panel {
     }
 
     /// Inline CSS for a summary-strip chip in this panel's status color (same
-    /// rationale as [`Panel::status_style`]).
+    /// rationale as [`Panel::status_style`]). Unlike a panel card, a chip is
+    /// always a filled pill and needs some visible color even when the panel
+    /// itself renders with no accent at all — so a healthy, unbanded source
+    /// (`accent_color` = `None`) gets a neutral gray chip instead of falling
+    /// back to green (spec: web-ui — source summary strip).
     fn chip_style(&self) -> &'static str {
-        match self.level_color() {
-            Level::Red => {
+        match self.accent_color() {
+            Some(Level::Red) => {
                 "background-color:var(--status-red-border);color:var(--status-red-chip-fg)"
             }
-            Level::Yellow => {
+            Some(Level::Yellow) => {
                 "background-color:var(--status-yellow-border);color:var(--status-yellow-chip-fg)"
             }
-            Level::Green => {
+            Some(Level::Green) => {
                 "background-color:var(--status-green-border);color:var(--status-green-chip-fg)"
+            }
+            None => {
+                "background-color:var(--status-gray-border);color:var(--status-gray-chip-fg)"
             }
         }
     }

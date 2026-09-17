@@ -104,6 +104,13 @@
   --status-green-fg: var(--foreground);
   --status-green-text: #059669;
   --status-green-chip-fg: #ffffff;
+  /* A healthy, unbanded source's summary-strip chip: no threshold color to
+     show, so this is a neutral gray rather than red/yellow/green — a
+     dedicated hex pair (Tailwind slate-400/900) so the chip is a clearly
+     visible filled pill, same weight as the other status chips, instead of
+     a washed-out tint of the page's own border/text tokens. */
+  --status-gray-border: #94a3b8;
+  --status-gray-chip-fg: #0f172a;
 }
 
 /* Typography-plugin variables, pointed at this project's own tokens instead
@@ -173,6 +180,8 @@
     --status-green-border: #4f9e7c;
     --status-green-text: #5cbf94;
     --status-green-chip-fg: #0d2e21;
+    --status-gray-border: #64748b;
+    --status-gray-chip-fg: #f1f5f9;
   }
 }
 
@@ -205,6 +214,8 @@
   --status-green-border: #4f9e7c;
   --status-green-text: #5cbf94;
   --status-green-chip-fg: #0d2e21;
+  --status-gray-border: #64748b;
+  --status-gray-chip-fg: #f1f5f9;
 }
 
 @layer base {
