@@ -78,6 +78,29 @@ preferred, and Prometheus is unnecessary.
 | TUI | Yes | No |
 | Target | Personal / home-server | Observability / production |
 
+## Platforms and commands
+
+Barduck uses `sh -c` on Linux/macOS and native `cmd.exe /D /S /C` on
+Windows. Query, setup, and stream commands run in the config file's
+directory. Commands must use the host shell's syntax and installed tools;
+the POSIX demo scripts are not native Windows examples. PowerShell scripts
+can be invoked explicitly, for example `powershell.exe -NoProfile -File scripts/metric.ps1`.
+
+Cancellation, output errors, and stream shutdown terminate the owned
+process tree: a process group on Unix, a Job Object on Windows. Commands
+must not deliberately detach from the Unix process group. No Git Bash or
+WSL is required for Windows command execution.
+
+Build with stable Rust and DuckDB available to the linker, or use
+`cargo build --release --features bundled` with a native C++ toolchain.
+The build downloads the host Tailwind executable. Web deployments also
+need the Topcoat CLI (`cargo install topcoat-cli --version 0.6.2`) and
+`topcoat asset bundle --release`; keep `target/release/assets` beside the
+binary. The Nix/home-manager service below is Linux/systemd-specific.
+
+CI runs native command execution and parent/descendant cleanup regressions
+on Windows and macOS, alongside the existing Ubuntu suite.
+
 ## Nix / home-manager
 
 `flake.nix` exposes `packages.<system>.default` (the binary, built against

@@ -12,6 +12,7 @@ crossterm = "0.29"
 duckdb = { version = "1.10505", features = ["chrono"] }
 humantime = "2.4"
 humantime-serde = "1.1"
+process-wrap = { version = "9.0.3", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop", "creation-flags"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 ratatui = "0.30"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }

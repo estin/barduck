@@ -1,5 +1,6 @@
 use crate::config::{Config, JsonlRow, SourceCfg, Threshold, ValueType, parse_jsonl_row};
 use anyhow::{Context as _, Result, bail};
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use std::path::Path;
 
 /// A fetchable data source. Enum-dispatched by config `type`;
@@ -444,105 +445,124 @@ pub async fn debug_stream(cfg: &Config, src: &SourceCfg) -> Result<Vec<DebugRow>
 }
 
 /// A running stream process with line-split stdout (spec: data-collection
-/// — Stream collection). Owns the child: drop the value without
-/// [`StreamProc::shutdown`] and the process group is killed on best effort
-/// rather than orphaned (see [`KillGroupOnDrop`]).
+/// — Stream collection). Owns the process tree even when dropped without
+/// calling [`StreamProc::shutdown`].
 pub struct StreamProc {
-    child: tokio::process::Child,
+    child: ShellProcess,
     lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
-    guard: KillGroupOnDrop,
 }
 
 impl StreamProc {
-    /// Spawns `sh -c <command>` with stdout piped and line-buffered.
-    /// Synchronous: spawning never blocks, only reading does.
+    /// Spawns the platform shell with stdout piped and line-buffered.
     pub fn spawn(command: &str, dir: &Path) -> Result<Self> {
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(dir)
-            .process_group(0)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
+        let mut child = spawn_shell(command, dir, std::process::Stdio::null())
             .context("spawning stream command")?;
-        let stdout = child.stdout.take().context("stream stdout not piped")?;
-        #[allow(clippy::cast_possible_wrap)]
-        let guard = KillGroupOnDrop(child.id().map(|id| id as i32));
+        let stdout = child
+            .child
+            .stdout()
+            .take()
+            .context("stream stdout not piped")?;
         Ok(Self {
             child,
             lines: tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(stdout)),
-            guard,
         })
     }
 
     /// The next stdout line, or `None` on EOF (process ended or closed
-    /// stdout). I/O errors surface as `Err` and are treated like an exit.
+    /// stdout). I/O errors terminate the tree before surfacing as `Err`.
     pub async fn next_line(&mut self) -> Result<Option<String>> {
-        self.lines.next_line().await.context("reading stream line")
+        match self.lines.next_line().await {
+            Ok(line) => Ok(line),
+            Err(error) => {
+                self.shutdown().await;
+                Err(error).context("reading stream line")
+            }
+        }
     }
-    /// Waits for the process to exit after EOF, for the collector's exit
-    /// log; disarms the orphan-killer since the child is reaped.
+
+    /// Waits for the direct process's exit status, then terminates any
+    /// descendants it left running, including ones that closed stdout.
     pub async fn wait_for_exit(&mut self) -> Result<std::process::ExitStatus> {
-        let status = self.child.wait().await.context("waiting for stream exit")?;
-        self.guard.0 = None;
-        Ok(status)
+        let status = self.child.wait().await.context("waiting for stream exit");
+        self.child.shutdown().await;
+        status
     }
 
-    /// Kills the process group and reaps the child (daemon shutdown). Kills
-    /// the whole group, not just the direct `sh` pid — a command like
-    /// `cmd | tee` or one that backgrounds work with `&` leaves descendants
-    /// that `Child::kill` (which only signals the direct child) would
-    /// otherwise orphan, reparented to init instead of cleaned up.
+    /// Terminates the entire process tree and reaps the direct child.
     pub async fn shutdown(&mut self) {
-        if let Some(pgid) = self.guard.0.take() {
-            KillGroupOnDrop::kill_group(pgid);
+        self.child.shutdown().await;
+    }
+}
+
+/// Owns the group/job as well as the direct child. Tokio's kill-on-drop
+/// only kills the direct child on Unix, so Drop must signal the group too.
+/// Tokio retains responsibility for best-effort reaping on cancellation;
+/// ordinary completion and explicit shutdown await the direct child.
+struct ShellProcess {
+    child: Box<dyn ChildWrapper>,
+    armed: bool,
+}
+
+impl ShellProcess {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        // These wrappers' inner_mut() delegates to the raw Tokio child.
+        // Waiting on the group/job wrapper instead can wait indefinitely
+        // for background descendants, and on Windows creates an uncancellable
+        // blocking completion-port wait. We own descendant cleanup ourselves.
+        self.child.inner_mut().wait().await
+    }
+
+    fn terminate(&mut self) {
+        if self.armed {
+            self.armed = false;
+            let _ = self.child.start_kill();
+            // Still kill the direct child if group/job termination failed.
+            let _ = self.child.inner_mut().start_kill();
         }
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+    }
+
+    async fn shutdown(&mut self) {
+        self.terminate();
+        let _ = self.wait().await;
     }
 }
 
-/// Kills a spawned command's whole process group (not just its direct PID)
-/// if dropped before the command finishes — e.g. the collector's caller
-/// cancels the surrounding `tokio::time::timeout` on a hung `query` source.
-/// Without this, a hanging command (a slow API call, a `whois` lookup with
-/// no timeout of its own) and everything it spawned are simply abandoned as
-/// orphans instead of being cleaned up, quietly leaking processes/sockets on
-/// every timeout (spec: data-collection — collector resilience: one
-/// source's misbehavior must not degrade the whole daemon over time).
-struct KillGroupOnDrop(Option<i32>);
-
-impl KillGroupOnDrop {
-    /// The negative pid targets the whole process group `process_group(0)`
-    /// put the command in at spawn time. Shared by the `Drop` glue (no async
-    /// context available there) and [`StreamProc::shutdown`], which needs the
-    /// same whole-group kill from an async context that can also reap the
-    /// child afterward.
-    ///
-    /// `status()`, not `spawn()`: a spawned-and-dropped `std::process::Child`
-    /// is never waited on, so it lingers as a zombie until the whole process
-    /// exits — one per cancelled fetch and per stream shutdown, accumulating
-    /// for the daemon's entire lifetime (spec: data-collection — collector
-    /// resilience). `kill` exits in about a millisecond, so blocking on it
-    /// here (including from a Tokio worker running `Drop`) costs far less
-    /// than leaking the entry.
-    fn kill_group(pgid: i32) {
-        let _ = std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pgid}"))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-}
-
-impl Drop for KillGroupOnDrop {
+impl Drop for ShellProcess {
     fn drop(&mut self) {
-        if let Some(pgid) = self.0.take() {
-            Self::kill_group(pgid);
-        }
+        self.terminate();
     }
+}
+
+/// Shared shell selection and tree ownership for queries, setup and streams.
+fn spawn_shell(command: &str, dir: &Path, stderr: std::process::Stdio) -> Result<ShellProcess> {
+    #[cfg(unix)]
+    let mut shell = CommandWrap::with_new("sh", |shell| {
+        shell.arg("-c").arg(command);
+    });
+    #[cfg(windows)]
+    let mut shell = CommandWrap::with_new("cmd.exe", |shell| {
+        // /S strips the outer pair of quotes. Keep the command inside them
+        // verbatim: argv quoting would escape shell operators and quotes.
+        shell
+            .args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command}\""));
+    });
+    shell
+        .command_mut()
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(stderr);
+    shell.wrap(KillOnDrop);
+    #[cfg(unix)]
+    shell.wrap(process_wrap::tokio::ProcessGroup::leader());
+    #[cfg(windows)]
+    // JobObject spawns suspended, assigns the child, then resumes it.
+    // KillOnDrop also sets the job's kill-on-close flag.
+    shell.wrap(process_wrap::tokio::JobObject);
+    Ok(ShellProcess {
+        child: shell.spawn()?,
+        armed: true,
+    })
 }
 
 /// Ceiling on a single command's captured stdout/stderr. A reading is a
@@ -557,33 +577,33 @@ const MAX_COMMAND_OUTPUT: usize = 1 << 20; // 1 MiB
 /// Runs a shell command (working directory `dir` — the config file's own
 /// directory, spec: source-configuration — config-relative working
 /// directory) and returns its trimmed stdout; non-zero exit is an error
-/// carrying stderr. Shared by query sources and setup commands. Spawned in
-/// its own process group so a cancelled/timed-out fetch can be cleaned up
-/// as a whole (see [`KillGroupOnDrop`]) instead of leaving orphans behind.
+/// carrying stderr. Shared by query sources and setup commands. The whole
+/// process tree is cleaned up on completion, cancellation or output errors.
 /// Output past [`MAX_COMMAND_OUTPUT`] fails the fetch rather than being
 /// buffered without limit.
 pub async fn run_shell(command: &str, dir: &Path) -> Result<String> {
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(dir)
-        .process_group(0)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning sh")?;
-    let mut guard = KillGroupOnDrop(child.id().map(u32::cast_signed));
-    let stdout = child.stdout.take().context("sh stdout not piped")?;
-    let stderr = child.stderr.take().context("sh stderr not piped")?;
+    let mut child = spawn_shell(command, dir, std::process::Stdio::piped())
+        .context("spawning shell command")?;
+    let stdout = child
+        .child
+        .stdout()
+        .take()
+        .context("shell stdout not piped")?;
+    let stderr = child
+        .child
+        .stderr()
+        .take()
+        .context("shell stderr not piped")?;
     // Both pipes must be drained concurrently with the wait: a command that
     // fills one pipe's buffer blocks until it is read, so reading them in
     // sequence would deadlock against a command writing to both.
-    let (status, out, err) = tokio::try_join!(
-        async { child.wait().await.context("waiting for sh") },
+    let output = tokio::try_join!(
+        async { child.wait().await.context("waiting for shell command") },
         read_capped(stdout, "stdout"),
         read_capped(stderr, "stderr"),
-    )?;
-    guard.0 = None; // exited on its own — nothing left to clean up
+    );
+    child.shutdown().await;
+    let (status, out, err) = output?;
     if !status.success() {
         bail!(
             "command failed ({status}): {}",
@@ -955,7 +975,15 @@ mod tests {
         );
         let root = find(&cfg, "load");
         let rows = debug_composite(&cfg, root, None).await.unwrap();
-        let missing = rows.iter().find(|r| r.name.as_deref() == Some("load::5m")).unwrap();
-        assert!(missing.error.as_deref().is_some_and(|e| e.contains("missing")));
+        let missing = rows
+            .iter()
+            .find(|r| r.name.as_deref() == Some("load::5m"))
+            .unwrap();
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("missing"))
+        );
     }
 }

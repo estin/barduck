@@ -40,3 +40,18 @@ jobs:
 
       - name: just ci
         run: just ci
+
+  native-processes:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Existing dashboard fixtures use POSIX commands. This suite runs
+      # native shell commands and observes both generations of a real tree.
+      - name: Test native command execution and process cleanup
+        run: cargo test --test process_lifecycle

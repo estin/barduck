@@ -1,7 +1,7 @@
 # barduck Skill Reference
 
 > barduck is a single-binary home dashboard that collects values from config-defined shell sources, stores them in DuckDB, and displays them via a web UI, TUI, CLI, and JSON API.
-> The config file lives at `~/.config/barduck/config.toml`. The app changes its working directory to the config file's directory at startup, so script commands resolve relative to it.
+> Pass the TOML config with `--config` (default: `config.toml`). Each source command runs in the config file's directory, so script paths resolve relative to it without changing the application's working directory.
 
 ## Creating Sources by User Query
 
@@ -14,6 +14,23 @@ When a user asks to add a data source, translate their request into a TOML `[[so
 **`stream`** — A long-running command emitting JSON lines to stdout. Use this for continuous data feeds like live API streams or log ingestion.
 
 **`ingest`** — A push-based source that receives data via HTTP POST. Use this for webhooks, event buses, or any producer that pushes values to barduck's `/api/ingest` endpoint. Has no `command`; data arrives via push. Reports `stale` when no push arrives within `expected_interval`.
+
+### Platform shell semantics
+
+`command` and `setup` execute through `sh -c` on Linux/macOS and
+`cmd.exe /D /S /C` on native Windows. Use the host shell's quoting,
+environment-variable syntax, and installed tools. POSIX examples below
+need adaptation on Windows; single quotes are not `cmd.exe` string quotes.
+To use PowerShell, invoke it explicitly, for example:
+
+```toml
+command = 'powershell.exe -NoProfile -File "scripts/metric.ps1"'
+```
+
+Timeout/cancellation and stream shutdown terminate descendants through
+Unix process groups or Windows Job Objects, not just the shell PID.
+Background processes belong to the source's lifetime; do not deliberately
+detach them from their Unix process group. Emit UTF-8 output from scripts.
 
 ### Composite Sources
 
@@ -308,7 +325,7 @@ duration of that one command.
 ## System Architecture
 
 - **Storage**: Embedded DuckDB (one file, plain SQL accessible)
-- **Config**: TOML (`sources`, `layouts`) at `~/.config/barduck/config.toml` — adding a data point needs no code changes
+- **Config**: TOML (`sources`, `layouts`) selected with `--config` (default: `config.toml`) — adding a data point needs no code changes
 - **Surfaces**: `daemon` (collector + API + web), `tui` (ratatui), CLI commands, all with direct-DB or daemon-backed modes
 - **Collection**: `query` sources run on schedule; `stream` sources run continuously
-- **Working directory**: barduck chdirs to the config file's directory at startup, so all script paths are relative to it
+- **Working directory**: each command runs in the config file's directory; the application's working directory is unchanged
