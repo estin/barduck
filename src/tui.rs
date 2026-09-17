@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,7 @@ pub fn run(backend: &Backend, cfg: &Config) -> Result<()> {
 fn event_loop(terminal: &mut TerminalGuard, backend: &Backend, cfg: &Config) -> Result<()> {
     let mut state = UiState {
         error: None,
+        scroll_offset: 0,
         rows: Vec::new(),
     };
     let mut refresher = Refresher::start(backend.clone(), cfg.clone());
@@ -57,9 +58,24 @@ fn event_loop(terminal: &mut TerminalGuard, backend: &Backend, cfg: &Config) -> 
         if let Some(outcome) = refresher.take_latest() {
             apply_outcome(cfg, outcome, &mut state);
         }
+
+        // Recomputed every iteration — not only after a scroll key — so a
+        // resize or a data refresh that shrinks the content can never leave
+        // `scroll_offset` pointing past the end (spec: tui — TUI scrolls
+        // when content overflows the terminal).
+        let rows = visible_rows(&state.rows);
+        let (heights, _) = row_heights(&rows);
+        let (_, term_height) = crossterm::terminal::size()?;
+        let available = term_height.saturating_sub(1 + u16::from(state.error.is_some()));
+        state.scroll_offset = state.scroll_offset.min(max_scroll_offset(&heights, available));
+
         terminal.draw(|f| draw(f, &state, &cfg.tui_width))?;
-        if crossterm::event::poll(POLL_INTERVAL)? && quit_requested(&crossterm::event::read()?) {
-            return Ok(());
+        if crossterm::event::poll(POLL_INTERVAL)? {
+            let event = crossterm::event::read()?;
+            if quit_requested(&event) {
+                return Ok(());
+            }
+            apply_scroll_key(&event, &heights, available, &mut state.scroll_offset);
         }
     }
 }
@@ -79,6 +95,40 @@ fn quit_requested(event: &crossterm::event::Event) -> bool {
     }
     matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Applies one scroll keypress to `*scroll_offset` — a no-op for any other
+/// key or event kind, mirroring `quit_requested`'s shape so both live in the
+/// same `crossterm::event::read()` match in `event_loop` (spec: tui — TUI
+/// scrolls when content overflows the terminal). `heights`/`available` are
+/// this frame's row heights and body height, freshly computed by the
+/// caller, so `PgUp`/`PgDn`'s page size and the top/bottom clamp always
+/// match what's actually on screen right now.
+fn apply_scroll_key(
+    event: &crossterm::event::Event,
+    heights: &[u16],
+    available: u16,
+    scroll_offset: &mut usize,
+) {
+    use crossterm::event::{Event, KeyCode, KeyEventKind};
+    let Event::Key(key) = event else {
+        return;
+    };
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+    let max_offset = max_scroll_offset(heights, available);
+    let page = visible_row_count(heights, *scroll_offset, available).max(1);
+    *scroll_offset = match key.code {
+        KeyCode::Up | KeyCode::Char('k') => scroll_offset.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => scroll_offset.saturating_add(1),
+        KeyCode::PageUp => scroll_offset.saturating_sub(page),
+        KeyCode::PageDown => scroll_offset.saturating_add(page),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => max_offset,
+        _ => *scroll_offset,
+    }
+    .min(max_offset);
 }
 
 struct Panel {
@@ -158,6 +208,12 @@ fn build_panel(
 struct UiState {
     error: Option<String>,
     rows: Vec<Vec<Slot>>,
+    /// Index into `rows` (after the zero-span-row filter `draw` applies) of
+    /// the first row currently shown, when the grid is taller than the
+    /// terminal (spec: tui — TUI scrolls when content overflows the
+    /// terminal). Clamped to `max_scroll_offset` inside `draw` on every
+    /// frame, so a resize or a data refresh can never leave it stale.
+    scroll_offset: usize,
 }
 
 enum Outcome {
@@ -465,16 +521,94 @@ fn content_rect(
     }
 }
 
+/// One `Slot`'s content-line count — the number of terminal lines
+/// `panel_widget` will draw inside its border for this cell, mirroring that
+/// function's own branch order so the two never disagree (spec: tui — TUI
+/// scrolls when content overflows the terminal). A spacer slot (nothing set)
+/// contributes 0 and so never constrains its row's height.
+fn slot_content_lines(slot: &Slot) -> usize {
+    if let Some(text) = &slot.text {
+        text.lines().count()
+    } else if slot.secondary.is_empty() && slot.table.is_empty() {
+        slot.main.as_ref().map_or(0, |p| p.value.lines().count())
+    } else {
+        usize::from(slot.main.is_some()) + slot.secondary.len() + slot.table.len()
+    }
+}
+
+/// A row's natural (content-driven) minimum height: its tallest cell's
+/// content lines plus the panel border's top and bottom, floored at 3 so an
+/// empty/near-empty panel still shows a border around something (spec: tui —
+/// TUI scrolls when content overflows the terminal).
+fn row_natural_height(row: &[Slot]) -> u16 {
+    let content = row.iter().map(slot_content_lines).max().unwrap_or(0);
+    (2 + content).max(3) as u16
+}
+
+/// Natural heights for every row, plus their total — the two numbers `draw`
+/// needs to decide whether the grid fits the terminal or must scroll (spec:
+/// tui — TUI scrolls when content overflows the terminal).
+fn row_heights(rows: &[&Vec<Slot>]) -> (Vec<u16>, u16) {
+    let heights: Vec<u16> = rows.iter().map(|r| row_natural_height(r)).collect();
+    let total = heights.iter().fold(0u16, |acc, h| acc.saturating_add(*h));
+    (heights, total)
+}
+
+/// The largest `scroll_offset` that still leaves the last row fully visible
+/// with no wasted blank space below it — scrolling any further would only
+/// shrink the visible tail without revealing anything new (spec: tui — TUI
+/// scrolls when content overflows the terminal). Walks backward from the
+/// last row, accumulating heights, until the next one wouldn't fit.
+fn max_scroll_offset(heights: &[u16], available: u16) -> usize {
+    let mut acc = 0u16;
+    let mut offset = heights.len();
+    for h in heights.iter().rev() {
+        let next = acc.saturating_add(*h);
+        if next > available {
+            break;
+        }
+        acc = next;
+        offset -= 1;
+    }
+    offset
+}
+
+/// The rows `draw` actually lays out: `rows` with all-spacer rows (every
+/// cell's span is 0) dropped, since they'd otherwise still claim a slice of
+/// height for nothing visible. Takes `state.rows` directly (not `&UiState`)
+/// so `event_loop` can borrow it alongside a separate `&mut` on
+/// `state.scroll_offset` — two disjoint fields, one call (spec: tui — TUI
+/// scrolls when content overflows the terminal).
+fn visible_rows(rows: &[Vec<Slot>]) -> Vec<&Vec<Slot>> {
+    rows.iter()
+        .filter(|row| row.iter().map(|c| c.span).sum::<usize>() > 0)
+        .collect()
+}
+
+/// How many rows starting at `start` fit within `available` height without
+/// exceeding it — the size of one `PgUp`/`PgDn` page, and the same slice
+/// `draw` renders (spec: tui — TUI scrolls when content overflows the
+/// terminal).
+fn visible_row_count(heights: &[u16], start: usize, available: u16) -> usize {
+    let mut used = 0u16;
+    let mut count = 0usize;
+    for h in &heights[start..] {
+        let next = used.saturating_add(*h);
+        if next > available {
+            break;
+        }
+        used = next;
+        count += 1;
+    }
+    count
+}
+
 fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
     let area = f.area();
 
     // Grid rows stacked vertically (equal height each), columns within a row
     // proportional to cell spans.
-    let rows: Vec<&Vec<Slot>> = state
-        .rows
-        .iter()
-        .filter(|row| row.iter().map(|c| c.span).sum::<usize>() > 0)
-        .collect();
+    let rows: Vec<&Vec<Slot>> = visible_rows(&state.rows);
     let max_columns = rows
         .iter()
         .map(|r| r.iter().map(|c| c.span).sum::<usize>())
@@ -515,7 +649,52 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
         width: content.width,
         height: content.height.saturating_sub(idx as u16),
     };
-    let row_areas = Layout::vertical(vec![Constraint::Fill(1); rows.len()]).split(body);
+
+    let (heights, total_natural) = row_heights(&rows);
+    if total_natural <= body.height {
+        // Unchanged from before this change: every row stretches to fill
+        // whatever height is available (spec: tui — TUI scrolls when
+        // content overflows the terminal, "behavior unchanged" scenario).
+        let row_areas = Layout::vertical(vec![Constraint::Fill(1); rows.len()]).split(body);
+        render_rows(f, &rows, &row_areas);
+        return;
+    }
+
+    // Content overflows: `event_loop` re-clamps `state.scroll_offset` every
+    // frame before calling `draw` (spec: tui — TUI scrolls when content
+    // overflows the terminal), but it's re-clamped again here against this
+    // exact frame's own heights/body height so `draw` can never slice out of
+    // bounds even when called directly (as the tests below do) with a
+    // `scroll_offset` nobody has clamped yet.
+    let start = state.scroll_offset.min(max_scroll_offset(&heights, body.height));
+    let end = start + visible_row_count(&heights, start, body.height);
+    // One column reserved on the right for the scroll indicator, so panel
+    // borders never collide with it.
+    let rows_body = ratatui::layout::Rect {
+        width: body.width.saturating_sub(1),
+        ..body
+    };
+    let row_areas = Layout::vertical(
+        heights[start..end]
+            .iter()
+            .map(|h| Constraint::Length(*h))
+            .collect::<Vec<_>>(),
+    )
+    .split(rows_body);
+    render_rows(f, &rows[start..end], &row_areas);
+
+    let mut scrollbar_state = ScrollbarState::new(rows.len()).position(start);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        body,
+        &mut scrollbar_state,
+    );
+}
+
+/// Renders each row's cells into its matching `Rect`, splitting the row
+/// horizontally by column span — the part of `draw` shared by the
+/// fits-on-screen and scrolled-viewport layout modes.
+fn render_rows(f: &mut ratatui::Frame, rows: &[&Vec<Slot>], row_areas: &[ratatui::layout::Rect]) {
     for (row, rect) in rows.iter().zip(row_areas.iter()) {
         let col_areas = Layout::horizontal(
             row.iter()
@@ -915,6 +1094,7 @@ mod tests {
     fn draw_renders_panels_and_error_banner() {
         let state = UiState {
             error: Some("daemon unreachable".into()),
+            scroll_offset: 0,
             // Two rows: [echo | balance] and [spacer(span2) | dead].
             rows: vec![
                 vec![
@@ -1013,6 +1193,7 @@ mod tests {
             .as_secs_f64();
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("ihor".into()),
@@ -1128,6 +1309,7 @@ mod tests {
     fn group_panel_unbanded_member_colors_red_with_plain_label() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("grp".into()),
@@ -1213,6 +1395,7 @@ mod tests {
     fn group_panel_with_only_main_renders_like_single_source_panel() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("CPU".into()),
@@ -1272,6 +1455,7 @@ mod tests {
     fn group_panel_combines_main_secondary_and_table_sections() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("Server".into()),
@@ -1345,6 +1529,7 @@ mod tests {
     fn text_panel_renders_titled_content() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("Links".into()),
@@ -1386,6 +1571,7 @@ mod tests {
     fn text_panel_without_title_renders_no_title() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: None,
@@ -1418,6 +1604,7 @@ mod tests {
     fn text_panel_shows_markdown_as_is() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("Note".into()),
@@ -1453,6 +1640,7 @@ mod tests {
     fn text_panel_splits_on_newlines() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("Links".into()),
@@ -1495,6 +1683,7 @@ mod tests {
     fn single_source_panel_splits_value_on_newlines() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: None,
@@ -1599,6 +1788,7 @@ mod tests {
     fn single_source_panel_title_shows_polling_marker() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: None,
@@ -1642,6 +1832,7 @@ mod tests {
     fn group_pane_table_row_shows_polling_marker() {
         let state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("ihor".into()),
@@ -1777,6 +1968,7 @@ mod tests {
     fn only_slot(cfg: &Config) -> Slot {
         let mut state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: Vec::new(),
         };
         apply_outcome(cfg, Outcome::Data(Vec::new(), Vec::new()), &mut state);
@@ -1932,6 +2124,7 @@ mod tests {
         );
         let mut visible_state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: Vec::new(),
         };
         apply_outcome(
@@ -1941,6 +2134,7 @@ mod tests {
         );
         let mut hidden_state = UiState {
             error: None,
+            scroll_offset: 0,
             rows: Vec::new(),
         };
         apply_outcome(
@@ -1970,5 +2164,311 @@ mod tests {
             slot.main.is_none(),
             "a web-only source should render as space in the TUI"
         );
+    }
+
+    fn spacer_slot() -> Slot {
+        Slot {
+            span: 1,
+            group_title: None,
+            main: None,
+            secondary: Vec::new(),
+            table: Vec::new(),
+            text: None,
+        }
+    }
+
+    fn single_panel(name: &str, value_lines: usize) -> Panel {
+        Panel {
+            name: name.into(),
+            value: vec!["x"; value_lines.max(1)].join("\n"),
+            unit: String::new(),
+            status: Health::Healthy,
+            level: None,
+            ts_epoch: 0.0,
+            polling: false,
+        }
+    }
+
+    fn main_slot(name: &str, value_lines: usize) -> Slot {
+        Slot {
+            span: 1,
+            group_title: None,
+            main: Some(single_panel(name, value_lines)),
+            secondary: Vec::new(),
+            table: Vec::new(),
+            text: None,
+        }
+    }
+
+    fn text_slot(lines: usize) -> Slot {
+        Slot {
+            span: 1,
+            group_title: None,
+            main: None,
+            secondary: Vec::new(),
+            table: Vec::new(),
+            text: Some(vec!["x"; lines].join("\n")),
+        }
+    }
+
+    fn group_slot(has_main: bool, secondary: usize, table: usize) -> Slot {
+        Slot {
+            span: 1,
+            group_title: Some("g".into()),
+            main: has_main.then(|| single_panel("m", 1)),
+            secondary: (0..secondary).map(|i| single_panel(&format!("s{i}"), 1)).collect(),
+            table: (0..table).map(|i| single_panel(&format!("t{i}"), 1)).collect(),
+            text: None,
+        }
+    }
+
+    /// One `Slot`'s content-line count matches what `panel_widget` actually
+    /// draws for each of its branches (spec: tui — TUI scrolls when content
+    /// overflows the terminal).
+    #[test]
+    fn slot_content_lines_matches_each_panel_widget_branch() {
+        assert_eq!(slot_content_lines(&spacer_slot()), 0, "a spacer needs no lines");
+        assert_eq!(slot_content_lines(&main_slot("p", 1)), 1, "single-line value");
+        assert_eq!(slot_content_lines(&main_slot("p", 3)), 3, "multi-line value");
+        assert_eq!(slot_content_lines(&text_slot(2)), 2, "static text");
+        assert_eq!(
+            slot_content_lines(&group_slot(true, 2, 1)),
+            4,
+            "main (1) + 2 secondary + 1 table line"
+        );
+        assert_eq!(
+            slot_content_lines(&group_slot(false, 0, 3)),
+            3,
+            "table-only group pane"
+        );
+    }
+
+    /// A row's natural height is its tallest cell plus the border, floored
+    /// at 3 so an all-spacer row still shows something rather than
+    /// collapsing to zero height (spec: tui — TUI scrolls when content
+    /// overflows the terminal).
+    #[test]
+    fn row_natural_height_is_tallest_cell_plus_border_floored_at_three() {
+        assert_eq!(row_natural_height(&[spacer_slot()]), 3, "floor for an empty row");
+        assert_eq!(row_natural_height(&[main_slot("p", 1)]), 3, "2 border + 1 line");
+        assert_eq!(
+            row_natural_height(&[main_slot("p", 1), main_slot("q", 5)]),
+            7,
+            "tallest cell in the row wins: 2 border + 5 lines"
+        );
+    }
+
+    /// All rows' natural heights, and their total, in one pass (spec: tui —
+    /// TUI scrolls when content overflows the terminal).
+    #[test]
+    fn row_heights_lists_each_row_and_sums_the_total() {
+        let row_a = vec![spacer_slot()];
+        let row_b = vec![main_slot("p", 1), main_slot("q", 4)];
+        let rows: Vec<&Vec<Slot>> = vec![&row_a, &row_b];
+        let (heights, total) = row_heights(&rows);
+        assert_eq!(heights, vec![3, 6]);
+        assert_eq!(total, 9);
+    }
+
+    /// The clamp that keeps `scroll_offset` from scrolling past the point
+    /// where the last row is still fully visible (spec: tui — TUI scrolls
+    /// when content overflows the terminal).
+    #[test]
+    fn max_scroll_offset_covers_fits_exact_and_overflow_cases() {
+        assert_eq!(
+            max_scroll_offset(&[3, 3], 10),
+            0,
+            "content shorter than the screen never needs to scroll"
+        );
+        assert_eq!(
+            max_scroll_offset(&[3, 3], 6),
+            0,
+            "content exactly filling the screen never needs to scroll"
+        );
+        assert_eq!(
+            max_scroll_offset(&[3, 3, 3, 3], 7),
+            2,
+            "only the last two rows (3+3=6) fit together within 7"
+        );
+    }
+
+    fn render_to_text(state: &UiState, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw(f, state, &TuiWidth::Named("auto".into())))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// When content overflows, `draw` renders only the rows that fit
+    /// starting from `scroll_offset`, instead of squeezing every row onto
+    /// one screen (spec: tui — TUI scrolls when content overflows the
+    /// terminal).
+    #[test]
+    fn draw_shows_only_the_rows_that_fit_from_scroll_offset() {
+        // Backend height 8: 1 header line leaves a body height of 7. Each
+        // row is 3 lines tall (2 border + 1 value line), so only two of the
+        // three rows fit at once.
+        let mut state = UiState {
+            error: None,
+            scroll_offset: 0,
+            rows: vec![
+                vec![main_slot("row0", 1)],
+                vec![main_slot("row1", 1)],
+                vec![main_slot("row2", 1)],
+            ],
+        };
+        let text = render_to_text(&state, 40, 8);
+        assert!(text.contains("row0"), "first row visible at offset 0");
+        assert!(text.contains("row1"), "second row visible at offset 0");
+        assert!(
+            !text.contains("row2"),
+            "third row doesn't fit and must not render at offset 0"
+        );
+
+        state.scroll_offset = 1;
+        let text = render_to_text(&state, 40, 8);
+        assert!(
+            !text.contains("row0"),
+            "scrolled-past row must not render at offset 1"
+        );
+        assert!(text.contains("row1"), "first visible row at offset 1");
+        assert!(text.contains("row2"), "second visible row at offset 1");
+    }
+
+    /// A scroll indicator appears only while content is actually scrolled
+    /// (spec: tui — TUI scrolls when content overflows the terminal). `█` is
+    /// ratatui's default scrollbar thumb symbol — distinct from any
+    /// box-drawing character panel borders use, so its presence
+    /// unambiguously means the scrollbar rendered.
+    #[test]
+    fn scrollbar_renders_only_when_content_overflows() {
+        let fitting = UiState {
+            error: None,
+            scroll_offset: 0,
+            rows: vec![vec![main_slot("a", 1)], vec![main_slot("b", 1)]],
+        };
+        let text = render_to_text(&fitting, 40, 8);
+        assert!(
+            !text.contains('█'),
+            "no scroll indicator when every row already fits"
+        );
+
+        let overflowing = UiState {
+            error: None,
+            scroll_offset: 0,
+            rows: vec![
+                vec![main_slot("a", 1)],
+                vec![main_slot("b", 1)],
+                vec![main_slot("c", 1)],
+            ],
+        };
+        let text = render_to_text(&overflowing, 40, 8);
+        assert!(
+            text.contains('█'),
+            "a scroll indicator appears once content overflows"
+        );
+    }
+
+    /// `↑`/`k` and `↓`/`j` move by one row, clamped so they can't scroll
+    /// past the first row or past the point where the last is fully visible
+    /// (spec: tui — TUI scrolls when content overflows the terminal).
+    #[test]
+    fn scroll_keys_move_within_clamped_range() {
+        use crossterm::event::KeyCode;
+        // max_scroll_offset(&heights, 7) == 2 for four 3-tall rows.
+        let heights = [3u16, 3, 3, 3];
+        let available = 7;
+        let mut offset = 0usize;
+
+        apply_scroll_key(&key(KeyCode::Down), &heights, available, &mut offset);
+        assert_eq!(offset, 1, "down moves by one row");
+        apply_scroll_key(&key(KeyCode::Char('j')), &heights, available, &mut offset);
+        assert_eq!(offset, 2, "j behaves like down");
+        apply_scroll_key(&key(KeyCode::Down), &heights, available, &mut offset);
+        assert_eq!(offset, 2, "down does not scroll past the last fully-visible row");
+
+        apply_scroll_key(&key(KeyCode::Up), &heights, available, &mut offset);
+        assert_eq!(offset, 1, "up moves back by one row");
+        apply_scroll_key(&key(KeyCode::Char('k')), &heights, available, &mut offset);
+        assert_eq!(offset, 0, "k behaves like up");
+        apply_scroll_key(&key(KeyCode::Up), &heights, available, &mut offset);
+        assert_eq!(offset, 0, "up does not scroll past the first row");
+
+        apply_scroll_key(&key(KeyCode::End), &heights, available, &mut offset);
+        assert_eq!(offset, 2, "End jumps to the last fully-visible position");
+        apply_scroll_key(&key(KeyCode::Char('G')), &heights, available, &mut offset);
+        assert_eq!(offset, 2, "G behaves like End");
+        apply_scroll_key(&key(KeyCode::Home), &heights, available, &mut offset);
+        assert_eq!(offset, 0, "Home jumps back to the first row");
+        apply_scroll_key(&key(KeyCode::Char('g')), &heights, available, &mut offset);
+        assert_eq!(offset, 0, "g behaves like Home");
+    }
+
+    /// `PgUp`/`PgDn` move by however many rows the current viewport shows,
+    /// not a fixed count (spec: tui — TUI scrolls when content overflows the
+    /// terminal).
+    #[test]
+    fn page_scroll_moves_by_viewport_row_count() {
+        use crossterm::event::KeyCode;
+        let heights = [3u16, 3, 3, 3, 3, 3];
+        let available = 7; // Two 3-tall rows fit per page (3+3=6<=7<9).
+        let mut offset = 0usize;
+
+        apply_scroll_key(&key(KeyCode::PageDown), &heights, available, &mut offset);
+        assert_eq!(offset, 2, "PageDown moves by the current viewport's row count");
+        apply_scroll_key(&key(KeyCode::PageDown), &heights, available, &mut offset);
+        assert_eq!(offset, 4, "PageDown again advances by another page, clamped to max_offset");
+        apply_scroll_key(&key(KeyCode::PageUp), &heights, available, &mut offset);
+        assert_eq!(offset, 2, "PageUp moves back by one page");
+    }
+
+    /// Scroll keys have no visible effect once everything already fits —
+    /// `max_scroll_offset` is 0, so every key clamps straight back to 0
+    /// (spec: tui — TUI scrolls when content overflows the terminal).
+    #[test]
+    fn scroll_keys_are_no_ops_when_content_fits() {
+        use crossterm::event::KeyCode;
+        let heights = [3u16, 3];
+        let available = 10;
+        for code in [
+            KeyCode::Down,
+            KeyCode::Char('j'),
+            KeyCode::PageDown,
+            KeyCode::End,
+            KeyCode::Char('G'),
+        ] {
+            let mut offset = 0usize;
+            apply_scroll_key(&key(code), &heights, available, &mut offset);
+            assert_eq!(offset, 0, "{code:?} must not scroll when everything already fits");
+        }
+    }
+
+    /// A non-key event (e.g. a resize) and a key *release* must not scroll —
+    /// mirrors `quit_requested`'s same guard, kept consistent here since both
+    /// read from the same event (spec: tui — TUI scrolls when content
+    /// overflows the terminal).
+    #[test]
+    fn non_key_events_and_releases_do_not_scroll() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let heights = [3u16, 3, 3, 3];
+        let available = 7;
+
+        let mut offset = 1usize;
+        apply_scroll_key(&Event::Resize(10, 10), &heights, available, &mut offset);
+        assert_eq!(offset, 1, "a resize event is not a scroll key");
+
+        let mut release = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        apply_scroll_key(&Event::Key(release), &heights, available, &mut offset);
+        assert_eq!(offset, 1, "a key release must not scroll");
     }
 }
