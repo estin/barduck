@@ -199,13 +199,11 @@ mod tests {
     fn ingest_source_within_window_is_not_stale() {
         let s = ingest_source("webhook", Duration::from_mins(1));
         assert!(!is_stale(30.0, Some(&s), Duration::from_mins(5)));
-
     }
     #[test]
     fn ingest_source_past_expected_interval_is_stale() {
         let s = ingest_source("webhook", Duration::from_mins(1));
         assert!(is_stale(90.0 * 60.0, Some(&s), Duration::from_mins(5)));
-
     }
     #[test]
     fn ingest_source_at_boundary_is_not_stale() {
@@ -310,7 +308,8 @@ mod tests {
             assert_eq!(batch.source, one.source);
             assert_eq!(batch.status, one.status, "status for `{}`", s.name());
             assert_eq!(
-                batch.consecutive_failures, one.consecutive_failures,
+                batch.consecutive_failures,
+                one.consecutive_failures,
                 "failure count for `{}`",
                 s.name()
             );
@@ -366,10 +365,9 @@ mod tests {
         use crate::db::Origin;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
-        let cfg: Config = toml::from_str(
-            "[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            toml::from_str("[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\n")
+                .unwrap();
         db.insert_log("s", 1, None, Some("1"), Origin::Poll)
             .await
             .unwrap();

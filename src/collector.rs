@@ -200,7 +200,9 @@ pub fn unpollable_reason(src: &SourceCfg) -> Option<&'static str> {
 /// point that iterates `cfg.sources` so the exclusion lives in exactly one
 /// place.
 fn collectible(cfg: &Config) -> impl Iterator<Item = &SourceCfg> {
-    cfg.sources.iter().filter(|src| !src.is_ingest() && !src.is_child())
+    cfg.sources
+        .iter()
+        .filter(|src| !src.is_ingest() && !src.is_child())
 }
 
 /// Builds the [`ControlHub`] for a config. Fails on a source whose kind
@@ -297,7 +299,6 @@ async fn loop_source(
     // is retried on this source's schedule tick instead of fetching. Stream
     // sources retry setup on `retry_interval` instead of opening the stream.
     let mut setup_done = src.setup().is_none();
-
 
     if matches!(kind, source::SourceKind::Stream { .. }) {
         return loop_stream(
@@ -492,14 +493,23 @@ async fn composite_fetch_once(
         .collect();
 
     let start = Instant::now();
-    let run = tokio::time::timeout(root.timeout(), source::run_shell(root.command(), &cfg.config_dir)).await;
+    let run = tokio::time::timeout(
+        root.timeout(),
+        source::run_shell(root.command(), &cfg.config_dir),
+    )
+    .await;
     #[allow(clippy::cast_possible_truncation)] // durations fit easily
     let ms = start.elapsed().as_millis() as i64;
 
     let failed_children = |msg: &str| {
         declared
             .iter()
-            .map(|c| (c.name().to_string(), PollOutcome::failed(c.name(), msg.to_string())))
+            .map(|c| {
+                (
+                    c.name().to_string(),
+                    PollOutcome::failed(c.name(), msg.to_string()),
+                )
+            })
             .collect()
     };
 
@@ -541,7 +551,10 @@ async fn composite_fetch_once(
         }
     };
 
-    if let Some(bad) = items.iter().find(|it| !declared.iter().any(|c| c.name() == it.source)) {
+    if let Some(bad) = items
+        .iter()
+        .find(|it| !declared.iter().any(|c| c.name() == it.source))
+    {
         let msg = format!("composite output names unknown child `{}`", bad.source);
         record_failure(db, name, ms, &msg).await;
         refresh_health(db, cfg, name, last_status).await;
@@ -586,8 +599,11 @@ async fn store_composite_children(
             children.insert(cname.to_string(), PollOutcome::failed(cname, msg));
             continue;
         };
-        let outcome = match source::resolve_ingest_item(item, arrival.clone(), child.effective_value_type())
-        {
+        let outcome = match source::resolve_ingest_item(
+            item,
+            arrival.clone(),
+            child.effective_value_type(),
+        ) {
             Ok(parsed) => {
                 match store_parsed_value(db, cfg, child, None, &parsed, ms, Origin::Poll).await {
                     Ok(()) => PollOutcome::stored(cname, &parsed),
@@ -930,10 +946,9 @@ pub async fn poll_once(db: &Db, cfg: &Config, src: &SourceCfg) -> PollOutcome {
             .unwrap_or(None)
             .unwrap_or_else(|| "healthy".into());
         let mut result = composite_fetch_once(db, cfg, root, &mut last_status).await;
-        return result
-            .children
-            .remove(name)
-            .unwrap_or_else(|| PollOutcome::failed(name, "child missing from composite result".into()));
+        return result.children.remove(name).unwrap_or_else(|| {
+            PollOutcome::failed(name, "child missing from composite result".into())
+        });
     }
     if src.is_composite() {
         let mut last_status = db
@@ -941,7 +956,9 @@ pub async fn poll_once(db: &Db, cfg: &Config, src: &SourceCfg) -> PollOutcome {
             .await
             .unwrap_or(None)
             .unwrap_or_else(|| "healthy".into());
-        return composite_fetch_once(db, cfg, src, &mut last_status).await.root;
+        return composite_fetch_once(db, cfg, src, &mut last_status)
+            .await
+            .root;
     }
     let kind = match source::build(src) {
         Ok(k) => k,
@@ -1459,7 +1476,11 @@ mod tests {
         let kind = source::build(&src).unwrap();
         let mut status = "healthy".to_string();
 
-        assert!(fetch_once(&db, &cfg, &src, &kind, &mut status).await.success);
+        assert!(
+            fetch_once(&db, &cfg, &src, &kind, &mut status)
+                .await
+                .success
+        );
 
         let rows = db.history("b", None, None, None).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -1483,7 +1504,11 @@ mod tests {
         let kind = source::build(&src).unwrap();
         let mut status = "healthy".to_string();
 
-        assert!(!fetch_once(&db, &cfg, &src, &kind, &mut status).await.success);
+        assert!(
+            !fetch_once(&db, &cfg, &src, &kind, &mut status)
+                .await
+                .success
+        );
         assert!(db.latest_values().await.unwrap().is_empty());
         let logs = db.logs(Some("b"), 10).await.unwrap();
         assert_eq!(logs.len(), 1);
@@ -1520,17 +1545,16 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(tx); // every sender gone, exactly as at daemon shutdown
         let (_keep_alive, shutdown) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(loop_source(
-            db.clone(),
-            src,
-            cfg,
-            Some(shutdown),
-            Some(rx),
-        ));
+        let task = tokio::spawn(loop_source(db.clone(), src, cfg, Some(shutdown), Some(rx)));
 
         let stored = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if !db.history("cpu", None, None, None).await.unwrap().is_empty() {
+                if !db
+                    .history("cpu", None, None, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1750,7 +1774,10 @@ mod tests {
         let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap();
 
         let outcome = poll_once(&db, &cfg, root).await;
-        assert!(outcome.success, "root still succeeds: the command ran and parsed");
+        assert!(
+            outcome.success,
+            "root still succeeds: the command ran and parsed"
+        );
 
         let outcome_5m = poll_once(&db, &cfg, find_child(&cfg, "load::5m")).await;
         // The above re-runs the command, so re-check via direct log inspection
@@ -1768,7 +1795,10 @@ mod tests {
         );
         let logs_5m = db.logs(Some("load::5m"), 10).await.unwrap();
         assert!(
-            logs_5m[0].error.as_deref().is_some_and(|e| e.contains("missing")),
+            logs_5m[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("missing")),
             "{logs_5m:?}"
         );
     }
@@ -1822,7 +1852,12 @@ mod tests {
             r#"sleep 0.3; echo '[{"source":"load::1m","value":"0.1"},{"source":"load::5m","value":"0.2"}]'"#,
             &["1m", "5m"],
         );
-        let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap().clone();
+        let root = cfg
+            .sources
+            .iter()
+            .find(|s| s.name() == "load")
+            .unwrap()
+            .clone();
         let db2 = db.clone();
         let cfg2 = cfg.clone();
         let handle = tokio::spawn(async move { poll_once(&db2, &cfg2, &root).await });

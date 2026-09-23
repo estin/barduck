@@ -21,7 +21,7 @@ pub use source::{
 
 use defaults::{
     apply_env_overrides_from, default_config_dir, default_db_path, default_history_points,
-    default_interval, default_listen, default_threshold, default_tui_width,
+    default_interval, default_listen, default_logs_per_page, default_threshold, default_tui_width,
 };
 use validation::{validate_cell, validate_source};
 
@@ -49,6 +49,10 @@ pub struct Config {
     /// history bar; overridable per source via `SourceCfg::history_points`.
     #[serde(default = "default_history_points")]
     pub history_points: u32,
+    /// Default number of fetch-log entries shown per page in the web UI log
+    /// view (`/logs/<source>`); overridable via `BARDUCK_LOGS_PER_PAGE`.
+    #[serde(default = "default_logs_per_page")]
+    pub logs_per_page: u32,
     /// How long to keep collected data before the daemon prunes it: a
     /// humantime string (e.g. `"30d"`). Unset (the default) keeps everything
     /// forever, matching prior behavior (spec: data-storage — retention).
@@ -78,6 +82,7 @@ impl Default for Config {
             interval: default_interval(),
             failure_threshold: default_threshold(),
             history_points: default_history_points(),
+            logs_per_page: default_logs_per_page(),
             retention: None,
             sources: Vec::new(),
             layouts: Vec::new(),
@@ -115,10 +120,12 @@ fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Con
     validate(&cfg)?;
     Ok(cfg)
 }
-
 pub fn validate(cfg: &Config) -> Result<()> {
     if cfg.history_points == 0 {
         bail!("history_points must be > 0");
+    }
+    if cfg.logs_per_page == 0 {
+        bail!("logs_per_page must be > 0");
     }
     if cfg.failure_threshold == 0 {
         // `health::compute` treats "0 consecutive failures >= threshold" as
@@ -628,6 +635,24 @@ mod tests {
     }
 
     #[test]
+    fn logs_per_page_defaults_to_50_and_env_can_override_it() {
+        assert_eq!(Config::default().logs_per_page, 50);
+        let mut cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.logs_per_page, 50);
+        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_LOGS_PER_PAGE", "20")]))
+            .unwrap();
+        assert_eq!(cfg.logs_per_page, 20);
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn zero_logs_per_page_is_rejected() {
+        let cfg: Config = toml::from_str("logs_per_page = 0").unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("logs_per_page"));
+    }
+
+    #[test]
     fn no_env_var_leaves_config_value_unchanged() {
         let mut cfg: Config = toml::from_str("failure_threshold = 5").unwrap();
         apply_env_overrides_from(&mut cfg, lookup_from(&[])).unwrap();
@@ -819,10 +844,23 @@ mod tests {
     fn layout_style_override_parses() {
         let toml = "[[layouts]]\ntitle = \"L\"\nstyle = { font_family = \"monospace\", font_size = \"14px\" }\nrows = [[{ main = \"s\", style = { font_family = \"sans-serif\" } }]]\n[[sources]]\nname = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\ninterval = \"10s\"\ntimeout = \"5s\"\n";
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.layouts[0].style.as_ref().unwrap().get("font_family"), Some(&"monospace".to_string()));
-        assert_eq!(cfg.layouts[0].style.as_ref().unwrap().get("font_size"), Some(&"14px".to_string()));
-        if let Cell::Group { style: Some(cell_style), .. } = &cfg.layouts[0].rows[0][0] {
-            assert_eq!(cell_style.get("font_family"), Some(&"sans-serif".to_string()));
+        assert_eq!(
+            cfg.layouts[0].style.as_ref().unwrap().get("font_family"),
+            Some(&"monospace".to_string())
+        );
+        assert_eq!(
+            cfg.layouts[0].style.as_ref().unwrap().get("font_size"),
+            Some(&"14px".to_string())
+        );
+        if let Cell::Group {
+            style: Some(cell_style),
+            ..
+        } = &cfg.layouts[0].rows[0][0]
+        {
+            assert_eq!(
+                cell_style.get("font_family"),
+                Some(&"sans-serif".to_string())
+            );
         } else {
             unreachable!("expected Group cell");
         }

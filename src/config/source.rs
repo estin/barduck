@@ -600,7 +600,9 @@ impl SourceCfg {
             SourceCfg::Stream {
                 expected_interval, ..
             }
-            | SourceCfg::Ingest { expected_interval, .. } => Some(*expected_interval),
+            | SourceCfg::Ingest {
+                expected_interval, ..
+            } => Some(*expected_interval),
         }
     }
 
@@ -617,7 +619,9 @@ impl SourceCfg {
             SourceCfg::Stream {
                 expected_interval, ..
             }
-            | SourceCfg::Ingest { expected_interval, .. } => *expected_interval,
+            | SourceCfg::Ingest {
+                expected_interval, ..
+            } => *expected_interval,
             SourceCfg::Child {
                 effective_interval, ..
             } => *effective_interval,
@@ -1115,13 +1119,21 @@ type = "ingest""#,
     /// (spec: source-configuration — Composite source children)
     #[test]
     fn composite_child_declaring_schedule_field_is_rejected() {
-        for field in ["interval = \"5s\"", "timeout = \"5s\"", "setup = \"true\"", "retry_interval = \"5s\""] {
+        for field in [
+            "interval = \"5s\"",
+            "timeout = \"5s\"",
+            "setup = \"true\"",
+            "retry_interval = \"5s\"",
+        ] {
             let err = toml::from_str::<Config>(&format!(
                 "[[sources]]\nname = \"load\"\ntype = \"query\"\ncommand = \"cat\"\ninterval = \"10s\"\n{}",
                 child_toml("1m", field)
             ))
             .unwrap_err();
-            assert!(err.to_string().contains(field.split(' ').next().unwrap()), "{err}");
+            assert!(
+                err.to_string().contains(field.split(' ').next().unwrap()),
+                "{err}"
+            );
         }
     }
 
@@ -1218,7 +1230,11 @@ type = "ingest""#,
         assert_eq!(child.effective_interval(), Duration::from_secs(10));
         assert_eq!(child.timeout(), Duration::from_secs(7));
         assert_eq!(child.cron(), None);
-        assert_eq!(child.interval(), None, "a child reports no schedule of its own");
+        assert_eq!(
+            child.interval(),
+            None,
+            "a child reports no schedule of its own"
+        );
 
         let mut cron_cfg: Config = toml::from_str(&format!(
             "[[sources]]\nname = \"backup\"\ntype = \"query\"\ncommand = \"cat\"\ncron = \"0 0 3 * * *\"\n{}",

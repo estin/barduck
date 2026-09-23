@@ -6,6 +6,12 @@
 // the binding is deliberately underscore-prefixed. Scoped to this file since
 // it's specific to that one established pattern, not a blanket exception.
 #![allow(clippy::no_effect_underscore_binding)]
+// `#[component]` moves a function-level `#[allow(...)]` onto the generated
+// props struct instead of the original fn body (it clears `item.attrs`
+// before re-embedding `item`), so a length allow on `page_chrome` itself
+// can't be scoped any tighter than the file. `page_chrome`'s length is the
+// shared page shell's markup, not accumulating logic.
+#![allow(clippy::too_many_lines)]
 
 use super::{
     panels::{panels_grid, poll_button, text_style_for_color},
@@ -24,7 +30,7 @@ use topcoat::{
     Result,
     context::{Cx, app_context},
     font::{Font, fontsource::fontsource_font},
-    router::{page, path_param},
+    router::{page, path_param, request::uri},
     runtime::shard,
     tailwind,
     view::{Unescaped, attributes, component, view},
@@ -216,7 +222,30 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
     // reflects "polling as of page load" only, unlike the always-live marker
     // `panels_grid`'s own panels show (spec: web-ui — poll-in-progress is
     // visible).
-    let polling = view_source.as_ref().is_some_and(|name| st.db.is_polling(name));
+    let polling = view_source
+        .as_ref()
+        .is_some_and(|name| st.db.is_polling(name));
+    // Read once per log-view request and pass as fixed shard args (design
+    // D7): the runtime re-invokes `log_rows` on every tick with the same
+    // values, preserving page/filter state across the 5 s refresh. Topcoat
+    // supports `f64`/`bool` shard args but not integer args; all valid offsets
+    // here remain exact in `f64` (u32 page × 10,000 maximum rows/page).
+    let q = if view_source.is_some() {
+        LogViewQuery::parse(uri(cx).query().unwrap_or(""))
+            .map_err(|e| topcoat::Error::from(topcoat::router::error::bad_request(e)))?
+    } else {
+        LogViewQuery {
+            page: 1,
+            error: false,
+        }
+    };
+    let max_limit = u32::try_from(crate::db::MAX_LOGS_LIMIT).unwrap_or(u32::MAX);
+    let limit = st.cfg.logs_per_page.clamp(1, max_limit);
+    let offset = q.offset(limit);
+    let errors_only = q.error;
+    #[allow(clippy::cast_precision_loss)]
+    let offset_f = offset as f64;
+    let limit_f = f64::from(limit);
     view! {
         <!DOCTYPE html>
         <html class=(theme)>
@@ -302,7 +331,13 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
                                     </span>
                                 }
                             </h2>
-                            log_rows(source: $(source.clone()), tick: $(tick.get()))
+                            log_rows(
+                                source: $(source.clone()),
+                                tick: $(tick.get()),
+                                limit: $(limit_f),
+                                offset: $(offset_f),
+                                errors_only: $(errors_only),
+                            )
                         } else {
                             panels_grid(tick: $(tick.get()))
                         }
@@ -332,14 +367,60 @@ pub async fn dashboard(cx: &Cx) -> Result {
 
 path_param!(source_name: String);
 
-/// Live log table: re-renders on the server whenever `tick` changes (spec:
-/// web-ui — log view live-refreshes without a full page reload), the same
-/// way `panels_grid` refreshes the dashboard. A shard has its own endpoint
-/// and no guard runs automatically for it (its arguments must not be
-/// trusted), so `source` is re-validated here independently of
-/// `source_logs`'s own check on the initial page render.
+/// `GET /logs/{source_name}`'s query string (spec: web-ui — Log view
+/// error-only filter; Log view pagination).
+///
+/// Parsed from raw key/value pairs rather than deserialized into a struct —
+/// `error=1` needs `""`/`1`-style leniency a plain `bool` field lacks —
+/// following the same pair-loop shape as api.rs `LogsQuery::parse`, but
+/// single-source (the source comes from the path) and with `page`/`error`.
+#[derive(Debug, Default, PartialEq)]
+struct LogViewQuery {
+    /// 1-based page (default 1; 0 or unparseable falls back to 1).
+    page: u32,
+    /// `?error=1` — show only failed attempts.
+    error: bool,
+}
+
+impl LogViewQuery {
+    fn parse(query: &str) -> std::result::Result<Self, String> {
+        let pairs: Vec<(String, String)> =
+            serde_urlencoded::from_str(query).map_err(|e| format!("invalid query: {e}"))?;
+        let mut out = Self {
+            page: 1,
+            error: false,
+        };
+        for (key, value) in pairs {
+            match key.as_str() {
+                "page" => {
+                    // Later `page` params win; invalid values fall back to
+                    // page 1 rather than rejecting the request.
+                    out.page = value.parse().unwrap_or(1);
+                }
+                "error" => out.error = value == "1",
+                // Unknown parameters stay ignored, matching api.rs.
+                _ => {}
+            }
+        }
+        out.page = out.page.max(1);
+        Ok(out)
+    }
+
+    /// 0-based row offset for `limit`, saturating at the largest i64 offset.
+    fn offset(&self, limit: u32) -> i64 {
+        i64::from(self.page.saturating_sub(1)).saturating_mul(i64::from(limit))
+    }
+}
+
 #[shard]
-pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
+pub(super) async fn log_rows(
+    cx: &Cx,
+    source: String,
+    tick: f64,
+    limit: f64,
+    offset: f64,
+    errors_only: bool,
+) -> Result {
     let _ = tick; // refresh trigger only; data always re-read from the DB
     let st = app_context::<AppState>(cx);
     let Some(src) = st.cfg.sources.iter().find(|s| s.name() == source) else {
@@ -347,7 +428,15 @@ pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
             format!("unknown source `{source}`"),
         )));
     };
-    let rows = st.db.logs(Some(&source), 50).await.unwrap_or_default();
+    // Shard request bodies are caller-controlled. Sanitize numeric args
+    // before SQL/pager use; Db clamps them again.
+    let limit = clamp_shard_integer(limit, 1, crate::db::MAX_LOGS_LIMIT);
+    let offset = clamp_shard_integer(offset, 0, i64::MAX);
+    let rows = st
+        .db
+        .logs_filtered(Some(&source), limit, offset, errors_only)
+        .await
+        .unwrap_or_default();
     // One health lookup per render (spec: web-ui — log view relative
     // timestamps and threshold coloring): every row shares the same source,
     // so its live health only needs computing once, the same fallback
@@ -358,50 +447,120 @@ pub(super) async fn log_rows(cx: &Cx, source: String, tick: f64) -> Result {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
+
+    // Pager state from the returned page alone (design D3, no COUNT query).
+    let current_page = u32::try_from((offset / limit).saturating_add(1)).unwrap_or(u32::MAX);
+    let has_prev = current_page > 1;
+    let has_next = rows.len() == usize::try_from(limit).unwrap_or(usize::MAX);
+    let next_href = pager_href(&source, current_page.saturating_add(1), errors_only);
+
     view! {
-            table(
-                attrs: attributes! { class="bg-background rounded-xl shadow-sm" },
-                table_header(
-                    table_row(
-                        table_head("TIME")
-                        table_head("DURATION")
-                        table_head("VALUE")
-                        table_head("ORIGIN")
-                        table_head("ERROR")
-                    )
-                )
-                table_body(
-                    for l in &rows {
-                        table_row(
-                            table_cell(
-                                attrs: attributes! { class="font-mono" title=(l.ts.clone()) },
-                                (age::ago(now, l.ts_epoch).unwrap_or_else(|| "—".into()))
-                            )
-                            table_cell(attrs: attributes! { class="font-mono" }, (format!("{} ms", l.duration_ms)))
-                            table_cell(
-                                attrs: attributes! {
-                                    class="font-mono"
-                                    style=(text_style_for_color(config::accent_color(
-                                        l.value.as_deref().and_then(|v| config::level_for(bands, v)),
-                                        status,
-                                    )))
-                                },
-                                <pre class="whitespace-pre-wrap break-all m-0">(value_with_unit(l.value.as_deref(), src.unit()))</pre>
-                            )
-                            table_cell(attrs: attributes! { class="font-mono" }, (l.origin.to_string()))
-                            table_cell(
-                                attrs: attributes! { class="text-red-500 font-mono" },
-                                <pre class="whitespace-pre-wrap break-all m-0">(l.error.clone().unwrap_or_default())</pre>
-                            )
-                        )
-                    }
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+            if errors_only {
+                <a href=(format!("/logs/{source}")) class="text-sm font-medium text-foreground underline underline-offset-4 hover:opacity-80" title="Showing only failed attempts — click to clear">
+                    "Errors only — on"
+                </a>
+            } else {
+                <a href=(pager_href(&source, 1, true)) class="text-sm text-muted-foreground hover:underline" title="Show only failed attempts">
+                    "Errors only"
+                </a>
+            }
+            <div class="flex items-center gap-3 text-sm text-muted-foreground">
+                <span>
                     if rows.is_empty() {
-                        table_row(
-                            table_cell(attrs: attributes! { class="text-center text-muted-foreground" }, "No fetch attempts recorded yet.")
-                        )
+                        "No entries"
+                    } else {
+                        (format!(
+                            "Showing {}–{}",
+                            offset.saturating_add(1),
+                            offset.saturating_add(i64::try_from(rows.len()).unwrap_or(i64::MAX))
+                        ))
                     }
+                </span>
+                if has_prev {
+                    <a href=(pager_href(&source, current_page - 1, errors_only)) class="rounded-md border border-border px-2 py-1 hover:bg-muted">
+                        "Prev"
+                    </a>
+                } else {
+                    <span class="rounded-md border border-border px-2 py-1 opacity-40">"Prev"</span>
+                }
+                if has_next {
+                    <a href=(next_href) class="rounded-md border border-border px-2 py-1 hover:bg-muted">
+                        "Next"
+                    </a>
+                } else {
+                    <span class="rounded-md border border-border px-2 py-1 opacity-40">"Next"</span>
+                }
+            </div>
+        </div>
+        table(
+            attrs: attributes! { class="bg-background rounded-xl shadow-sm" },
+            table_header(
+                table_row(
+                    table_head("TIME")
+                    table_head("DURATION")
+                    table_head("VALUE")
+                    table_head("ORIGIN")
+                    table_head("ERROR")
                 )
             )
+            table_body(
+                for l in &rows {
+                    table_row(
+                        table_cell(
+                            attrs: attributes! { class="font-mono" title=(l.ts.clone()) },
+                            (age::ago(now, l.ts_epoch).unwrap_or_else(|| "—".into()))
+                        )
+                        table_cell(attrs: attributes! { class="font-mono" }, (format!("{} ms", l.duration_ms)))
+                        table_cell(
+                            attrs: attributes! {
+                                class="font-mono"
+                                style=(text_style_for_color(config::accent_color(
+                                    l.value.as_deref().and_then(|v| config::level_for(bands, v)),
+                                    status,
+                                )))
+                            },
+                            <pre class="whitespace-pre-wrap break-all m-0">(value_with_unit(l.value.as_deref(), src.unit()))</pre>
+                        )
+                        table_cell(attrs: attributes! { class="font-mono" }, (l.origin.to_string()))
+                        table_cell(
+                            attrs: attributes! { class="text-red-500 font-mono" },
+                            <pre class="whitespace-pre-wrap break-all m-0">(l.error.clone().unwrap_or_default())</pre>
+                        )
+                    )
+                }
+                if rows.is_empty() {
+                    table_row(
+                        table_cell(attrs: attributes! { class="text-center text-muted-foreground" },
+                            if errors_only { "No failed attempts." } else { "No fetch attempts recorded yet." })
+                    )
+                }
+            )
+        )
+    }
+}
+
+/// Convert an untrusted topcoat `f64` shard argument into a bounded integer.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn clamp_shard_integer(value: f64, min: i64, max: i64) -> i64 {
+    if !value.is_finite() {
+        return min;
+    }
+    value.round().clamp(min as f64, max as f64) as i64
+}
+
+/// Pager/error-toggle link target for `source` at 1-based `page`, preserving
+/// the error filter (design D8): `?page=N&error=1` when filtered, plain
+/// `?page=N` otherwise.
+fn pager_href(source: &str, page: u32, errors_only: bool) -> String {
+    if errors_only {
+        format!("/logs/{source}?page={page}&error=1")
+    } else {
+        format!("/logs/{source}?page={page}")
     }
 }
 
@@ -439,4 +598,38 @@ pub async fn source_logs(cx: &Cx) -> Result {
         )));
     }
     view! { page_chrome(title: format!("logs — {source}"), view_source: Some(source)) }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::LogViewQuery;
+
+    #[test]
+    fn log_view_query_defaults_to_page_one_without_filter() {
+        let query = LogViewQuery::parse("").unwrap();
+        assert_eq!(query.page, 1);
+        assert!(!query.error);
+    }
+
+    #[test]
+    fn log_view_query_invalid_or_zero_page_falls_back_to_one() {
+        for query in ["page=0", "page=abc", "page=-1"] {
+            assert_eq!(LogViewQuery::parse(query).unwrap().page, 1, "{query}");
+        }
+    }
+
+    #[test]
+    fn log_view_query_parses_page_and_error_filter() {
+        let query = LogViewQuery::parse("page=3&error=1").unwrap();
+        assert_eq!(query.page, 3);
+        assert!(query.error);
+        assert!(!LogViewQuery::parse("error=0").unwrap().error);
+    }
+
+    #[test]
+    fn log_view_query_computes_paged_offset() {
+        let query = LogViewQuery::parse("page=3").unwrap();
+        assert_eq!(query.offset(50), 100);
+    }
 }

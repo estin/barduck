@@ -1,7 +1,6 @@
 //! Panel data model and the live panel-grid shard (spec: web-ui — current
 //! values without manual reload; group panes; panel retrospective history
 //! bar; source summary strip).
-use std::collections::BTreeMap;
 use super::markdown::formatted_content;
 use crate::{
     AppState,
@@ -10,6 +9,7 @@ use crate::{
     config::{Level, ValueFormat},
     health::{self, Health},
 };
+use std::collections::BTreeMap;
 use topcoat::{
     Result,
     context::{Cx, app_context},
@@ -103,9 +103,7 @@ impl Panel {
             Some(Level::Green) => {
                 "background-color:var(--status-green-border);color:var(--status-green-chip-fg)"
             }
-            None => {
-                "background-color:var(--status-gray-border);color:var(--status-gray-chip-fg)"
-            }
+            None => "background-color:var(--status-gray-border);color:var(--status-gray-chip-fg)",
         }
     }
 
@@ -264,7 +262,6 @@ pub(super) fn text_style_for_color(color: Option<Level>) -> &'static str {
     }
 }
 
-
 /// Converts a config-authored style-override key to a CSS property name:
 /// config keys follow this project's `snake_case` convention (matching
 /// `history_points`, `show_history`, ...), but CSS properties are
@@ -298,11 +295,19 @@ fn style_override_to_css(style: Option<&BTreeMap<String, String>>) -> String {
 /// Build a CSS inline style string from base styles and optional overrides.
 /// Avoids leading/trailing semicolons and double semicolons.
 fn style_string(base: &str, extra: &str) -> String {
-    let base = base.trim().trim_start_matches(';').trim_end_matches(';').trim();
+    let base = base
+        .trim()
+        .trim_start_matches(';')
+        .trim_end_matches(';')
+        .trim();
     if extra.is_empty() {
         base.to_string()
     } else {
-        let extra = extra.trim().trim_start_matches(';').trim_end_matches(';').trim();
+        let extra = extra
+            .trim()
+            .trim_start_matches(';')
+            .trim_end_matches(';')
+            .trim();
         format!("{base}; {extra}")
     }
 }
@@ -590,7 +595,14 @@ fn build_cell_parts(st: &AppState, data: &RenderData, cell: &config::Cell) -> Ce
                     .into_iter()
                     .map(&panel),
             );
-            (main_panel, secondary_panels, table_out, title.clone(), None, group_style.clone())
+            (
+                main_panel,
+                secondary_panels,
+                table_out,
+                title.clone(),
+                None,
+                group_style.clone(),
+            )
         }
         config::Cell::Source(name) => {
             if let Some((table, title)) = composite_cell_parts(st, data, name, None) {
@@ -603,11 +615,22 @@ fn build_cell_parts(st: &AppState, data: &RenderData, cell: &config::Cell) -> Ce
             };
             (main, Vec::new(), Vec::new(), None, None, None)
         }
-        config::Cell::Pane { id, title, style: pane_style } => {
+        config::Cell::Pane {
+            id,
+            title,
+            style: pane_style,
+        } => {
             if let Some((table, resolved_title)) =
                 composite_cell_parts(st, data, id, title.as_deref())
             {
-                return (None, Vec::new(), table, Some(resolved_title), None, pane_style.clone());
+                return (
+                    None,
+                    Vec::new(),
+                    table,
+                    Some(resolved_title),
+                    None,
+                    pane_style.clone(),
+                );
             }
             let main = if config::source_visible_in(&st.cfg, id, config::View::Web) {
                 Some(build_panel(st, data, id, title.as_deref()))
@@ -916,7 +939,10 @@ mod tests {
     #[test]
     fn style_string_leading_semicolon_stripped() {
         let result = style_string("; grid-row: 1; grid-column: 3", "font-family: monospace");
-        assert_eq!(result, "grid-row: 1; grid-column: 3; font-family: monospace");
+        assert_eq!(
+            result,
+            "grid-row: 1; grid-column: 3; font-family: monospace"
+        );
     }
 
     #[test]

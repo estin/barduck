@@ -67,7 +67,9 @@ fn event_loop(terminal: &mut TerminalGuard, backend: &Backend, cfg: &Config) -> 
         let (heights, _) = row_heights(&rows);
         let (_, term_height) = crossterm::terminal::size()?;
         let available = term_height.saturating_sub(1 + u16::from(state.error.is_some()));
-        state.scroll_offset = state.scroll_offset.min(max_scroll_offset(&heights, available));
+        state.scroll_offset = state
+            .scroll_offset
+            .min(max_scroll_offset(&heights, available));
 
         terminal.draw(|f| draw(f, &state, &cfg.tui_width))?;
         if crossterm::event::poll(POLL_INTERVAL)? {
@@ -361,7 +363,13 @@ fn composite_cell_parts(
 /// per-source view visibility) is simply omitted here, so the cell falls
 /// through to the same empty-slot rendering as an explicit `space` cell
 /// (spec: tui — hidden sources render as space in the TUI).
-type TuiCellParts = (Option<Panel>, Vec<Panel>, Vec<Panel>, Option<String>, Option<String>);
+type TuiCellParts = (
+    Option<Panel>,
+    Vec<Panel>,
+    Vec<Panel>,
+    Option<String>,
+    Option<String>,
+);
 
 fn build_tui_cell_parts(
     cfg: &Config,
@@ -427,9 +435,13 @@ fn build_tui_cell_parts(
             }
         }
         crate::config::Cell::Space { .. } => (None, Vec::new(), Vec::new(), None, None),
-        crate::config::Cell::Text { title, text, .. } => {
-            (None, Vec::new(), Vec::new(), title.clone(), Some(text.clone()))
-        }
+        crate::config::Cell::Text { title, text, .. } => (
+            None,
+            Vec::new(),
+            Vec::new(),
+            title.clone(),
+            Some(text.clone()),
+        ),
     }
 }
 
@@ -666,7 +678,9 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
     // exact frame's own heights/body height so `draw` can never slice out of
     // bounds even when called directly (as the tests below do) with a
     // `scroll_offset` nobody has clamped yet.
-    let start = state.scroll_offset.min(max_scroll_offset(&heights, body.height));
+    let start = state
+        .scroll_offset
+        .min(max_scroll_offset(&heights, body.height));
     let end = start + visible_row_count(&heights, start, body.height);
     // One column reserved on the right for the scroll indicator, so panel
     // borders never collide with it.
@@ -1033,7 +1047,10 @@ mod tests {
         let backend = Backend::new(&cfg, false).unwrap();
 
         let mut refresher = Refresher::start(backend, cfg);
-        assert!(refresher.is_idle(), "nothing running before the first request");
+        assert!(
+            refresher.is_idle(),
+            "nothing running before the first request"
+        );
         for round in 0..3 {
             assert!(refresher.request(), "request {round} should dispatch");
             assert!(
@@ -1062,10 +1079,7 @@ mod tests {
         results.send(Outcome::Failed("stale".into())).unwrap();
         results.send(Outcome::Data(Vec::new(), Vec::new())).unwrap();
 
-        assert!(matches!(
-            refresher.take_latest(),
-            Some(Outcome::Data(..))
-        ));
+        assert!(matches!(refresher.take_latest(), Some(Outcome::Data(..))));
         assert!(refresher.is_idle());
         assert!(refresher.take_latest().is_none(), "queue is drained");
     }
@@ -2068,7 +2082,10 @@ mod tests {
              [[layouts]]\ntitle = \"L\"\nrows = [[\"load\"]]\n",
         );
         let slot = only_slot(&cfg);
-        assert!(slot.main.is_none(), "the root has no scalar value of its own");
+        assert!(
+            slot.main.is_none(),
+            "the root has no scalar value of its own"
+        );
         assert_eq!(slot.table.len(), 2, "one row per declared child");
         assert_eq!(slot.table[0].name, "load::1m");
         assert_eq!(slot.table[1].name, "load::5m");
@@ -2089,7 +2106,11 @@ mod tests {
         );
         let slot = only_slot(&cfg);
         assert!(slot.main.is_none());
-        assert_eq!(slot.table.len(), 2, "the composite child plus the pane's own table member");
+        assert_eq!(
+            slot.table.len(),
+            2,
+            "the composite child plus the pane's own table member"
+        );
         assert_eq!(slot.table[0].name, "load::1m");
         assert_eq!(slot.table[1].name, "note");
         assert_eq!(slot.group_title.as_deref(), Some("Server"));
@@ -2216,8 +2237,12 @@ mod tests {
             span: 1,
             group_title: Some("g".into()),
             main: has_main.then(|| single_panel("m", 1)),
-            secondary: (0..secondary).map(|i| single_panel(&format!("s{i}"), 1)).collect(),
-            table: (0..table).map(|i| single_panel(&format!("t{i}"), 1)).collect(),
+            secondary: (0..secondary)
+                .map(|i| single_panel(&format!("s{i}"), 1))
+                .collect(),
+            table: (0..table)
+                .map(|i| single_panel(&format!("t{i}"), 1))
+                .collect(),
             text: None,
         }
     }
@@ -2227,9 +2252,21 @@ mod tests {
     /// overflows the terminal).
     #[test]
     fn slot_content_lines_matches_each_panel_widget_branch() {
-        assert_eq!(slot_content_lines(&spacer_slot()), 0, "a spacer needs no lines");
-        assert_eq!(slot_content_lines(&main_slot("p", 1)), 1, "single-line value");
-        assert_eq!(slot_content_lines(&main_slot("p", 3)), 3, "multi-line value");
+        assert_eq!(
+            slot_content_lines(&spacer_slot()),
+            0,
+            "a spacer needs no lines"
+        );
+        assert_eq!(
+            slot_content_lines(&main_slot("p", 1)),
+            1,
+            "single-line value"
+        );
+        assert_eq!(
+            slot_content_lines(&main_slot("p", 3)),
+            3,
+            "multi-line value"
+        );
         assert_eq!(slot_content_lines(&text_slot(2)), 2, "static text");
         assert_eq!(
             slot_content_lines(&group_slot(true, 2, 1)),
@@ -2249,8 +2286,16 @@ mod tests {
     /// overflows the terminal).
     #[test]
     fn row_natural_height_is_tallest_cell_plus_border_floored_at_three() {
-        assert_eq!(row_natural_height(&[spacer_slot()]), 3, "floor for an empty row");
-        assert_eq!(row_natural_height(&[main_slot("p", 1)]), 3, "2 border + 1 line");
+        assert_eq!(
+            row_natural_height(&[spacer_slot()]),
+            3,
+            "floor for an empty row"
+        );
+        assert_eq!(
+            row_natural_height(&[main_slot("p", 1)]),
+            3,
+            "2 border + 1 line"
+        );
         assert_eq!(
             row_natural_height(&[main_slot("p", 1), main_slot("q", 5)]),
             7,
@@ -2394,7 +2439,10 @@ mod tests {
         apply_scroll_key(&key(KeyCode::Char('j')), &heights, available, &mut offset);
         assert_eq!(offset, 2, "j behaves like down");
         apply_scroll_key(&key(KeyCode::Down), &heights, available, &mut offset);
-        assert_eq!(offset, 2, "down does not scroll past the last fully-visible row");
+        assert_eq!(
+            offset, 2,
+            "down does not scroll past the last fully-visible row"
+        );
 
         apply_scroll_key(&key(KeyCode::Up), &heights, available, &mut offset);
         assert_eq!(offset, 1, "up moves back by one row");
@@ -2424,9 +2472,15 @@ mod tests {
         let mut offset = 0usize;
 
         apply_scroll_key(&key(KeyCode::PageDown), &heights, available, &mut offset);
-        assert_eq!(offset, 2, "PageDown moves by the current viewport's row count");
+        assert_eq!(
+            offset, 2,
+            "PageDown moves by the current viewport's row count"
+        );
         apply_scroll_key(&key(KeyCode::PageDown), &heights, available, &mut offset);
-        assert_eq!(offset, 4, "PageDown again advances by another page, clamped to max_offset");
+        assert_eq!(
+            offset, 4,
+            "PageDown again advances by another page, clamped to max_offset"
+        );
         apply_scroll_key(&key(KeyCode::PageUp), &heights, available, &mut offset);
         assert_eq!(offset, 2, "PageUp moves back by one page");
     }
@@ -2448,7 +2502,10 @@ mod tests {
         ] {
             let mut offset = 0usize;
             apply_scroll_key(&key(code), &heights, available, &mut offset);
-            assert_eq!(offset, 0, "{code:?} must not scroll when everything already fits");
+            assert_eq!(
+                offset, 0,
+                "{code:?} must not scroll when everything already fits"
+            );
         }
     }
 

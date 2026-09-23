@@ -36,9 +36,7 @@ fn test_asset_bundle() -> Option<topcoat::asset::AssetBundle> {
             std::fs::create_dir_all(&target_dir).expect("creating target directory");
             let lock_file = std::fs::File::create(target_dir.join(".topcoat-asset-bundle.lock"))
                 .expect("creating asset-bundle lockfile");
-            lock_file
-                .lock()
-                .expect("locking asset-bundle lockfile");
+            lock_file.lock().expect("locking asset-bundle lockfile");
 
             let status = std::process::Command::new("topcoat")
                 .args(["asset", "bundle"])
@@ -426,10 +424,13 @@ async fn force_poll(
     txs: &std::collections::HashMap<String, collector::ControlSender>,
     source: &str,
 ) -> collector::PollOutcome {
-    tokio::time::timeout(std::time::Duration::from_secs(30), request_poll(txs, source))
-        .await
-        .expect("forced poll timed out")
-        .expect("collector dropped the reply")
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        request_poll(txs, source),
+    )
+    .await
+    .expect("forced poll timed out")
+    .expect("collector dropped the reply")
 }
 
 /// A forced poll fetches now and re-arms the interval from *that* attempt,
@@ -770,7 +771,10 @@ async fn api_force_poll_stores_a_reading_and_reports_it() {
     assert_eq!(rows.len(), 2, "expected the seed plus the forced poll");
     assert_eq!(rows[0].origin, Origin::Poll);
     assert!(rows[0].error.is_none());
-    assert_eq!(db.history("ok", None, None, None).await.unwrap()[0].value, "42");
+    assert_eq!(
+        db.history("ok", None, None, None).await.unwrap()[0].value,
+        "42"
+    );
 
     stop_collectors(shutdown_tx, tasks).await;
 }
@@ -950,7 +954,9 @@ async fn api_force_poll_reports_a_missing_collector() {
     for name in ["ok", "broken"] {
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            client.post(format!("{base}/api/sources/{name}/poll")).send(),
+            client
+                .post(format!("{base}/api/sources/{name}/poll"))
+                .send(),
         )
         .await
         .expect("the endpoint hung waiting for a dead collector")
@@ -1179,17 +1185,37 @@ rows = [["slow"]]
     // literal (single-quoted) that's on every page regardless of state.
     let polling_marker = ">polling…<";
 
-    let before = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
-    assert!(before.contains(r#"data-bd-poll="slow""#), "control expected before polling");
-    assert!(!before.contains(polling_marker), "not polling yet:\n{before}");
+    let before = reqwest::get(format!("{base}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        before.contains(r#"data-bd-poll="slow""#),
+        "control expected before polling"
+    );
+    assert!(
+        !before.contains(polling_marker),
+        "not polling yet:\n{before}"
+    );
 
     // The endpoint itself blocks until the fetch finishes, so the request
     // has to run concurrently with the dashboard fetches that observe it.
-    let poll = tokio::spawn(reqwest::Client::new().post(format!("{base}/api/sources/slow/poll")).send());
+    let poll = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("{base}/api/sources/slow/poll"))
+            .send(),
+    );
 
     let saw_polling = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let html = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
+            let html = reqwest::get(format!("{base}/"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
             if html.contains(polling_marker) && !html.contains(r#"data-bd-poll="slow""#) {
                 return;
             }
@@ -1197,13 +1223,21 @@ rows = [["slow"]]
         }
     })
     .await;
-    assert!(saw_polling.is_ok(), "dashboard never showed the polling state");
+    assert!(
+        saw_polling.is_ok(),
+        "dashboard never showed the polling state"
+    );
 
     std::fs::write(&release, "go").unwrap();
     let resp = poll.await.unwrap().unwrap();
     assert_eq!(resp.status(), 200);
 
-    let after = reqwest::get(format!("{base}/")).await.unwrap().text().await.unwrap();
+    let after = reqwest::get(format!("{base}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(
         after.contains(r#"data-bd-poll="slow""#) && !after.contains(polling_marker),
         "the control should be back once the fetch finished:\n{after}"
@@ -1519,9 +1553,18 @@ async fn web_ui_composite_as_pane_main_renders_children_table() {
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     assert!(html.contains(">Server</span>"), "pane's own title expected");
-    assert!(html.contains("0.42 avg"), "composite child 1m expected in the table");
-    assert!(html.contains("0.31 avg"), "composite child 5m expected in the table");
-    assert!(html.contains("hi"), "the pane's own table member is unaffected");
+    assert!(
+        html.contains("0.42 avg"),
+        "composite child 1m expected in the table"
+    );
+    assert!(
+        html.contains("0.31 avg"),
+        "composite child 5m expected in the table"
+    );
+    assert!(
+        html.contains("hi"),
+        "the pane's own table member is unaffected"
+    );
 }
 
 #[tokio::test]

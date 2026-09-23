@@ -168,7 +168,10 @@ async fn get<T: serde::de::DeserializeOwned>(client: &reqwest::Client, url: &str
 
 /// Shared response handling for both verbs: a non-success status is an
 /// error naming what the daemon said, a success decodes into `T`.
-async fn read_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response, url: &str) -> Result<T> {
+async fn read_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    url: &str,
+) -> Result<T> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();

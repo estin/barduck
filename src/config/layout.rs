@@ -2,9 +2,9 @@
 //! format shared by a `Cell::Text` panel and `SourceCfg::format`.
 
 use super::GroupItem;
-use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 pub const VALUE_FORMATS: &[&str] = &["text", "markdown"];
 

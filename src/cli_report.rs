@@ -332,7 +332,10 @@ mod tests {
     #[test]
     fn one_line_keeps_short_values_and_collapses_prose() {
         assert_eq!(one_line("42"), "42");
-        assert_eq!(one_line("# Weekly report\n\nHours: 36.5"), "# Weekly report…");
+        assert_eq!(
+            one_line("# Weekly report\n\nHours: 36.5"),
+            "# Weekly report…"
+        );
         assert_eq!(one_line(&"x".repeat(80)), format!("{}…", "x".repeat(60)));
     }
 

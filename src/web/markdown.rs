@@ -102,8 +102,8 @@ pub(super) fn markdown_to_html(value: &str) -> Unescaped<String> {
 /// The actual rendering behind [`markdown_to_html`], factored out so tests
 /// can assert on the plain `String` instead of reaching into `Unescaped`.
 fn render_markdown(value: &str) -> String {
-    let events = pulldown_cmark::Parser::new_ext(value, Options::ENABLE_TABLES)
-        .map(|event| match event {
+    let events =
+        pulldown_cmark::Parser::new_ext(value, Options::ENABLE_TABLES).map(|event| match event {
             pulldown_cmark::Event::Html(html) | pulldown_cmark::Event::InlineHtml(html) => {
                 pulldown_cmark::Event::Text(html)
             }
@@ -175,7 +175,10 @@ mod tests {
     #[test]
     fn safe_link_schemes_pass_through() {
         for (md, want_fragment) in [
-            ("[site](https://example.com/page)", "https://example.com/page"),
+            (
+                "[site](https://example.com/page)",
+                "https://example.com/page",
+            ),
             ("[mail](mailto:a@example.com)", "mailto:a@example.com"),
             ("[rel](/dashboard)", "/dashboard"),
             ("[anchor](#panel-cpu)", "#panel-cpu"),

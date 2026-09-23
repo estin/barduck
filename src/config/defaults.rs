@@ -1,5 +1,4 @@
 //! Built-in defaults and `BARDUCK_*` environment variable overrides.
-
 use super::{Config, TuiWidth};
 use anyhow::{Context as _, Result};
 use std::path::PathBuf;
@@ -25,6 +24,9 @@ pub(crate) fn default_threshold() -> u32 {
 }
 pub(crate) fn default_history_points() -> u32 {
     30
+}
+pub(crate) fn default_logs_per_page() -> u32 {
+    50
 }
 pub(crate) fn default_tui_width() -> TuiWidth {
     TuiWidth::Named("auto".into())
@@ -60,6 +62,9 @@ pub(crate) fn apply_env_overrides_from(
     }
     if let Some(v) = lookup("BARDUCK_HISTORY_POINTS") {
         cfg.history_points = parse_env_u32("BARDUCK_HISTORY_POINTS", &v)?;
+    }
+    if let Some(v) = lookup("BARDUCK_LOGS_PER_PAGE") {
+        cfg.logs_per_page = parse_env_u32("BARDUCK_LOGS_PER_PAGE", &v)?;
     }
     if let Some(v) = lookup("BARDUCK_TUI_WIDTH") {
         cfg.tui_width = parse_env_tui_width(&v)?;

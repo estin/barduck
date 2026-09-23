@@ -335,6 +335,15 @@ enum ReadCmd {
         limit: i64,
         reply: oneshot::Sender<Result<Vec<LogRow>>>,
     },
+    LogsFiltered {
+        /// Empty means "every source" (spec: cli — Filter query output by
+        /// source); otherwise the filter is applied inside the query.
+        sources: Vec<String>,
+        limit: i64,
+        offset: i64,
+        errors_only: bool,
+        reply: oneshot::Sender<Result<Vec<LogRow>>>,
+    },
     LastSuccess {
         source: String,
         reply: oneshot::Sender<Result<Option<LogRow>>>,
@@ -406,8 +415,7 @@ impl ReadCmd {
                 limit,
                 reply,
             } => {
-                let _ =
-                    reply.send(db.with_lock(|| query_history(conn, &source, from, to, limit)));
+                let _ = reply.send(db.with_lock(|| query_history(conn, &source, from, to, limit)));
             }
             ReadCmd::Logs {
                 sources,
@@ -415,6 +423,18 @@ impl ReadCmd {
                 reply,
             } => {
                 let _ = reply.send(db.with_lock(|| query_logs(conn, &sources, limit)));
+            }
+            ReadCmd::LogsFiltered {
+                sources,
+                limit,
+                offset,
+                errors_only,
+                reply,
+            } => {
+                let _ =
+                    reply.send(db.with_lock(|| {
+                        query_logs_filtered(conn, &sources, limit, offset, errors_only)
+                    }));
             }
             ReadCmd::LastSuccess { source, reply } => {
                 let _ = reply.send(db.with_lock(|| query_last_success(conn, &source)));
@@ -426,8 +446,7 @@ impl ReadCmd {
                 let _ = reply.send(db.with_lock(|| HealthInputs::read(conn, per_source)));
             }
             ReadCmd::RecentReadings { per_source, reply } => {
-                let _ =
-                    reply.send(db.with_lock(|| query_recent_readings_all(conn, per_source)));
+                let _ = reply.send(db.with_lock(|| query_recent_readings_all(conn, per_source)));
             }
         }
     }
@@ -445,7 +464,9 @@ impl ReadCmd {
             ReadCmd::LatestValues { reply } | ReadCmd::History { reply, .. } => {
                 drop(reply.send(Err(msg())));
             }
-            ReadCmd::Logs { reply, .. } => drop(reply.send(Err(msg()))),
+            ReadCmd::Logs { reply, .. } | ReadCmd::LogsFiltered { reply, .. } => {
+                drop(reply.send(Err(msg())));
+            }
             ReadCmd::LastSuccess { reply, .. } | ReadCmd::LastAttempt { reply, .. } => {
                 drop(reply.send(Err(msg())));
             }
@@ -707,7 +728,9 @@ fn clone_writer_conn(
     writer
         .send(WriteCmd::CloneConnection { reply })
         .map_err(|_| anyhow::anyhow!("db writer task has stopped"))?;
-    handle.block_on(rx).context("db writer task dropped the reply")?
+    handle
+        .block_on(rx)
+        .context("db writer task dropped the reply")?
 }
 
 /// Starts the daemon's single reader task (spec: data-storage — resident
@@ -721,7 +744,10 @@ fn clone_writer_conn(
 /// handling, but reconnects via a fresh clone rather than a fresh
 /// independent open — see [`WriteCmd::CloneConnection`] for why the two
 /// aren't interchangeable.
-fn spawn_reader(path: PathBuf, writer: mpsc::UnboundedSender<WriteCmd>) -> mpsc::UnboundedSender<ReadCmd> {
+fn spawn_reader(
+    path: PathBuf,
+    writer: mpsc::UnboundedSender<WriteCmd>,
+) -> mpsc::UnboundedSender<ReadCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ReadCmd>();
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
@@ -922,7 +948,49 @@ fn query_logs(conn: &Connection, sources: &[String], limit: i64) -> Result<Vec<L
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
-
+/// Fetch logs for `sources` with optional error-only filter and pagination.
+/// Returns newest-first; `limit` and `offset` are clamped by the caller.
+fn query_logs_filtered(
+    conn: &Connection,
+    sources: &[String],
+    limit: i64,
+    offset: i64,
+    errors_only: bool,
+) -> Result<Vec<LogRow>> {
+    let filter = if sources.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "WHERE source IN ({})",
+            std::iter::repeat_n("?", sources.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let error_clause = if errors_only {
+        if filter.is_empty() {
+            "WHERE error IS NOT NULL"
+        } else {
+            "AND error IS NOT NULL"
+        }
+    } else {
+        ""
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {LOG_COLUMNS} FROM fetch_logs {filter} {error_clause}
+         ORDER BY ts_epoch DESC, id DESC LIMIT ? OFFSET ?"
+    ))?;
+    let mut binds: Vec<duckdb::types::Value> = sources
+        .iter()
+        .map(|s| duckdb::types::Value::Text(s.clone()))
+        .collect();
+    binds.push(duckdb::types::Value::BigInt(limit));
+    binds.push(duckdb::types::Value::BigInt(offset));
+    let rows = stmt
+        .query_map(duckdb::params_from_iter(binds), log_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
 /// Most recent successful fetch log for `source`, if any (`error IS NULL`).
 /// Shared by [`Db::last_success`]'s reader-task and direct-mode paths.
 fn query_last_success(conn: &Connection, source: &str) -> Result<Option<LogRow>> {
@@ -1365,9 +1433,7 @@ impl Db {
     /// collector task to ever call [`Db::mark_polling`].
     #[must_use]
     pub fn is_polling(&self, source: &str) -> bool {
-        self.polling
-            .read()
-            .is_ok_and(|set| set.contains(source))
+        self.polling.read().is_ok_and(|set| set.contains(source))
     }
 
     pub async fn last_health(&self, source: &str) -> Result<Option<String>> {
@@ -1483,6 +1549,36 @@ impl Db {
         }
         let (_guard, conn) = self.connect_async().await?;
         query_logs(&conn, sources, limit)
+    }
+
+    /// Fetch logs with optional error-only filter and pagination (spec: web-ui).
+    /// `limit` and `offset` are clamped to valid ranges; `errors_only` filters
+    /// to rows with a non-null `error`.
+    pub async fn logs_filtered(
+        &self,
+        source: Option<&str>,
+        limit: i64,
+        offset: i64,
+        errors_only: bool,
+    ) -> Result<Vec<LogRow>> {
+        let sources: Vec<String> = source.map(str::to_string).into_iter().collect();
+        let limit = limit.clamp(1, MAX_LOGS_LIMIT);
+        let offset = offset.max(0);
+        if let Some(reader) = &self.reader {
+            let (reply, rx) = oneshot::channel();
+            reader
+                .send(ReadCmd::LogsFiltered {
+                    sources,
+                    limit,
+                    offset,
+                    errors_only,
+                    reply,
+                })
+                .map_err(|_| anyhow::anyhow!("db reader task has stopped"))?;
+            return rx.await.context("db reader task dropped the reply")?;
+        }
+        let (_guard, conn) = self.connect_async().await?;
+        query_logs_filtered(&conn, &sources, limit, offset, errors_only)
     }
 
     /// Both per-source inputs [`crate::health::compute_all`] needs, in one
@@ -1653,12 +1749,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(db.last_health("cpu").await.unwrap().as_deref(), Some("healthy"));
-        assert_eq!(db.latest_values().await.unwrap().len(), 1);
         assert_eq!(
-            db.history("cpu", None, None, None).await.unwrap().len(),
-            1
+            db.last_health("cpu").await.unwrap().as_deref(),
+            Some("healthy")
         );
+        assert_eq!(db.latest_values().await.unwrap().len(), 1);
+        assert_eq!(db.history("cpu", None, None, None).await.unwrap().len(), 1);
         assert_eq!(db.logs(Some("cpu"), 10).await.unwrap().len(), 2);
         let success = db.last_success("cpu").await.unwrap().unwrap();
         assert_eq!(success.value.as_deref(), Some("42"));
@@ -1708,6 +1804,77 @@ mod tests {
             db.history("cpu", None, None, None).await.unwrap().len(),
             100
         );
+    }
+
+    #[tokio::test]
+    async fn logs_filtered_applies_error_filter_and_offset_in_both_modes() {
+        for resident_reader in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("t.duckdb");
+            let db = if resident_reader {
+                Db::open_rw_daemon(&path).unwrap()
+            } else {
+                Db::open_rw(&path).unwrap()
+            };
+            // Writes go through `insert_log` (not a raw `with_conn` batch)
+            // so the resident-reader case is exercised too: a daemon's
+            // reader-task connection is cloned from the writer task's own
+            // connection (`spawn_reader`/`clone_writer_conn`), so it only
+            // observes writes made through that same writer task, not an
+            // ad-hoc direct connection opened by `with_conn`.
+            for (error, value) in [
+                (None, Some("old")),
+                (None, Some("middle")),
+                (None, Some("newest")),
+                (Some("boom"), None),
+            ] {
+                db.insert_log("cpu", 1, error, value, Origin::Poll)
+                    .await
+                    .unwrap();
+            }
+
+            let failures = db.logs_filtered(Some("cpu"), 10, 0, true).await.unwrap();
+            assert_eq!(
+                failures.len(),
+                1,
+                "filtered rows: {:?}; all rows: {:?}",
+                failures,
+                db.logs(Some("cpu"), 10).await.unwrap()
+            );
+            assert_eq!(failures[0].error.as_deref(), Some("boom"));
+
+            let window = db.logs_filtered(Some("cpu"), 2, 1, false).await.unwrap();
+            assert_eq!(window.len(), 2);
+            assert_eq!(window[0].value.as_deref(), Some("newest"));
+            assert_eq!(window[1].value.as_deref(), Some("middle"));
+            assert!(
+                db.logs_filtered(Some("cpu"), 2, 20, false)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_filtered_clamps_limit_to_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value, origin)
+                 SELECT nextval('fetch_logs_id_seq'), 'bulk', i, 't', 1, NULL, 'v', 'poll'
+                 FROM range(10001) AS rows(i);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let rows = db
+            .logs_filtered(Some("bulk"), i64::MAX, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), usize::try_from(MAX_LOGS_LIMIT).unwrap());
     }
 
     /// Two attempts landing in the same millisecond (routine — every source
@@ -1905,10 +2072,7 @@ mod tests {
         let huge = db.logs(Some("s"), 1_000_000_000).await.unwrap();
         assert_eq!(huge.len(), 5, "still returns every row that exists");
 
-        let via_sources = db
-            .logs_for_sources(&["s".to_string()], -1)
-            .await
-            .unwrap();
+        let via_sources = db.logs_for_sources(&["s".to_string()], -1).await.unwrap();
         assert_eq!(via_sources.len(), 1);
     }
 
@@ -2157,7 +2321,10 @@ mod tests {
         assert!(db.is_polling("s"));
         let clone = db.clone();
         assert!(clone.is_polling("s"), "a later clone shares the same set");
-        assert!(!clone.is_polling("other"), "unrelated sources are unaffected");
+        assert!(
+            !clone.is_polling("other"),
+            "unrelated sources are unaffected"
+        );
         drop(guard);
         assert!(!db.is_polling("s"));
         assert!(!clone.is_polling("s"));

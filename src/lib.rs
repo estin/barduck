@@ -99,9 +99,10 @@ fn warn_if_listen_not_loopback(listen: &str) {
 /// or the bare hostname `localhost` a `SocketAddr` parse can't resolve
 /// without a DNS lookup this check deliberately avoids doing.
 fn is_loopback_listen(listen: &str) -> bool {
-    listen
-        .parse::<std::net::SocketAddr>()
-        .map_or_else(|_| listen.starts_with("localhost:"), |a| a.ip().is_loopback())
+    listen.parse::<std::net::SocketAddr>().map_or_else(
+        |_| listen.starts_with("localhost:"),
+        |a| a.ip().is_loopback(),
+    )
 }
 
 /// Resolves on Ctrl+C or (on Unix) `SIGTERM` — the same signals
@@ -207,7 +208,10 @@ mod tests {
     #[test]
     fn non_loopback_addresses_recognized() {
         for listen in ["0.0.0.0:8420", "192.168.1.5:8420", "[::]:8420"] {
-            assert!(!is_loopback_listen(listen), "expected non-loopback: {listen}");
+            assert!(
+                !is_loopback_listen(listen),
+                "expected non-loopback: {listen}"
+            );
         }
     }
 }
