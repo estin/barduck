@@ -74,7 +74,7 @@ When a source declares threshold bands and its latest value falls in a band, the
 - **WHEN** a healthy source has bands 60→green, 85→yellow, 100→red and reports `92`
 - **THEN** its panel renders with the red style
 ### Requirement: Per-source log view linked from panels
-Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHALL open in the current tab, not a new tab. The daemon SHALL serve that page showing the source's recent fetch log entries: timestamp, duration, gathered value rendered together with the source's unit (when the source declares one), attempt origin (`push` for HTTP-ingested values, `poll` for scheduled fetches; spec: data-collection — Fetch attempts logged), and error. The page SHALL include a link back to the dashboard. Requests for unknown sources MUST return a client error naming the unknown source.
+Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHALL open in the current tab, not a new tab. The daemon SHALL serve that page showing the source's recent fetch log entries as a table with columns, in this order: TIME, DURATION, SOURCE, VALUE. The SOURCE column SHALL show the attempt's origin (`push` for HTTP-ingested values, `poll` for scheduled fetches; spec: data-collection — Fetch attempts logged). The VALUE column SHALL show the gathered value rendered together with the source's unit (when the source declares one); for an entry that recorded an error, the VALUE cell SHALL instead show that error's text, wrapped, in place of a value — there is no separate error column. The page SHALL include a link back to the dashboard. Requests for unknown sources MUST return a client error naming the unknown source.
 
 #### Scenario: Log view opens from panel
 - **WHEN** the user clicks the time-ago text on the `bank-balance` panel
@@ -82,15 +82,19 @@ Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHA
 
 #### Scenario: Value renders with unit
 - **WHEN** a source declaring `unit = "USD"` has a log entry with value `1480.42`
-- **THEN** the entry's value cell shows the value together with `USD`, in the same form panels use
+- **THEN** the entry's VALUE cell shows the value together with `USD`, in the same form panels use
 
 #### Scenario: Unitless value renders bare
 - **WHEN** a source declaring no unit has a log entry
-- **THEN** the entry's value cell shows the bare value, as before this change
+- **THEN** the entry's VALUE cell shows the bare value, as before this change
 
 #### Scenario: Origin rendered
 - **WHEN** the log view renders entries of both origins
-- **THEN** each entry shows `push` or `poll`
+- **THEN** each entry's SOURCE cell shows `push` or `poll`
+
+#### Scenario: Error entry shows error text in the VALUE cell
+- **WHEN** a fetch log entry recorded an error
+- **THEN** its VALUE cell shows the wrapped error text instead of a value, and the row has no separate error cell
 
 #### Scenario: Back link returns to the dashboard
 - **WHEN** the user clicks the back link on a source's log view
@@ -100,15 +104,27 @@ Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHA
 - **WHEN** `/logs/nope` is requested
 - **THEN** the response is a client error naming the unknown source
 ### Requirement: Log view relative timestamps and threshold coloring
-The log view SHALL show each entry's timestamp as relative time. It SHALL use the same format panels already use for their own "updated X ago" text. It SHALL NOT show a raw date and time string. Each entry's TIME cell SHALL carry the full stored timestamp as a native hover tooltip, so the exact time stays available on demand.
+The log view SHALL show each entry's timestamp as relative time, at up to two units of precision, coarser unit first (e.g. `1d 6h`, `1h 12m`, `12m 3s`, `45s`). The second (finer) unit SHALL be omitted when it would be zero — e.g. an age of exactly one hour shows `1h`, not `1h 0m`. An age under one minute SHALL show seconds alone, since there is no finer unit. This is more precise than the single-unit format panels use for their own "updated X ago" text, and is otherwise unrelated to it. It SHALL NOT show a raw date and time string. Each entry's TIME cell SHALL carry the full stored timestamp as a native hover tooltip, so the exact time stays available on demand.
 
-The log view SHALL color each entry's value cell the same way panels do. If the source is failing or stale, the cell SHALL render in health's color, regardless of any threshold band. If the source is healthy, its threshold band color SHALL apply instead. A healthy source with no threshold bands, or a non-numeric value, SHALL render with no color.
+The log view SHALL color each entry's VALUE cell the same way panels do. If the source is failing or stale, the cell SHALL render in health's color, regardless of any threshold band. If the source is healthy, its threshold band color SHALL apply instead. A healthy source with no threshold bands, or a non-numeric value, SHALL render with no color. When an entry's VALUE cell shows error text instead of a value (spec: web-ui — Per-source log view linked from panels), it SHALL always render in the failing (red) color, regardless of the source's health or threshold bands.
 
 The log view's table SHALL use narrow row spacing so more entries fit on screen without scrolling.
 
 #### Scenario: Timestamp shows as relative time
-- **WHEN** a fetch log entry was recorded 2 minutes ago
-- **THEN** its row shows "2m ago" instead of a raw timestamp
+- **WHEN** a fetch log entry was recorded exactly 2 minutes ago
+- **THEN** its row's TIME cell shows `2m`
+
+#### Scenario: Two units shown when both are non-zero
+- **WHEN** a fetch log entry was recorded 1 day and 6 hours ago
+- **THEN** its row's TIME cell shows `1d 6h`
+
+#### Scenario: Zero-valued finer unit is omitted
+- **WHEN** a fetch log entry was recorded exactly 1 hour ago
+- **THEN** its row's TIME cell shows `1h`, not `1h 0m`
+
+#### Scenario: Sub-minute age shows seconds only
+- **WHEN** a fetch log entry was recorded 45 seconds ago
+- **THEN** its row's TIME cell shows `45s`
 
 #### Scenario: Hovering the relative time shows the exact timestamp
 - **WHEN** the user hovers the TIME cell's relative-time text
@@ -116,15 +132,19 @@ The log view's table SHALL use narrow row spacing so more entries fit on screen 
 
 #### Scenario: Value colored by threshold band
 - **WHEN** a source has bands 60→green, 85→yellow, 100→red and an entry's value is `92`
-- **THEN** that entry's value cell renders with the red color
+- **THEN** that entry's VALUE cell renders with the red color
 
 #### Scenario: Unbanded or non-numeric value has no color when healthy
 - **WHEN** a source declares no threshold bands, or an entry's value is not a number, and the source is currently healthy
-- **THEN** that entry's value cell renders with no color
+- **THEN** that entry's VALUE cell renders with no color
 
 #### Scenario: Unbanded value colored by health when not healthy
 - **WHEN** a source declares no threshold bands and its last fetch is currently failing
-- **THEN** that entry's value cell renders in the failing (red) color
+- **THEN** that entry's VALUE cell renders in the failing (red) color
+
+#### Scenario: Error entry renders in red regardless of health or band
+- **WHEN** an entry recorded an error, and its source is currently healthy with a green threshold band
+- **THEN** that entry's VALUE cell renders the error text in the failing (red) color, not green
 
 #### Scenario: Narrow rows fit more history on screen
 - **WHEN** the log view renders many entries
@@ -176,6 +196,8 @@ The web dashboard SHALL show a single, always-visible connection health indicato
 
 While the connection is offline, the dashboard SHALL additionally: render the browser-tab favicon in its red status color, overriding whatever health-derived color it would otherwise show; display a persistent, fixed-position banner stating the connection is lost; and visibly dim the main panel content to signal it may be stale. All three SHALL clear automatically, with no page reload, the instant the connection recovers.
 
+On the dashboard, the favicon's health-derived color SHALL reflect the worst status across every source shown on the page. On a source's log view (`/logs/<source>`), the favicon SHALL instead reflect that one source's own status color — its threshold band color when healthy, or the failing/stale health color when it is not — falling back to green when the source is healthy and declares no threshold bands. The offline override still applies on the log view: while the connection is offline, its favicon SHALL also turn red, the same as the dashboard's.
+
 #### Scenario: Server reachable
 - **WHEN** the browser's ping to the daemon succeeds
 - **THEN** the indicator shows an online state
@@ -211,6 +233,22 @@ While the connection is offline, the dashboard SHALL additionally: render the br
 #### Scenario: No banner or dim while checking or online
 - **WHEN** the connection is in the initial "checking" state or is online
 - **THEN** no offline banner is shown and the panel content is not dimmed
+
+#### Scenario: Log view favicon reflects the source's own status
+- **WHEN** a source's log view is open and that source is currently `failing`
+- **THEN** the browser-tab favicon renders in the failing (red) color, regardless of any other source's status on the dashboard
+
+#### Scenario: Log view favicon reflects a healthy banded source's color
+- **WHEN** a source's log view is open, the source is healthy, and its latest value falls in its yellow threshold band
+- **THEN** the browser-tab favicon renders in the yellow color
+
+#### Scenario: Log view favicon falls back to green for an unbanded healthy source
+- **WHEN** a source's log view is open, the source is healthy, and it declares no threshold bands
+- **THEN** the browser-tab favicon renders in the green color
+
+#### Scenario: Log view favicon still turns red when offline
+- **WHEN** a source's log view is open and the connection goes offline
+- **THEN** the browser-tab favicon renders in its red status color, overriding the source's own status color
 ### Requirement: Group panes show multiple labeled, independently colored values
 A layout cell using the generalized pane shape (`{ title, main?, secondary?, table? }`, spec: source-configuration — UI layouts are config-declared like sources) SHALL render as a single card titled with the cell's configured title, combining up to three sections in this order: `main`, then `secondary`, then `table`.
 

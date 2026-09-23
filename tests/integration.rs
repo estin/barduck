@@ -1277,9 +1277,54 @@ async fn log_view_renders_push_and_poll_origins() {
     tokio::spawn(async move { topcoat::serve(listener, router).await });
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
-    assert!(html.contains("ORIGIN"), "origin column expected:\n{html}");
+    assert!(html.contains("SOURCE"), "source column expected:\n{html}");
     assert!(html.contains("poll"), "scheduled row shows poll");
     assert!(html.contains("push"), "ingested row shows push");
+}
+
+/// An entry with a recorded error shows its error text in the VALUE cell,
+/// colored red, in place of a value — there is no separate error column
+/// (spec: web-ui — per-source log view linked from panels; log view
+/// relative timestamps and threshold coloring).
+#[tokio::test]
+async fn log_view_shows_error_text_in_value_cell() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    db.insert_log(
+        "echo",
+        5,
+        Some("boom: connection refused"),
+        None,
+        Origin::Poll,
+    )
+    .await
+    .unwrap();
+    db.insert_log("echo", 5, None, Some("42"), Origin::Poll)
+        .await
+        .unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/logs/echo", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(!html.contains("ERROR"), "no separate error column:\n{html}");
+    assert!(
+        html.contains("boom: connection refused") && html.contains("text-red-500"),
+        "error row's VALUE cell should show the error text in red:\n{html}"
+    );
+    assert!(
+        html.contains("42"),
+        "value row's VALUE cell should still show its value:\n{html}"
+    );
 }
 
 #[tokio::test]
@@ -3361,8 +3406,8 @@ rows = [["cpu"]]
         "log view should link back to the dashboard"
     );
     assert!(
-        html.contains("ago") || html.contains("just now"),
-        "TIME cell should show relative time"
+        html.contains("just now") || (0..60).any(|s| html.contains(&format!(">{s}s<"))),
+        "TIME cell should show relative time:\n{html}"
     );
     assert!(
         html.contains(&format!("title=\"{raw_ts}\"")),
@@ -3449,5 +3494,112 @@ rows = [["price"]]
     assert!(
         html.contains("42 USD"),
         "log VALUE cell should show the value with its unit"
+    );
+}
+
+/// The log view's favicon marker reflects that one source's own status —
+/// not the dashboard-wide worst color — so a failing source's log view
+/// tab warns even when every other source on the dashboard is healthy
+/// (spec: web-ui — global connection health indicator).
+#[tokio::test]
+async fn log_view_favicon_reflects_failing_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    // `failure_threshold = 1` (test_config): one errored attempt is enough
+    // to flip `dead` to failing.
+    db.insert_log("dead", 5, Some("boom"), None, Origin::Poll)
+        .await
+        .unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/logs/dead", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(
+        html.contains(r#"id="bd-status" data-status="red""#),
+        "failing source's log view favicon marker should be red:\n{html}"
+    );
+}
+
+/// A healthy, threshold-banded source's log view favicon reflects its
+/// current band color (spec: web-ui — global connection health indicator).
+#[tokio::test]
+async fn log_view_favicon_reflects_healthy_banded_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+
+[[sources]]
+name = "cpu"
+type = "query"
+command = "echo 75"
+thresholds = [
+  {{ bound = 60.0, level = "green" }},
+  {{ bound = 85.0, level = "yellow" }},
+  {{ bound = 100.0, level = "red" }},
+]
+
+[[layouts]]
+title = "Overview"
+rows = [["cpu"]]
+"#,
+        db = db_path.display()
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/logs/cpu", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(
+        html.contains(r#"id="bd-status" data-status="yellow""#),
+        "value 75 falls in the yellow band, so the favicon marker should be yellow:\n{html}"
+    );
+}
+
+/// A healthy, unbanded source's log view favicon falls back to green
+/// (spec: web-ui — global connection health indicator).
+#[tokio::test]
+async fn log_view_favicon_falls_back_to_green_for_unbanded_healthy_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, test_asset_bundle());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/logs/echo", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(
+        html.contains(r#"id="bd-status" data-status="green""#),
+        "healthy unbanded source's log view favicon marker should fall back to green:\n{html}"
     );
 }

@@ -448,6 +448,25 @@ pub(super) async fn log_rows(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
 
+    // The source's own status color for the browser-tab favicon (spec:
+    // web-ui — global connection health indicator: log view favicon
+    // reflects the source's own status), computed from the true latest
+    // reading rather than `rows[0]` — `rows` can be paginated or
+    // error-filtered, so its first entry isn't reliably "the latest value"
+    // (design.md — favicon marker decision).
+    let latest = st
+        .db
+        .logs_filtered(Some(&source), 1, 0, false)
+        .await
+        .unwrap_or_default();
+    let latest_row = latest.into_iter().next();
+    let favicon_level = latest_row
+        .as_ref()
+        .filter(|_| !bands.is_empty())
+        .and_then(|r| r.value.as_deref())
+        .and_then(|v| config::level_for(bands, v));
+    let favicon_status = config::status_color(favicon_level, status);
+
     // Pager state from the returned page alone (design D3, no COUNT query).
     let current_page = u32::try_from((offset / limit).saturating_add(1)).unwrap_or(u32::MAX);
     let has_prev = current_page > 1;
@@ -455,6 +474,7 @@ pub(super) async fn log_rows(
     let next_href = pager_href(&source, current_page.saturating_add(1), errors_only);
 
     view! {
+        <span id="bd-status" data-status=(favicon_status.as_str()) style="display:none"></span>
         <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
             if errors_only {
                 <a href=(format!("/logs/{source}")) class="text-sm font-medium text-foreground underline underline-offset-4 hover:opacity-80" title="Showing only failed attempts — click to clear">
@@ -499,9 +519,8 @@ pub(super) async fn log_rows(
                 table_row(
                     table_head("TIME")
                     table_head("DURATION")
+                    table_head("SOURCE")
                     table_head("VALUE")
-                    table_head("ORIGIN")
-                    table_head("ERROR")
                 )
             )
             table_body(
@@ -509,24 +528,27 @@ pub(super) async fn log_rows(
                     table_row(
                         table_cell(
                             attrs: attributes! { class="font-mono" title=(l.ts.clone()) },
-                            (age::ago(now, l.ts_epoch).unwrap_or_else(|| "—".into()))
+                            (age::ago_precise(now, l.ts_epoch).unwrap_or_else(|| "—".into()))
                         )
                         table_cell(attrs: attributes! { class="font-mono" }, (format!("{} ms", l.duration_ms)))
-                        table_cell(
-                            attrs: attributes! {
-                                class="font-mono"
-                                style=(text_style_for_color(config::accent_color(
-                                    l.value.as_deref().and_then(|v| config::level_for(bands, v)),
-                                    status,
-                                )))
-                            },
-                            <pre class="whitespace-pre-wrap break-all m-0">(value_with_unit(l.value.as_deref(), src.unit()))</pre>
-                        )
                         table_cell(attrs: attributes! { class="font-mono" }, (l.origin.to_string()))
-                        table_cell(
-                            attrs: attributes! { class="text-red-500 font-mono" },
-                            <pre class="whitespace-pre-wrap break-all m-0">(l.error.clone().unwrap_or_default())</pre>
-                        )
+                        if let Some(err) = &l.error {
+                            table_cell(
+                                attrs: attributes! { class="text-red-500 font-mono" },
+                                <pre class="whitespace-pre-wrap break-all m-0">(err.clone())</pre>
+                            )
+                        } else {
+                            table_cell(
+                                attrs: attributes! {
+                                    class="font-mono"
+                                    style=(text_style_for_color(config::accent_color(
+                                        l.value.as_deref().and_then(|v| config::level_for(bands, v)),
+                                        status,
+                                    )))
+                                },
+                                <pre class="whitespace-pre-wrap break-all m-0">(value_with_unit(l.value.as_deref(), src.unit()))</pre>
+                            )
+                        }
                     )
                 }
                 if rows.is_empty() {
