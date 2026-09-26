@@ -18,6 +18,7 @@ use std::sync::Arc;
 use topcoat::{
     asset::{AssetBundle, RouterBuilderAssetExt},
     cookie::RouterBuilderCookieExt,
+    runtime::RouterBuilderRuntimeExt,
     router::RouterBuilderDiscoverExt,
 };
 
@@ -186,7 +187,14 @@ pub fn build_router_with_bundle(
         tracing::warn!("no asset bundle loaded; pages using bundled assets will fail to render");
         builder
     };
-    builder.app_context(state).build()
+    // Registered before `.runtime()` per topcoat 0.9: the runtime layer must
+    // come after application layers so it converts page rerun requests to
+    // `GET` before they run (spec: web-ui — current values without manual
+    // reload).
+    builder
+        .runtime()
+        .app_context(state)
+        .build()
 }
 
 /// Re-exported so `barduck::collect_once` (used throughout the test suite)

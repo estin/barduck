@@ -6,7 +6,7 @@ use crate::config::ValueFormat;
 use pulldown_cmark::Options;
 use topcoat::{
     Result,
-    view::{Unescaped, component, view},
+    view::{Unescaped, View, component, view},
 };
 
 /// Schemes safe to leave as a live link/image destination. Anything else —
@@ -120,19 +120,23 @@ fn render_markdown(value: &str) -> String {
 /// content and the static-text cell's content, so the two-way format branch
 /// isn't copy-pasted a third time (design.md — factor format-rendering logic).
 #[component]
-pub(super) async fn formatted_content(format: ValueFormat, value: String, unit: String) -> Result {
+pub(super) async fn formatted_content(
+    format: ValueFormat,
+    value: String,
+    unit: String,
+) -> Result<impl View> {
     let value_and_unit = if unit.is_empty() {
         value.clone()
     } else {
         format!("{value} {unit}")
     };
-    view! {
+    Ok(view! {
         if format == ValueFormat::Markdown {
             <div class="prose prose-sm max-w-none">(markdown_to_html(&value))</div>
         } else {
             <div class="text-2xl font-semibold">(value_and_unit)</div>
         }
-    }
+    })
 }
 
 #[cfg(test)]

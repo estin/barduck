@@ -1368,7 +1368,7 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
     );
     // Live updates: shard scope markers + vendored runtime script tag.
     assert!(
-        html.contains("::topcoat::scope::"),
+        html.contains("::topcoat::shard::"),
         "shard reactive scope expected"
     );
     assert!(
@@ -3430,7 +3430,7 @@ rows = [["cpu"]]
         "log view should load the runtime script the tick signal needs"
     );
     assert!(
-        html.contains("::topcoat::scope::"),
+        html.contains("::topcoat::shard::"),
         "log table should be a shard with a reactive scope"
     );
     // Shared page chrome (spec: web-ui — header and footer stay pinned

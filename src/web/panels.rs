@@ -14,7 +14,7 @@ use topcoat::{
     Result,
     context::{Cx, app_context},
     runtime::shard,
-    view::{attributes, component, view},
+    view::{View, ViewExt, attributes, component, view},
 };
 
 pub(super) struct Panel {
@@ -478,18 +478,18 @@ fn build_panel(
 /// needs no separate progress popup: every viewer sees the same state,
 /// live, on the panel itself.
 #[component]
-pub(super) async fn poll_button(source: String, polling: bool) -> Result {
+pub(super) async fn poll_button(source: String, polling: bool) -> Result<impl View> {
     if polling {
-        view! {
+        Ok(view! {
             <span
                 aria-live="polite"
                 class="normal-case opacity-60 italic"
             >
                 "polling…"
             </span>
-        }
+        }.boxed())
     } else {
-        view! {
+        Ok(view! {
             <button
                 type="button"
                 data-bd-poll=(source.clone())
@@ -499,7 +499,7 @@ pub(super) async fn poll_button(source: String, polling: bool) -> Result {
             >
                 "poll now"
             </button>
-        }
+        }.boxed())
     }
 }
 
@@ -704,20 +704,22 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
 /// Live panel grid: re-renders on the server whenever `tick` changes
 /// (spec: web-ui — current values without manual reload).
 #[shard]
-pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
+pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
     let _ = tick; // refresh trigger only; data always re-read from the DB
     let st = app_context::<AppState>(cx);
     let grids = collect_grids(st).await;
     // Same panels, same order, as a flat list for the summary strip
     // (spec: web-ui — source summary strip). A group's members all point at
-    // their shared card's anchor, not their own.
-    let mut chips: Vec<(&Panel, &str)> = Vec::new();
+    // their shared card's anchor, not their own. Owned data (`name`,
+    // `anchor`) because the view body moves its inputs in (topcoat 0.7+),
+    // so borrows of `grids` can't be captured in it.
+    let mut chips: Vec<(Level, String, String, &'static str)> = Vec::new();
     for grid in &grids {
         for row in &grid.rows {
             for slot in row {
                 if let Some(anchor) = slot.anchor() {
                     for p in slot.main.iter().chain(&slot.secondary).chain(&slot.table) {
-                        chips.push((p, anchor));
+                        chips.push((p.level_color(), p.name.clone(), anchor.to_string(), p.chip_style()));
                     }
                 }
             }
@@ -726,22 +728,23 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
     // Worst color across every source currently on the dashboard (spec:
     // web-ui — health visible at a glance); read by the browser-tab favicon
     // script via this hidden marker's `data-status`, refreshed each tick.
-    let worst = config::worst_color(chips.iter().map(|(p, _)| p.level_color()));
-    view! {
-        <span id="bd-status" data-status=(worst.as_str()) style="display:none"></span>
+    let grids_empty = grids.is_empty();
+    let worst = config::worst_color(chips.iter().map(|(level, _, _, _)| *level));
+    Ok(view! {
+        <span id="bd-status" data-status=(worst.as_str().to_owned()) style="display:none"></span>
         if !chips.is_empty() {
             <div class="flex flex-wrap gap-1.5 mb-4">
-                for (p, anchor) in &chips {
+                for (_, name, anchor, style) in chips {
                     <a href=(format!("#panel-{}", anchor))
                         class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium leading-none hover:opacity-90"
-                        style=(p.chip_style())
+                        style=(style)
                     >
-                        (p.name.clone())
+                        (name)
                     </a>
                 }
             </div>
         }
-        for grid in &grids {
+        for grid in grids {
             <h2 class="text-lg font-semibold mb-3 text-foreground">(grid.title.clone())</h2>
             <div class=(format!("grid bd-panel-grid gap-3 mb-6 grid-cols-{}", grid.columns.min(6)))
                 style=(style_string(&format!("--bd-cols: {}; grid-template-columns: repeat({}, minmax(0, 1fr));", grid.columns, grid.columns), &style_override_to_css(grid.style.as_ref())))
@@ -912,12 +915,12 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result {
                 }
             </div>
         }
-        if grids.is_empty() {
+        if grids_empty {
             <div class="rounded-xl border-2 border-dashed border-border p-8 text-center text-muted-foreground">
                 "No panels configured. Add sources and layouts to the config file."
             </div>
         }
-    }
+    })
 }
 
 #[cfg(test)]

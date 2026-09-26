@@ -31,9 +31,9 @@ use topcoat::{
     context::{Cx, app_context},
     font::{Font, fontsource::fontsource_font},
     router::{page, path_param, request::uri},
-    runtime::shard,
+    runtime::{shard, signal},
     tailwind,
-    view::{Unescaped, attributes, component, view},
+    view::{Unescaped, View, attributes, component, view},
 };
 
 /// Declared once and reused by every page: two independent
@@ -207,7 +207,7 @@ const POLL_SCRIPT: &str = r"(function () {
 /// `#[component]` has no network endpoint of its own, so its parameters are
 /// ordinary Rust values fixed once per real request, unlike a `#[shard]`'s.
 #[component]
-pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<String>) -> Result {
+pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<String>) -> Result<impl View> {
     let theme = theme_class(cx);
     let st = app_context::<AppState>(cx);
     let pollable = view_source.as_ref().is_some_and(|name| {
@@ -246,7 +246,8 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
     #[allow(clippy::cast_precision_loss)]
     let offset_f = offset as f64;
     let limit_f = f64::from(limit);
-    view! {
+    let tick = signal(cx, || 0.0f64);
+    Ok(view! {
         <!DOCTYPE html>
         <html class=(theme)>
             <head>
@@ -276,10 +277,12 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
                 </style>
             </head>
             <body>
-                signal tick = 0.0;
                 <span :data-bd-tick=$({
-                    let _t = tick;
-                    raw!("(globalThis.__bdTick ??= setInterval(() => ${_t}.increment(), 5000), 'tick')", "tick")
+                    let t = tick;
+                    raw!("(globalThis.__bdTick ??= setInterval(() => ${t}.increment(), 5000), 'tick')", {
+                        let _ = t.get();
+                        "tick"
+                    })
                 }) style="display:none"></span>
                 // The offline banner and the h1 header bar are pinned together
                 // as one sticky block (spec: web-ui — header and footer stay
@@ -352,7 +355,7 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
                 <script>(Unescaped::new_unchecked(POLL_SCRIPT.to_string()))</script>
             </body>
         </html>
-    }
+    })
 }
 
 /// Web dashboard rendered from the same config layouts as the TUI (spec:
@@ -360,9 +363,9 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
 /// bumps `tick`, and each change re-renders the grid on the server without a
 /// full page reload.
 #[page("/")]
-pub async fn dashboard(cx: &Cx) -> Result {
+pub async fn dashboard(cx: &Cx) -> Result<impl View> {
     let _st = app_context::<AppState>(cx);
-    view! { page_chrome(title: "barduck".to_string(), view_source: None) }
+    Ok(view! { page_chrome(title: "barduck".to_string(), view_source: None) })
 }
 
 path_param!(source_name: String);
@@ -420,7 +423,7 @@ pub(super) async fn log_rows(
     limit: f64,
     offset: f64,
     errors_only: bool,
-) -> Result {
+) -> Result<impl View> {
     let _ = tick; // refresh trigger only; data always re-read from the DB
     let st = app_context::<AppState>(cx);
     let Some(src) = st.cfg.sources.iter().find(|s| s.name() == source) else {
@@ -443,7 +446,11 @@ pub(super) async fn log_rows(
     // `build_panel` uses for a lookup failure.
     let health = health::compute(&st.db, &st.cfg, &source).await;
     let status = health.as_ref().map_or(health::Health::Stale, |h| h.status);
-    let bands: &[config::Threshold] = health.as_ref().map_or(&[], |h| &h.thresholds);
+    // Owned: the view body captures values, not borrows of these locals.
+    let bands = health
+        .as_ref()
+        .map_or(&[][..], |h| h.thresholds.as_slice())
+        .to_vec();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
@@ -464,41 +471,48 @@ pub(super) async fn log_rows(
         .as_ref()
         .filter(|_| !bands.is_empty())
         .and_then(|r| r.value.as_deref())
-        .and_then(|v| config::level_for(bands, v));
+        .and_then(|v| config::level_for(&bands, v));
     let favicon_status = config::status_color(favicon_level, status);
 
     // Pager state from the returned page alone (design D3, no COUNT query).
     let current_page = u32::try_from((offset / limit).saturating_add(1)).unwrap_or(u32::MAX);
     let has_prev = current_page > 1;
     let has_next = rows.len() == usize::try_from(limit).unwrap_or(usize::MAX);
+    let rows_empty = rows.is_empty();
+    let row_count = rows.len();
+    let showing = format!(
+        "Showing {}–{}",
+        offset.saturating_add(1),
+        offset.saturating_add(i64::try_from(row_count).unwrap_or(i64::MAX))
+    );
+    let base_href = format!("/logs/{source}");
+    let errors_href = pager_href(&source, 1, true);
+    let prev_href = pager_href(&source, current_page.saturating_sub(1), errors_only);
     let next_href = pager_href(&source, current_page.saturating_add(1), errors_only);
+    let source_unit = src.unit().unwrap_or("").to_string();
 
-    view! {
+    Ok(view! {
         <span id="bd-status" data-status=(favicon_status.as_str()) style="display:none"></span>
         <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
             if errors_only {
-                <a href=(format!("/logs/{source}")) class="text-sm font-medium text-foreground underline underline-offset-4 hover:opacity-80" title="Showing only failed attempts — click to clear">
+                <a href=(base_href) class="text-sm font-medium text-foreground underline underline-offset-4 hover:opacity-80" title="Showing only failed attempts — click to clear">
                     "Errors only — on"
                 </a>
             } else {
-                <a href=(pager_href(&source, 1, true)) class="text-sm text-muted-foreground hover:underline" title="Show only failed attempts">
+                <a href=(errors_href) class="text-sm text-muted-foreground hover:underline" title="Show only failed attempts">
                     "Errors only"
                 </a>
             }
             <div class="flex items-center gap-3 text-sm text-muted-foreground">
                 <span>
-                    if rows.is_empty() {
+                    if rows_empty {
                         "No entries"
                     } else {
-                        (format!(
-                            "Showing {}–{}",
-                            offset.saturating_add(1),
-                            offset.saturating_add(i64::try_from(rows.len()).unwrap_or(i64::MAX))
-                        ))
+                        (showing)
                     }
                 </span>
                 if has_prev {
-                    <a href=(pager_href(&source, current_page - 1, errors_only)) class="rounded-md border border-border px-2 py-1 hover:bg-muted">
+                    <a href=(prev_href) class="rounded-md border border-border px-2 py-1 hover:bg-muted">
                         "Prev"
                     </a>
                 } else {
@@ -524,7 +538,7 @@ pub(super) async fn log_rows(
                 )
             )
             table_body(
-                for l in &rows {
+                for l in rows {
                     table_row(
                         table_cell(
                             attrs: attributes! { class="font-mono" title=(l.ts.clone()) },
@@ -542,16 +556,16 @@ pub(super) async fn log_rows(
                                 attrs: attributes! {
                                     class="font-mono"
                                     style=(text_style_for_color(config::accent_color(
-                                        l.value.as_deref().and_then(|v| config::level_for(bands, v)),
+                                        l.value.as_deref().and_then(|v| config::level_for(&bands, v)),
                                         status,
                                     )))
                                 },
-                                <pre class="whitespace-pre-wrap break-all m-0">(value_with_unit(l.value.as_deref(), src.unit()))</pre>
+                                <pre class="whitespace-pre-wrap break-all m-0">(value_with_unit(l.value.as_deref(), Some(source_unit.as_str())))</pre>
                             )
                         }
                     )
                 }
-                if rows.is_empty() {
+                if rows_empty {
                     table_row(
                         table_cell(attrs: attributes! { class="text-center text-muted-foreground" },
                             if errors_only { "No failed attempts." } else { "No fetch attempts recorded yet." })
@@ -559,7 +573,7 @@ pub(super) async fn log_rows(
                 }
             )
         )
-    }
+    })
 }
 
 /// Convert an untrusted topcoat `f64` shard argument into a bounded integer.
@@ -602,7 +616,7 @@ fn value_with_unit(value: Option<&str>, unit: Option<&str>) -> String {
 /// same `page_chrome` the dashboard uses, so both pages share one header,
 /// footer, and set of scripts.
 #[page("/logs/{source_name}")]
-pub async fn source_logs(cx: &Cx) -> Result {
+pub async fn source_logs(cx: &Cx) -> Result<impl View> {
     let st = app_context::<AppState>(cx);
     // Unparsed String params cannot fail to parse, but map the error to owned
     // so no cx-borrowed data escapes the handler.
@@ -619,7 +633,7 @@ pub async fn source_logs(cx: &Cx) -> Result {
             format!("unknown source `{source}`"),
         )));
     }
-    view! { page_chrome(title: format!("logs — {source}"), view_source: Some(source)) }
+    Ok(view! { page_chrome(title: format!("logs — {source}"), view_source: Some(source)) })
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@
 
       # The Tailwind CLI release `topcoat-tailwind` downloads by default at
       # build time (see topcoat_tailwind::build::DEFAULT_VERSION, currently
-      # pinned to this version by the `topcoat = "0.6.2"` dependency).
+      # pinned to this version by the `topcoat = "0.9"` dependency).
       # Pre-fetched here as a fixed-output derivation so the actual `cargo
       # build` stays network-free inside Nix's build sandbox.
       tailwindVersion = "4.3.2";
@@ -47,13 +47,13 @@
           # crate, not a dependency of barduck itself.
           topcoat-cli = pkgs.rustPlatform.buildRustPackage {
             pname = "topcoat-cli";
-            version = "0.6.2";
+            version = "0.9.0";
             src = pkgs.fetchCrate {
               pname = "topcoat-cli";
-              version = "0.6.2";
-              hash = "sha256-+6DKc2yjKwju64iokWV1EUXf62GGj1W32kp7E7WVKdM=";
+              version = "0.9.0";
+              hash = "sha256-6kLV2AP9e2H8WfmaZ5IwJp3HY3uFD6B0U3qMEvWzWYE=";
             };
-            cargoHash = "sha256-CDnvF0CMkpjIK0dDhuxIfpm0PnyEjFvbIjWhgSfFk1w=";
+            cargoHash = "sha256-o/QffbjjkHqM+mxZwjxARm2mx4ylqxWrRw4UJ4Q0R+Q=";
             doCheck = false;
           };
         in

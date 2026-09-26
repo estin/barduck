@@ -94,7 +94,7 @@ WSL is required for Windows command execution.
 Build with stable Rust and DuckDB available to the linker, or use
 `cargo build --release --features bundled` with a native C++ toolchain.
 The build downloads the host Tailwind executable. Web deployments also
-need the Topcoat CLI (`cargo install topcoat-cli --version 0.6.2`) and
+need the Topcoat CLI (`cargo install topcoat-cli --version 0.9.0 --locked`) and
 `topcoat asset bundle --release`; keep `target/release/assets` beside the
 binary. The Nix/home-manager service below is Linux/systemd-specific.
 
