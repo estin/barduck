@@ -6,6 +6,12 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+/// Widest a `space` cell's `colspan` may be. The value feeds
+/// [`LayoutCfg::columns`] verbatim — into a CSS `grid-template-columns:
+/// repeat(N, …)` and a TUI `Constraint::Fill(span as u16)` — so it is
+/// bounded rather than trusted; a dashboard column wider than this is not a
+/// real layout.
+pub(crate) const MAX_COLSPAN: usize = 12;
 pub const VALUE_FORMATS: &[&str] = &["text", "markdown"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -144,11 +150,18 @@ pub struct LayoutCfg {
 
 impl LayoutCfg {
     /// Column count = widest row (cells weighted by colspan).
+    ///
+    /// Sums saturating rather than with a plain `sum()`: a TOML integer is
+    /// `i64`-backed, so several wide `space` cells could overflow the `usize`
+    /// total outright.
     #[must_use]
     pub fn columns(&self) -> usize {
         self.rows
             .iter()
-            .map(|row| row.iter().map(Cell::span).sum())
+            .map(|row| {
+                row.iter()
+                    .fold(0usize, |acc, c| acc.saturating_add(Cell::span(c)))
+            })
             .max()
             .unwrap_or(0)
     }

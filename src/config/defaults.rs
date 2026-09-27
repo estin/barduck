@@ -84,10 +84,14 @@ fn parse_env_u32(var: &str, v: &str) -> Result<u32> {
 }
 
 fn parse_env_tui_width(v: &str) -> Result<TuiWidth> {
-    if v == "auto" {
+    // Compared trimmed, like every other `BARDUCK_*` value is parsed:
+    // `BARDUCK_TUI_WIDTH=" auto "` is as valid as `"auto"`, and an
+    // untrimmed comparison rejected it with a confusing message.
+    let trimmed = v.trim();
+    if trimmed == "auto" {
         return Ok(TuiWidth::Named("auto".into()));
     }
-    v.trim()
+    trimmed
         .parse()
         .map(TuiWidth::Fixed)
         .with_context(|| format!("environment variable `BARDUCK_TUI_WIDTH` value `{v}` is invalid"))

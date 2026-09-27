@@ -18,8 +18,8 @@ use std::sync::Arc;
 use topcoat::{
     asset::{AssetBundle, RouterBuilderAssetExt},
     cookie::RouterBuilderCookieExt,
-    runtime::RouterBuilderRuntimeExt,
     router::RouterBuilderDiscoverExt,
+    runtime::RouterBuilderRuntimeExt,
 };
 
 /// Long-lived values shared with topcoat handlers via app context.
@@ -143,7 +143,11 @@ fn spawn_retention(
     tokio::spawn(async move {
         // `interval`'s first tick fires immediately, so the loop's very
         // first pass runs right away; every later pass waits a full hour.
+        // `Skip` rather than the default `Burst`: a purge that overran an
+        // hour would otherwise be followed by back-to-back catch-up purges,
+        // and the next scheduled pass is all that's wanted.
         let mut interval = tokio::time::interval(std::time::Duration::from_hours(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -191,10 +195,7 @@ pub fn build_router_with_bundle(
     // come after application layers so it converts page rerun requests to
     // `GET` before they run (spec: web-ui — current values without manual
     // reload).
-    builder
-        .runtime()
-        .app_context(state)
-        .build()
+    builder.runtime().app_context(state).build()
 }
 
 /// Re-exported so `barduck::collect_once` (used throughout the test suite)

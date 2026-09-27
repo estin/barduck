@@ -9,6 +9,7 @@ use crate::{
     config::{Level, ValueFormat},
     health::{self, Health},
 };
+use anyhow::Context as _;
 use std::collections::BTreeMap;
 use topcoat::{
     Result,
@@ -338,11 +339,17 @@ impl RenderData {
     /// independent of how many sources or panels the config declares.
     ///
     /// Only a failed `latest_values` gives up on the page — without values
-    /// there is nothing to show. A health or history failure degrades that
-    /// part alone (every panel falls back to `stale`, bars render empty),
-    /// the same fallback each panel used to apply for itself.
-    async fn load(st: &AppState) -> Option<Self> {
-        let latest = st.db.latest_values().await.ok()?;
+    /// there is nothing to show — and it says so, so the caller can tell an
+    /// unreadable database from a config that declares no panels. A health or
+    /// history failure degrades that part alone (every panel falls back to
+    /// `stale`, bars render empty), the same fallback each panel used to
+    /// apply for itself.
+    async fn load(st: &AppState) -> anyhow::Result<Self> {
+        let latest = st
+            .db
+            .latest_values()
+            .await
+            .context("reading latest values")?;
         let healths = health::compute_all(&st.db, &st.cfg)
             .await
             .unwrap_or_else(|e| {
@@ -359,7 +366,7 @@ impl RenderData {
                 .collect(),
             None => BTreeMap::new(),
         };
-        Some(Self {
+        Ok(Self {
             latest,
             healths,
             recent,
@@ -434,7 +441,13 @@ fn build_panel(
     let show_bar = !bands.is_empty() && src.is_some_and(|s| s.show_history().unwrap_or(true));
     let history = match src.filter(|_| show_bar) {
         Some(s) => {
-            let n = s.history_points().unwrap_or(st.cfg.history_points) as usize;
+            // Clamped to what the query can return: the padding below sizes a
+            // `Vec` that is rendered as one bar segment each, and the read
+            // itself never yields more than `MAX_HISTORY_LIMIT` points.
+            let n = s
+                .history_points()
+                .unwrap_or(st.cfg.history_points)
+                .min(crate::db::MAX_HISTORY_LIMIT as u32) as usize;
             let recent = data.history_of(name, n);
             let mut segments: Vec<Option<Level>> = recent
                 .iter()
@@ -487,7 +500,8 @@ pub(super) async fn poll_button(source: String, polling: bool) -> Result<impl Vi
             >
                 "polling…"
             </span>
-        }.boxed())
+        }
+        .boxed())
     } else {
         Ok(view! {
             <button
@@ -663,10 +677,11 @@ fn build_cell_parts(st: &AppState, data: &RenderData, cell: &config::Cell) -> Ce
     }
 }
 
-async fn collect_grids(st: &AppState) -> Vec<Grid> {
-    let Some(data) = RenderData::load(st).await else {
-        return Vec::new();
-    };
+/// `Err` carries the whole-render database read's failure, so the page can
+/// say "couldn't read the database" instead of falling through to the config
+/// hint an empty layout produces.
+async fn collect_grids(st: &AppState) -> anyhow::Result<Vec<Grid>> {
+    let data = RenderData::load(st).await?;
     let mut grids = Vec::new();
     for layout in &st.cfg.layouts {
         let mut rows = Vec::new();
@@ -698,7 +713,7 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
             rows,
         });
     }
-    grids
+    Ok(grids)
 }
 
 /// Live panel grid: re-renders on the server whenever `tick` changes
@@ -707,7 +722,16 @@ async fn collect_grids(st: &AppState) -> Vec<Grid> {
 pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
     let _ = tick; // refresh trigger only; data always re-read from the DB
     let st = app_context::<AppState>(cx);
-    let grids = collect_grids(st).await;
+    // Logged here, rendered as its own message: a database this daemon can't
+    // read is not a config with no panels, and the old silent fall-through
+    // told the user to go edit their config.
+    let (grids, read_error) = match collect_grids(st).await {
+        Ok(grids) => (grids, None),
+        Err(e) => {
+            tracing::error!("dashboard render: {e:#}");
+            (Vec::new(), Some(e.to_string()))
+        }
+    };
     // Same panels, same order, as a flat list for the summary strip
     // (spec: web-ui — source summary strip). A group's members all point at
     // their shared card's anchor, not their own. Owned data (`name`,
@@ -719,7 +743,12 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
             for slot in row {
                 if let Some(anchor) = slot.anchor() {
                     for p in slot.main.iter().chain(&slot.secondary).chain(&slot.table) {
-                        chips.push((p.level_color(), p.name.clone(), anchor.to_string(), p.chip_style()));
+                        chips.push((
+                            p.level_color(),
+                            p.name.clone(),
+                            anchor.to_string(),
+                            p.chip_style(),
+                        ));
                     }
                 }
             }
@@ -746,7 +775,10 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
         }
         for grid in grids {
             <h2 class="text-lg font-semibold mb-3 text-foreground">(grid.title.clone())</h2>
-            <div class=(format!("grid bd-panel-grid gap-3 mb-6 grid-cols-{}", grid.columns.min(6)))
+            // No `grid-cols-N`: the inline `style` below always sets
+            // `grid-template-columns`, which a class can't override, and a
+            // runtime-formatted class name is invisible to Tailwind anyway.
+            <div class="grid bd-panel-grid gap-3 mb-6"
                 style=(style_string(&format!("--bd-cols: {}; grid-template-columns: repeat({}, minmax(0, 1fr));", grid.columns, grid.columns), &style_override_to_css(grid.style.as_ref())))
             >
                 for (ri, row) in grid.rows.iter().enumerate() {
@@ -915,7 +947,13 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
                 }
             </div>
         }
-        if grids_empty {
+        if read_error.is_some() {
+            // The reason is server-side detail (paths, DuckDB internals), so
+            // only the fact is shown; the log line carries the rest.
+            <div class="rounded-xl border-2 border-dashed border-border p-8 text-center text-muted-foreground">
+                "Could not read the database. The daemon logged the error — check its output."
+            </div>
+        } else if grids_empty {
             <div class="rounded-xl border-2 border-dashed border-border p-8 text-center text-muted-foreground">
                 "No panels configured. Add sources and layouts to the config file."
             </div>

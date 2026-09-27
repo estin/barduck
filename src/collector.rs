@@ -442,6 +442,10 @@ async fn attempt(
 ) -> PollOutcome {
     if !*setup_done && !try_setup(db, src, cfg).await {
         schedule.advance(false);
+        // Setup is a recorded failed attempt, so it has to move health like
+        // any other failure: a source whose setup never succeeds is exactly
+        // the one that most needs its healthy→failing transition written.
+        refresh_health(db, cfg, src.name(), last_status).await;
         return PollOutcome::failed(requested, "setup command failed".into());
     }
     *setup_done = true;
@@ -638,6 +642,10 @@ async fn loop_stream(
     loop {
         if !*setup_done {
             if !try_setup(&db, &src, &cfg).await {
+                // As on the scheduled path: the recorded setup failure is
+                // what health is derived from, so recompute it here or a
+                // stream whose setup never succeeds never leaves "healthy".
+                refresh_health(&db, &cfg, src.name(), last_status).await;
                 if sleep_or_stopped(shutdown, retry).await {
                     return Ok(());
                 }
@@ -813,10 +821,11 @@ async fn ingest_stream_line(
 
 /// Converts, stores, and logs one already-parsed value (shared by
 /// [`fetch_once`] and [`ingest_stream_line`]); applies a valid threshold
-/// override and refreshes health. `Ok` means the round trip counts as
-/// successful for scheduling purposes; `Err` carries the same message that
-/// was recorded as the attempt's failure, so a caller reporting the outcome
-/// (a forced poll) doesn't have to reconstruct it.
+/// override and refreshes health. `Ok` means the whole round trip — reading
+/// *and* its log row — counts as successful for scheduling purposes; `Err`
+/// carries the same message that was recorded as the attempt's failure, so
+/// a caller reporting the outcome (a forced poll) doesn't have to
+/// reconstruct it.
 pub(crate) async fn store_parsed_value(
     db: &Db,
     cfg: &Config,
@@ -845,19 +854,31 @@ pub(crate) async fn store_parsed_value(
                 tracing::error!("insert reading `{name}`: {e:#}");
             }
             match &stored {
-                Ok(()) => {
-                    if let Err(e) = db
-                        .insert_log(name, ms, None, Some(&parsed.value), origin)
-                        .await
-                    {
+                Ok(()) => match db
+                    .insert_log(name, ms, None, Some(&parsed.value), origin)
+                    .await
+                {
+                    Ok(()) => {
+                        if let Some(bands) = &parsed.threshold {
+                            db.set_session_bands(name, bands);
+                        }
+                        refresh_health_opt(db, cfg, name, last_status).await;
+                        Ok(())
+                    }
+                    // The reading landed but its log row did not, and that
+                    // row is what health's failure streak, the restart
+                    // resume point and the Logs view all read — so the
+                    // attempt is a failed one, not a clean success with
+                    // no record. (A second `record_failure` write would
+                    // hit the same broken table, so only the returned
+                    // error carries the detail.)
+                    Err(e) => {
                         tracing::error!("insert log `{name}`: {e:#}");
+                        let msg = format!("fetched but failed to log: {e:#}");
+                        refresh_health_opt(db, cfg, name, last_status).await;
+                        Err(msg)
                     }
-                    if let Some(bands) = &parsed.threshold {
-                        db.set_session_bands(name, bands);
-                    }
-                    refresh_health_opt(db, cfg, name, last_status).await;
-                    Ok(())
-                }
+                },
                 Err(e) => {
                     let msg = format!("fetched but failed to store: {e:#}");
                     record_failure(db, name, ms, &msg).await;
@@ -934,29 +955,43 @@ pub async fn collect_once(db: &Db, cfg: &Config) {
 /// root's command once, fans out to every declared child, and returns just
 /// `src`'s own resulting outcome (spec: data-collection — Force polling a
 /// composite source or its children).
+///
+/// A declared `setup` gates the fetch here exactly as it does on a
+/// collector task, and runs on whichever source owns the command — a
+/// child's composite root, not the child (spec: data-collection — setup
+/// gates first fetch).
 pub async fn poll_once(db: &Db, cfg: &Config, src: &SourceCfg) -> PollOutcome {
     let name = src.name();
-    if let Some(parent) = src.parent() {
-        let Some(root) = cfg.sources.iter().find(|s| s.name() == parent) else {
-            return PollOutcome::failed(name, format!("composite root `{parent}` not found"));
-        };
-        let mut last_status = db
-            .last_health(parent)
-            .await
-            .unwrap_or(None)
-            .unwrap_or_else(|| "healthy".into());
-        let mut result = composite_fetch_once(db, cfg, root, &mut last_status).await;
+    // A child's command — and its setup — belong to the composite root
+    // that declares them, so resolve the owner first: setup is run on
+    // whichever source owns the command, exactly where a collector task
+    // runs it, instead of being skipped whenever a composite is involved
+    // (spec: data-collection — setup gates first fetch).
+    let owner = match src.parent() {
+        Some(parent) => match cfg.sources.iter().find(|s| s.name() == parent) {
+            Some(root) => root,
+            None => {
+                return PollOutcome::failed(name, format!("composite root `{parent}` not found"));
+            }
+        },
+        None => src,
+    };
+    if !try_setup(db, owner, cfg).await {
+        return PollOutcome::failed(name, "setup command failed".into());
+    }
+    let mut last_status = db
+        .last_health(owner.name())
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| "healthy".into());
+    if src.parent().is_some() {
+        let mut result = composite_fetch_once(db, cfg, owner, &mut last_status).await;
         return result.children.remove(name).unwrap_or_else(|| {
             PollOutcome::failed(name, "child missing from composite result".into())
         });
     }
-    if src.is_composite() {
-        let mut last_status = db
-            .last_health(name)
-            .await
-            .unwrap_or(None)
-            .unwrap_or_else(|| "healthy".into());
-        return composite_fetch_once(db, cfg, src, &mut last_status)
+    if owner.is_composite() {
+        return composite_fetch_once(db, cfg, owner, &mut last_status)
             .await
             .root;
     }
@@ -964,30 +999,29 @@ pub async fn poll_once(db: &Db, cfg: &Config, src: &SourceCfg) -> PollOutcome {
         Ok(k) => k,
         Err(e) => return PollOutcome::failed(name, format!("{e:#}")),
     };
-    if !try_setup(db, src, cfg).await {
-        return PollOutcome::failed(name, "setup command failed".into());
-    }
-    let mut last_status = db
-        .last_health(name)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_else(|| "healthy".into());
     fetch_once(db, cfg, src, &kind, &mut last_status).await
 }
 
 /// Runs a source's setup command. Returns true when setup is satisfied
 /// (success or not declared); failures are logged and reported as false.
+/// The command's stdout is discarded, not captured: nothing reads it, so
+/// capping it would fail a chatty but successful setup command for the
+/// amount it printed.
 async fn try_setup(db: &Db, src: &SourceCfg, cfg: &Config) -> bool {
     let Some(cmd) = src.setup() else {
         return true;
     };
     let start = Instant::now();
-    let outcome = timeout(src.timeout(), source::run_shell(cmd, &cfg.config_dir)).await;
+    let outcome = timeout(
+        src.timeout(),
+        source::run_shell_discarding_stdout(cmd, &cfg.config_dir),
+    )
+    .await;
     #[allow(clippy::cast_possible_truncation)] // durations fit easily
     let ms = start.elapsed().as_millis() as i64;
     let name = src.name();
     match outcome {
-        Ok(Ok(_)) => {
+        Ok(Ok(())) => {
             tracing::info!("setup for `{name}` succeeded");
             true
         }
@@ -1150,7 +1184,7 @@ async fn record_failure(db: &Db, name: &str, ms: i64, error: &str) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     /// `PollOutcome`'s field names are what the HTTP endpoint writes and
@@ -1313,7 +1347,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            next.saturating_duration_since(before) < std::time::Duration::from_millis(300),
+            next.saturating_duration_since(before) < std::time::Duration::from_secs(1),
             "a source with no prior run must be due immediately"
         );
     }
@@ -1363,7 +1397,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            next.saturating_duration_since(before) < std::time::Duration::from_millis(300),
+            next.saturating_duration_since(before) < std::time::Duration::from_secs(1),
             "a source whose last success is already older than its interval must be due immediately"
         );
     }
@@ -1420,7 +1454,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            next.saturating_duration_since(before) < std::time::Duration::from_millis(300),
+            next.saturating_duration_since(before) < std::time::Duration::from_secs(1),
             "a source whose last failure is already older than its retry interval must be due immediately"
         );
     }
@@ -1848,8 +1882,10 @@ mod tests {
     async fn composite_fetch_marks_root_and_every_child_polling() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        // Long enough that observing the polling mark cannot race the end of
+        // the fetch, whatever the machine does while the test runs.
         let cfg = composite_cfg(
-            r#"sleep 0.3; echo '[{"source":"load::1m","value":"0.1"},{"source":"load::5m","value":"0.2"}]'"#,
+            r#"sleep 2; echo '[{"source":"load::1m","value":"0.1"},{"source":"load::5m","value":"0.2"}]'"#,
             &["1m", "5m"],
         );
         let root = cfg
@@ -1862,8 +1898,17 @@ mod tests {
         let cfg2 = cfg.clone();
         let handle = tokio::spawn(async move { poll_once(&db2, &cfg2, &root).await });
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(db.is_polling("load"), "root should be polling");
+        // Wait for the mark rather than sleeping a guessed interval: it is
+        // set only after the database has opened and the previous health has
+        // been read, so how long that takes is a property of the machine, not
+        // of the test.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !db.is_polling("load") {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("root should be marked polling while its command runs");
         assert!(db.is_polling("load::1m"), "child 1m should be polling");
         assert!(db.is_polling("load::5m"), "child 5m should be polling");
 
@@ -1871,5 +1916,211 @@ mod tests {
         assert!(!db.is_polling("load"));
         assert!(!db.is_polling("load::1m"));
         assert!(!db.is_polling("load::5m"));
+    }
+
+    /// A composite root carrying a declared `setup`, expanded the way
+    /// `config::load` would.
+    fn composite_cfg_with_setup(setup: &str) -> Config {
+        let mut cfg = composite_cfg(r#"echo '[{"source":"load::1m","value":"0.1"}]'"#, &["1m"]);
+        let root = cfg.sources.iter_mut().find(|s| s.name() == "load").unwrap();
+        if let SourceCfg::Query {
+            setup: declared, ..
+        } = root
+        {
+            *declared = Some(setup.to_string());
+        }
+        cfg
+    }
+
+    /// A composite root's `setup` gates the direct path exactly as it
+    /// gates a collector task: polling the root, or any one of its
+    /// children, runs it first (spec: data-collection — setup gates first
+    /// fetch).
+    #[tokio::test]
+    async fn poll_once_runs_a_composite_roots_setup_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("setup-ran");
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = composite_cfg_with_setup(&format!("touch {}", marker.display()));
+        let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap();
+
+        assert!(poll_once(&db, &cfg, root).await.success);
+        assert!(marker.exists(), "polling the root skipped its setup");
+
+        std::fs::remove_file(&marker).unwrap();
+        assert!(
+            poll_once(&db, &cfg, find_child(&cfg, "load::1m"))
+                .await
+                .success
+        );
+        assert!(marker.exists(), "polling a child skipped its root's setup");
+    }
+
+    /// A composite root whose setup fails fetches nothing at all, and says
+    /// so (spec: data-collection — setup gates first fetch).
+    #[tokio::test]
+    async fn poll_once_on_a_composite_root_whose_setup_fails_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let cfg = composite_cfg_with_setup("exit 1");
+        let root = cfg.sources.iter().find(|s| s.name() == "load").unwrap();
+
+        let outcome = poll_once(&db, &cfg, root).await;
+
+        assert!(!outcome.success, "{outcome:?}");
+        assert_eq!(outcome.error.as_deref(), Some("setup command failed"));
+        assert!(db.latest_values().await.unwrap().is_empty());
+    }
+
+    /// A setup command that prints far more than a reading's output cap is
+    /// still a success: its stdout is discarded, never captured, so
+    /// `apt-get`-scale chatter no longer fails the source for good (spec:
+    /// data-collection — setup gates first fetch).
+    #[tokio::test]
+    async fn a_chatty_setup_command_does_not_fail_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        // Twice the 1 MiB a captured reading is capped at, which used to
+        // fail this source's setup on every single poll.
+        let src: SourceCfg = toml::from_str(&format!(
+            "name = \"s\"\ntype = \"query\"\ncommand = \"echo 7\"\nsetup = \"yes x | head -c {}\"\n",
+            2usize << 20
+        ))
+        .unwrap();
+        let cfg = Config {
+            sources: vec![src.clone()],
+            ..Config::default()
+        };
+
+        let outcome = poll_once(&db, &cfg, &src).await;
+
+        assert!(outcome.success, "{outcome:?}");
+    }
+
+    /// A reading that cannot be logged is a failed attempt, not a clean
+    /// success: the log row is what health's failure streak, the restart
+    /// resume point and the Logs view all read, so a value stored with no
+    /// row would be invisible to all three (spec: data-collection — fetch
+    /// attempts logged).
+    #[tokio::test]
+    async fn a_fetch_whose_log_write_fails_is_reported_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let db = Db::open_rw(&path).unwrap();
+        let cfg = Config::default();
+        let src = query_source("s", "echo 42", None);
+        let kind = source::build(&src).unwrap();
+        let mut status = "healthy".to_string();
+        // `fetch_logs` draws its id from this sequence, so dropping it
+        // breaks every log write while `readings` keeps accepting rows.
+        duckdb::Connection::open(&path)
+            .unwrap()
+            .execute("DROP SEQUENCE fetch_logs_id_seq", [])
+            .unwrap();
+
+        let outcome = fetch_once(&db, &cfg, &src, &kind, &mut status).await;
+
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("failed to log")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            db.history("s", None, None, None).await.unwrap().len(),
+            1,
+            "the reading itself did land"
+        );
+        assert!(db.logs(Some("s"), 10).await.unwrap().is_empty());
+    }
+
+    /// A query source whose setup never succeeds goes failing like any
+    /// other repeatedly failing source: the transition has to be recorded,
+    /// or a source that has never fetched a thing still reports healthy
+    /// forever (spec: data-collection — consecutive failures flip to
+    /// failing).
+    #[tokio::test]
+    async fn a_scheduled_source_whose_setup_keeps_failing_records_its_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let src: SourceCfg = toml::from_str(
+            "name = \"s\"\ntype = \"query\"\ncommand = \"echo 1\"\nsetup = \"exit 1\"\ninterval = \"1h\"\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            failure_threshold: 1,
+            sources: vec![src.clone()],
+            ..Config::default()
+        };
+        let kind = source::build(&src).unwrap();
+        let mut status = "healthy".to_string();
+        let mut setup_done = false;
+        let mut schedule = Schedule::new(&db, &src).await.unwrap();
+
+        let outcome = attempt(
+            &db,
+            &cfg,
+            &src,
+            &kind,
+            &mut status,
+            &mut setup_done,
+            &mut schedule,
+            src.name(),
+        )
+        .await;
+
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(!setup_done, "a failed setup must be retried");
+        assert_eq!(
+            db.last_health("s").await.unwrap().as_deref(),
+            Some("failing"),
+            "a setup that never succeeds must still flip health"
+        );
+    }
+
+    /// The same for a stream source, which retries setup on
+    /// `retry_interval` instead of on a schedule tick (spec: data-collection
+    /// — Stream collection).
+    #[tokio::test]
+    async fn a_stream_whose_setup_keeps_failing_records_its_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        let watcher = db.clone();
+        let src: SourceCfg = toml::from_str(
+            "name = \"s\"\ntype = \"stream\"\ncommand = \"true\"\nsetup = \"exit 1\"\nexpected_interval = \"30s\"\nretry_interval = \"1h\"\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            failure_threshold: 1,
+            sources: vec![src.clone()],
+            ..Config::default()
+        };
+        // The sender is held for the whole test: dropping it would close
+        // the channel and end the loop on its first setup retry.
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut shutdown = Some(rx);
+        let mut status = "healthy".to_string();
+        let mut setup_done = false;
+        let task = tokio::spawn(async move {
+            loop_stream(db, src, cfg, &mut status, &mut setup_done, &mut shutdown).await
+        });
+
+        let flipped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if watcher.last_health("s").await.unwrap().as_deref() == Some("failing") {
+                    break true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        task.abort();
+
+        assert!(
+            flipped.is_ok_and(|f| f),
+            "a stream whose setup never succeeds must still flip health"
+        );
     }
 }

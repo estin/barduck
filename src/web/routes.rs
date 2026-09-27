@@ -37,10 +37,16 @@ use topcoat::{
 };
 
 /// Declared once and reused by every page: two independent
-/// `fontsource_font!(GEIST)` call sites would each register their own font
-/// route, colliding on `.discover()` (`duplicate route registered for GET
+/// `fontsource_font!` call sites would each register their own font route,
+/// colliding on `.discover()` (`duplicate route registered for GET
 /// /_topcoat/fonts/...`).
-const GEIST: Font = fontsource_font!(GEIST);
+///
+/// Only the weights and style the UI actually uses, and no italics: an
+/// unqualified `fontsource_font!` pulls every face the family ships, and each
+/// one becomes a `<link rel=preload>` on every page load — 18 woff2 files
+/// for a dashboard that renders `font-normal`/`font-medium`/`font-semibold`/
+/// `font-bold` and nothing else.
+const GEIST: Font = fontsource_font!(GEIST, weight: [400, 500, 600, 700], style: Normal);
 
 /// Frontend-initiated ping/pong: polls `/api/ping` and reflects reachability
 /// in the connection indicator, independent of the panel-refresh shard
@@ -207,24 +213,13 @@ const POLL_SCRIPT: &str = r"(function () {
 /// `#[component]` has no network endpoint of its own, so its parameters are
 /// ordinary Rust values fixed once per real request, unlike a `#[shard]`'s.
 #[component]
-pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<String>) -> Result<impl View> {
+pub(super) async fn page_chrome(
+    cx: &Cx,
+    title: String,
+    view_source: Option<String>,
+) -> Result<impl View> {
     let theme = theme_class(cx);
     let st = app_context::<AppState>(cx);
-    let pollable = view_source.as_ref().is_some_and(|name| {
-        st.cfg
-            .sources
-            .iter()
-            .find(|s| s.name() == name)
-            .is_some_and(|s| crate::collector::unpollable_reason(s).is_none())
-    });
-    // `page_chrome` is a `#[component]`, fixed once per real request — not a
-    // `#[shard]` that re-renders on the tick like `log_rows` does — so this
-    // reflects "polling as of page load" only, unlike the always-live marker
-    // `panels_grid`'s own panels show (spec: web-ui — poll-in-progress is
-    // visible).
-    let polling = view_source
-        .as_ref()
-        .is_some_and(|name| st.db.is_polling(name));
     // Read once per log-view request and pass as fixed shard args (design
     // D7): the runtime re-invokes `log_rows` on every tick with the same
     // values, preserving page/filter state across the 5 s refresh. Topcoat
@@ -322,18 +317,15 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
                     <div id="bd-panel-wrapper">
                         if let Some(source) = &view_source {
                             <a href="/" class="text-xs opacity-60 hover:opacity-100 hover:underline">"← Back to dashboard"</a>
-                            <h2 class="text-xl font-bold mt-2 mb-4 text-foreground flex items-center gap-3">
-                                "Fetch logs — "(source.clone())
-                                // Every panel links here, so a source with no
-                                // control of its own on a compact group card
-                                // still has one a click away (spec: web-ui —
-                                // Panels can force a poll).
-                                if pollable {
-                                    <span class="text-xs font-normal">
-                                        poll_button(source: source.clone(), polling: polling)
-                                    </span>
-                                }
-                            </h2>
+                            // The heading (and the poll control it carries) is
+                            // rendered by the `log_rows` shard, not here:
+                            // `page_chrome` is fixed once per real request, so
+                            // a poll control placed here would keep claiming
+                            // "poll now" for the whole duration of a running
+                            // fetch and queue another one on every click,
+                            // while the panels' own controls — inside the
+                            // `panels_grid` shard — do reflect it (spec:
+                            // web-ui — poll-in-progress is visible).
                             log_rows(
                                 source: $(source.clone()),
                                 tick: $(tick.get()),
@@ -349,10 +341,10 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
                         "barduck v"(config::VERSION)
                     </footer>
                 </div>
-                <script>(Unescaped::new_unchecked(CONNECTION_SCRIPT.to_string()))</script>
-                <script>(Unescaped::new_unchecked(FAVICON_SCRIPT.to_string()))</script>
-                <script>(Unescaped::new_unchecked(THEME_TOGGLE_SCRIPT.to_string()))</script>
-                <script>(Unescaped::new_unchecked(POLL_SCRIPT.to_string()))</script>
+                <script>(Unescaped::new_unchecked(CONNECTION_SCRIPT))</script>
+                <script>(Unescaped::new_unchecked(FAVICON_SCRIPT))</script>
+                <script>(Unescaped::new_unchecked(THEME_TOGGLE_SCRIPT))</script>
+                <script>(Unescaped::new_unchecked(POLL_SCRIPT))</script>
             </body>
         </html>
     })
@@ -364,7 +356,7 @@ pub(super) async fn page_chrome(cx: &Cx, title: String, view_source: Option<Stri
 /// full page reload.
 #[page("/")]
 pub async fn dashboard(cx: &Cx) -> Result<impl View> {
-    let _st = app_context::<AppState>(cx);
+    let _ = cx;
     Ok(view! { page_chrome(title: "barduck".to_string(), view_source: None) })
 }
 
@@ -435,11 +427,24 @@ pub(super) async fn log_rows(
     // before SQL/pager use; Db clamps them again.
     let limit = clamp_shard_integer(limit, 1, crate::db::MAX_LOGS_LIMIT);
     let offset = clamp_shard_integer(offset, 0, i64::MAX);
-    let rows = st
+    // Re-read on every tick, unlike in `page_chrome`: this is what makes the
+    // heading's poll control reflect an in-flight fetch (spec: web-ui —
+    // poll-in-progress is visible).
+    let pollable = crate::collector::unpollable_reason(src).is_none();
+    let polling = st.db.is_polling(&source);
+    // A failed query is not "no entries": log it, so a dead reader task
+    // doesn't look like a source that was never polled.
+    let rows = match st
         .db
         .logs_filtered(Some(&source), limit, offset, errors_only)
         .await
-        .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("log view `{source}` rows: {e:#}");
+            Vec::new()
+        }
+    };
     // One health lookup per render (spec: web-ui — log view relative
     // timestamps and threshold coloring): every row shares the same source,
     // so its live health only needs computing once, the same fallback
@@ -461,11 +466,13 @@ pub(super) async fn log_rows(
     // reading rather than `rows[0]` — `rows` can be paginated or
     // error-filtered, so its first entry isn't reliably "the latest value"
     // (design.md — favicon marker decision).
-    let latest = st
-        .db
-        .logs_filtered(Some(&source), 1, 0, false)
-        .await
-        .unwrap_or_default();
+    let latest = match st.db.logs_filtered(Some(&source), 1, 0, false).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("log view `{source}` latest row: {e:#}");
+            Vec::new()
+        }
+    };
     let latest_row = latest.into_iter().next();
     let favicon_level = latest_row
         .as_ref()
@@ -493,6 +500,19 @@ pub(super) async fn log_rows(
 
     Ok(view! {
         <span id="bd-status" data-status=(favicon_status.as_str()) style="display:none"></span>
+        // Every panel links here, so a source with no control of its own on a
+        // compact group card still has one a click away (spec: web-ui —
+        // panels can force a poll). Rendered here rather than in
+        // `page_chrome` so it re-reads `is_polling` on every tick like the
+        // dashboard panels' own controls do.
+        <h2 class="text-xl font-bold mt-2 mb-4 text-foreground flex items-center gap-3">
+            "Fetch logs — "(source.clone())
+            if pollable {
+                <span class="text-xs font-normal">
+                    poll_button(source: source.clone(), polling: polling)
+                </span>
+            }
+        </h2>
         <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
             if errors_only {
                 <a href=(base_href) class="text-sm font-medium text-foreground underline underline-offset-4 hover:opacity-80" title="Showing only failed attempts — click to clear">
@@ -527,8 +547,12 @@ pub(super) async fn log_rows(
                 }
             </div>
         </div>
+        // Narrow row spacing so more entries fit without scrolling (spec:
+        // web-ui — log view table density). Set on the table itself, in
+        // descendant selectors, so the vendored component's own `p-3` /
+        // `text-sm` defaults can't quietly win again.
         table(
-            attrs: attributes! { class="bg-background rounded-xl shadow-sm" },
+            attrs: attributes! { class="bg-background rounded-xl shadow-sm text-xs [&_td]:p-1.5 [&_th]:h-7" },
             table_header(
                 table_row(
                     table_head("TIME")
@@ -548,7 +572,17 @@ pub(super) async fn log_rows(
                         table_cell(attrs: attributes! { class="font-mono" }, (l.origin.to_string()))
                         if let Some(err) = &l.error {
                             table_cell(
-                                attrs: attributes! { class="text-red-500 font-mono" },
+                                attrs: attributes! {
+                                    class="font-mono"
+                                    // The `--status-*` token, not a fixed
+                                    // Tailwind palette value: every other
+                                    // status color in the app routes through
+                                    // it, so the light-mode saturated red
+                                    // doesn't leak into the dark theme
+                                    // (spec: web-ui — consistent token-based
+                                    // visual theme).
+                                    style=(text_style_for_color(Some(config::Level::Red)))
+                                },
                                 <pre class="whitespace-pre-wrap break-all m-0">(err.clone())</pre>
                             )
                         } else {

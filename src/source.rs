@@ -449,14 +449,20 @@ pub async fn debug_stream(cfg: &Config, src: &SourceCfg) -> Result<Vec<DebugRow>
 /// calling [`StreamProc::shutdown`].
 pub struct StreamProc {
     child: ShellProcess,
-    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    lines: tokio::io::Lines<tokio::io::BufReader<Capped<tokio::process::ChildStdout>>>,
 }
 
 impl StreamProc {
-    /// Spawns the platform shell with stdout piped and line-buffered.
+    /// Spawns the platform shell with stdout piped, capped and
+    /// line-buffered.
     pub fn spawn(command: &str, dir: &Path) -> Result<Self> {
-        let mut child = spawn_shell(command, dir, std::process::Stdio::null())
-            .context("spawning stream command")?;
+        let mut child = spawn_shell(
+            command,
+            dir,
+            std::process::Stdio::piped(),
+            std::process::Stdio::null(),
+        )
+        .context("spawning stream command")?;
         let stdout = child
             .child
             .stdout()
@@ -464,7 +470,9 @@ impl StreamProc {
             .context("stream stdout not piped")?;
         Ok(Self {
             child,
-            lines: tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(stdout)),
+            lines: tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(Capped::new(
+                stdout,
+            ))),
         })
     }
 
@@ -533,8 +541,16 @@ impl Drop for ShellProcess {
     }
 }
 
-/// Shared shell selection and tree ownership for queries, setup and streams.
-fn spawn_shell(command: &str, dir: &Path, stderr: std::process::Stdio) -> Result<ShellProcess> {
+/// Shared shell selection and tree ownership for queries, setup and
+/// streams. Both output modes are the caller's: stdout is piped only where
+/// that output *is* a reading, and null where the command runs purely for
+/// its effect.
+fn spawn_shell(
+    command: &str,
+    dir: &Path,
+    stdout: std::process::Stdio,
+    stderr: std::process::Stdio,
+) -> Result<ShellProcess> {
     #[cfg(unix)]
     let mut shell = CommandWrap::with_new("sh", |shell| {
         shell.arg("-c").arg(command);
@@ -550,7 +566,7 @@ fn spawn_shell(command: &str, dir: &Path, stderr: std::process::Stdio) -> Result
     shell
         .command_mut()
         .current_dir(dir)
-        .stdout(std::process::Stdio::piped())
+        .stdout(stdout)
         .stderr(stderr);
     shell.wrap(KillOnDrop);
     #[cfg(unix)]
@@ -577,13 +593,17 @@ const MAX_COMMAND_OUTPUT: usize = 1 << 20; // 1 MiB
 /// Runs a shell command (working directory `dir` — the config file's own
 /// directory, spec: source-configuration — config-relative working
 /// directory) and returns its trimmed stdout; non-zero exit is an error
-/// carrying stderr. Shared by query sources and setup commands. The whole
-/// process tree is cleaned up on completion, cancellation or output errors.
-/// Output past [`MAX_COMMAND_OUTPUT`] fails the fetch rather than being
-/// buffered without limit.
+/// carrying stderr. The whole process tree is cleaned up on completion,
+/// cancellation or output errors. Output past [`MAX_COMMAND_OUTPUT`] fails
+/// the fetch rather than being buffered without limit.
 pub async fn run_shell(command: &str, dir: &Path) -> Result<String> {
-    let mut child = spawn_shell(command, dir, std::process::Stdio::piped())
-        .context("spawning shell command")?;
+    let mut child = spawn_shell(
+        command,
+        dir,
+        std::process::Stdio::piped(),
+        std::process::Stdio::piped(),
+    )
+    .context("spawning shell command")?;
     let stdout = child
         .child
         .stdout()
@@ -598,19 +618,70 @@ pub async fn run_shell(command: &str, dir: &Path) -> Result<String> {
     // fills one pipe's buffer blocks until it is read, so reading them in
     // sequence would deadlock against a command writing to both.
     let output = tokio::try_join!(
-        async { child.wait().await.context("waiting for shell command") },
+        wait_then_reap_tree(&mut child),
         read_capped(stdout, "stdout"),
         read_capped(stderr, "stderr"),
     );
     child.shutdown().await;
     let (status, out, err) = output?;
     if !status.success() {
-        bail!(
-            "command failed ({status}): {}",
-            String::from_utf8_lossy(&err).trim()
-        );
+        return Err(command_failed(status, &err));
     }
     Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// Runs a shell command for its effect alone, throwing its stdout away: a
+/// setup command's output is never read (spec: data-collection — setup
+/// gates first fetch), so capping it would permanently fail a chatty but
+/// perfectly successful one (`apt-get`, a verbose `pip install`) for
+/// printing more than [`MAX_COMMAND_OUTPUT`]. stderr is still captured, so
+/// a non-zero exit names the problem exactly as in [`run_shell`].
+pub async fn run_shell_discarding_stdout(command: &str, dir: &Path) -> Result<()> {
+    let mut child = spawn_shell(
+        command,
+        dir,
+        std::process::Stdio::null(),
+        std::process::Stdio::piped(),
+    )
+    .context("spawning shell command")?;
+    let stderr = child
+        .child
+        .stderr()
+        .take()
+        .context("shell stderr not piped")?;
+    let output = tokio::try_join!(
+        wait_then_reap_tree(&mut child),
+        read_capped(stderr, "stderr")
+    );
+    child.shutdown().await;
+    let (status, err) = output?;
+    if !status.success() {
+        return Err(command_failed(status, &err));
+    }
+    Ok(())
+}
+
+/// Waits for the direct child, then tears down whatever it left behind. A
+/// pipe reaches EOF only once *every* write end is closed — including one
+/// inherited by a descendant the command backgrounded — so without this
+/// the reads outlive the command: `sleep 30 & echo 42` would leave the
+/// shell gone with the right value sitting in the pipe buffer, and the
+/// fetch would be discarded at the source timeout. The child's own output
+/// is already buffered, so the value survives; `terminate` is idempotent,
+/// and the `shutdown` that follows still reaps.
+async fn wait_then_reap_tree(child: &mut ShellProcess) -> Result<std::process::ExitStatus> {
+    let status = child.wait().await.context("waiting for shell command");
+    child.terminate();
+    status
+}
+
+/// The error a non-zero exit reports: its status plus whatever the command
+/// said on stderr, so both shell runners word a failure identically.
+fn command_failed(status: std::process::ExitStatus, stderr: &[u8]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "command failed ({status}): {}",
+        String::from_utf8_lossy(stderr).trim()
+    )
 }
 
 /// Reads `r` to EOF, failing once more than [`MAX_COMMAND_OUTPUT`] bytes
@@ -632,6 +703,50 @@ where
         bail!("command {what} exceeded {MAX_COMMAND_OUTPUT} bytes");
     }
     Ok(buf)
+}
+
+/// Caps the bytes a stream's stdout may deliver, so
+/// [`tokio::io::AsyncBufReadExt::lines`] can't grow one `String` without
+/// bound while waiting for a `\n` a misbehaving command will never send
+/// (`yes`, `cat /dev/urandom`). A stream line is still a dashboard value,
+/// so it gets the same ceiling as a captured one; the resulting read
+/// error ends the stream run the way any other line-read failure does
+/// (spec: data-collection — collector resilience).
+struct Capped<R> {
+    inner: R,
+    read: usize,
+}
+
+impl<R> Capped<R> {
+    const fn new(inner: R) -> Self {
+        Self { inner, read: 0 }
+    }
+}
+
+impl<R> tokio::io::AsyncRead for Capped<R>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut this.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                this.read += buf.filled().len() - before;
+                if this.read > MAX_COMMAND_OUTPUT {
+                    return std::task::Poll::Ready(Err(std::io::Error::other(format!(
+                        "stream stdout exceeded {MAX_COMMAND_OUTPUT} bytes"
+                    ))));
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            pending => pending,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -755,6 +870,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.len(), 1000);
+    }
+
+    /// A command that backgrounds long work and then prints its value must
+    /// still return that value: the pipes reach EOF only when the
+    /// backgrounded descendant lets go of them, so reading to EOF before
+    /// reaping the shell would block out to the source timeout and throw
+    /// away a reading the command had already produced (spec:
+    /// data-collection — collector resilience).
+    #[tokio::test]
+    async fn a_backgrounded_descendant_does_not_hold_up_the_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_shell("sleep 30 & echo 42", dir.path()),
+        )
+        .await;
+        assert!(
+            value.is_ok(),
+            "the read blocked on the backgrounded descendant's pipe"
+        );
+        assert_eq!(value.unwrap().unwrap(), "42");
+    }
+
+    /// A setup command's stdout is thrown away, so being chatty is not a
+    /// failure: it must not be capped the way a reading is (spec:
+    /// data-collection — setup gates first fetch).
+    #[tokio::test]
+    async fn a_discarded_stdout_setup_command_may_exceed_the_output_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        run_shell_discarding_stdout(
+            &format!("yes x | head -c {}", 2 * MAX_COMMAND_OUTPUT),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Discarding stdout costs nothing on failure: a non-zero exit still
+    /// names the command's stderr, exactly as a reading's fetch would.
+    #[tokio::test]
+    async fn a_discarded_stdout_command_still_reports_its_stderr_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_shell_discarding_stdout("echo boom >&2; exit 3", dir.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("boom"), "{err:#}");
+    }
+
+    /// A stream's stdout gets the same ceiling as a captured reading's, so
+    /// a command emitting a newline-free run fails the read instead of
+    /// growing one `String` until the daemon runs out of memory (spec:
+    /// data-collection — collector resilience).
+    #[tokio::test]
+    async fn a_stream_line_past_the_cap_fails_the_read() {
+        let bytes = vec![b'x'; MAX_COMMAND_OUTPUT + 1];
+        let mut reader = tokio::io::BufReader::new(Capped::new(std::io::Cursor::new(bytes)));
+        let mut line = String::new();
+        let err = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
+
+    /// A line *at* the cap is not truncated — the limit must only reject
+    /// what goes past it.
+    #[tokio::test]
+    async fn a_stream_line_within_the_cap_is_delivered_whole() {
+        let bytes = vec![b'x'; MAX_COMMAND_OUTPUT];
+        let mut reader = tokio::io::BufReader::new(Capped::new(std::io::Cursor::new(bytes)));
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+            .await
+            .unwrap();
+        assert_eq!(line.len(), MAX_COMMAND_OUTPUT);
     }
 
     /// A command writing heavily to *both* pipes must not deadlock: the two

@@ -49,8 +49,9 @@ fn internal_error(context: &str, e: &anyhow::Error) -> Response {
     json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
-/// The vendored topcoat browser runtime (see assets/README note in repo);
-/// served here so no external bundler step is needed.
+/// The vendored topcoat browser runtime, compiled into the binary
+/// (`assets/topcoat-runtime.js`) and served from here, so no external
+/// bundler step is needed.
 #[route(GET "/assets/bd-runtime.js")]
 pub async fn runtime_script(_cx: &Cx) -> Result<Response> {
     let js = include_bytes!("../assets/topcoat-runtime.js");
@@ -290,7 +291,12 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
         Ok(p) => p,
         Err(e) => return Ok(json_err(StatusCode::BAD_REQUEST, &e)),
     };
-    let _ = collector::store_parsed_value(
+    // A value that was parsed but not persisted is a server-side failure, and
+    // the client has to be able to tell it apart from a delivered one: the
+    // reading is absent while a *failure* row went into the fetch log. The
+    // schedule reset below is also skipped, since nothing was stored for the
+    // source's interval to resume from.
+    if let Err(msg) = collector::store_parsed_value(
         &st.db,
         &st.cfg,
         src,
@@ -299,7 +305,13 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
         elapsed_ms(),
         Origin::Push,
     )
-    .await;
+    .await
+    {
+        return Ok(internal_error(
+            &format!("POST /api/ingest source `{}`", src.name()),
+            &anyhow::anyhow!("{msg}"),
+        ));
+    }
     // Move the source's interval wait to the success path; cron and stream
     // sources have no sender and are unaffected (spec: data-collection —
     // Ingested values reset interval schedules). A closed channel only

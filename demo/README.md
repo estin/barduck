@@ -82,8 +82,10 @@ Then:
   same way and does show one. `domain-expiry` in `secondary` shows no bar
   either, but for a different reason — `secondary` never renders one,
   regardless of thresholds, since it only ever shows a plain colored value.
-- **Value formats** — `weekly-report` renders markdown (headings, bold, lists)
-  and `status-json` pretty-prints its JSON payload.
+- **Value formats** — `weekly-report` renders markdown (headings, bold, lists).
+  `status-json` is also `format = "markdown"`, so its raw JSON payload is
+  displayed exactly as the command printed it — one line, verbatim. Nothing
+  pretty-prints or reformats it, and the web UI has no JSON renderer.
 - **Static-text panels** — "Quick Links" (next to `weekly-report`) is a
   standalone `{ text = "..." }` layout cell, not a source: no `[[sources]]`
   entry, no schedule, no health, no log view, no summary-strip chip. Its

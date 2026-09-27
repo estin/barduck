@@ -172,6 +172,40 @@ enum WriteCmd {
     },
 }
 
+/// Deletes every row older than `cutoff_epoch` across the three append-only
+/// tables, in one transaction. All-or-nothing matters: health's
+/// consecutive-failure counts and schedule resumption both read
+/// `fetch_logs`, so a half-applied purge (readings gone, logs kept, or the
+/// reverse) leaves the two disagreeing. Shared by the writer task's
+/// [`WriteCmd::PurgeOlderThan`] and the direct-mode path, so the statement
+/// list exists once.
+fn purge_older_than(conn: &Connection, cutoff_epoch: f64) -> Result<()> {
+    conn.execute_batch("BEGIN TRANSACTION")?;
+    let deleted = (|| -> Result<()> {
+        conn.execute(
+            "DELETE FROM readings WHERE ts_epoch < ?",
+            params![cutoff_epoch],
+        )?;
+        conn.execute(
+            "DELETE FROM fetch_logs WHERE ts_epoch < ?",
+            params![cutoff_epoch],
+        )?;
+        conn.execute(
+            "DELETE FROM health_events WHERE ts_epoch < ?",
+            params![cutoff_epoch],
+        )?;
+        Ok(())
+    })();
+    if deleted.is_ok() {
+        conn.execute_batch("COMMIT")?;
+        return Ok(());
+    }
+    // Roll back before reporting: leaving the transaction open would pin
+    // every later write on this connection behind an abandoned one.
+    let _ = conn.execute_batch("ROLLBACK");
+    deleted
+}
+
 impl WriteCmd {
     /// Executes this command against the writer's persistent connection,
     /// taking the advisory lock only for this one statement.
@@ -247,21 +281,7 @@ impl WriteCmd {
                 cutoff_epoch,
                 reply,
             } => (
-                db.with_lock(|| {
-                    conn.execute(
-                        "DELETE FROM readings WHERE ts_epoch < ?",
-                        params![cutoff_epoch],
-                    )?;
-                    conn.execute(
-                        "DELETE FROM fetch_logs WHERE ts_epoch < ?",
-                        params![cutoff_epoch],
-                    )?;
-                    conn.execute(
-                        "DELETE FROM health_events WHERE ts_epoch < ?",
-                        params![cutoff_epoch],
-                    )?;
-                    Ok(())
-                }),
+                db.with_lock(|| purge_older_than(conn, cutoff_epoch)),
                 reply,
             ),
         };
@@ -568,6 +588,15 @@ pub const MAX_HISTORY_LIMIT: i64 = 10_000;
 /// (which `DuckDB` treats as unbounded) can force a full-table scan.
 pub const MAX_LOGS_LIMIT: i64 = 10_000;
 
+/// How many full pages deep [`Db::logs_filtered`] will follow an `OFFSET`,
+/// in units of [`MAX_LOGS_LIMIT`]. The web log view's page number is a `u32`
+/// taken straight from the query string, so without a ceiling
+/// `?page=4294967295` asks `DuckDB` to skip ~4·10^13 rows it can only produce
+/// by scanning — an unbounded read from one link. Pages past this are empty
+/// for any database this app can plausibly hold, so the cap costs nothing
+/// real and bounds the scan.
+pub const MAX_LOGS_OFFSET_PAGES: i64 = 1_000;
+
 pub(crate) fn now() -> (f64, String) {
     let t: DateTime<Utc> = Utc::now();
     (t.timestamp_millis() as f64 / 1000.0, t.to_rfc3339())
@@ -648,11 +677,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
 /// same as every operation that follows. Shared by both tasks' initial open
 /// and their post-panic reconnect.
 fn open_daemon_conn(db: &Db) -> Result<Connection> {
-    db.acquire().and_then(|guard| {
-        let c = db.connect();
-        drop(guard);
-        c
-    })
+    // `acquire_and_connect` releases the advisory lock between connect
+    // attempts, so a stalled open can't park every other process' `acquire`
+    // for its whole retry window. The guard is dropped on return: the
+    // connection stays valid without it, the same as before.
+    db.acquire_and_connect().map(|(_guard, conn)| conn)
 }
 
 /// Starts the daemon's single writer task (spec: data-storage — single
@@ -702,11 +731,18 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
                 // in an unknown state — there's no reliable way to tell, so
                 // reopen rather than risk every subsequent write silently
                 // failing against a wedged connection until the daemon
-                // restarts.
+                // restarts. A reopen that fails leaves no usable connection
+                // at all: stop here and fail every queued command, exactly as
+                // the initial-open failure does, rather than keep serving
+                // writes on the suspect one.
                 match open_daemon_conn(&db) {
                     Ok(fresh) => conn = fresh,
                     Err(e) => {
                         tracing::error!("db writer: failed to reopen after panic: {e:#}");
+                        while let Some(cmd) = rx.blocking_recv() {
+                            cmd.fail(&e);
+                        }
+                        return;
                     }
                 }
             }
@@ -777,10 +813,18 @@ fn spawn_reader(
                     "db reader: read command panicked: {}",
                     panic_message(&panic)
                 );
+                // As in the writer: a reclone that fails leaves the suspect
+                // connection in place, so stop and fail queued reads rather
+                // than serve every later read from a connection whose state
+                // is unknown.
                 match clone_writer_conn(&handle, &writer) {
                     Ok(fresh) => conn = fresh,
                     Err(e) => {
                         tracing::error!("db reader: failed to reclone after panic: {e:#}");
+                        while let Some(cmd) = rx.blocking_recv() {
+                            cmd.fail(&e);
+                        }
+                        return;
                     }
                 }
             }
@@ -1184,23 +1228,22 @@ impl Db {
         .context(format!("opening database {}", self.path.display()))
     }
 
-    /// Opens a `DuckDB` connection, retrying on transient conflicts. Blocking
-    /// — same caveat as [`Db::acquire`].
-    fn connect(&self) -> Result<Connection> {
-        self.retrying(|_| Ok(()), |(), conn| conn)
-    }
-
-    /// Blocking retry loop combining [`Db::acquire`] and [`Db::connect`],
-    /// run entirely on a `spawn_blocking` thread by [`Db::connect_async`] so
-    /// none of its sleeps ever park a Tokio worker.
+    /// Blocking retry loop combining [`Db::acquire_once`] and
+    /// [`Db::open_connection`], run entirely on a `spawn_blocking` thread by
+    /// [`Db::connect_async`] so none of its sleeps ever park a Tokio worker.
+    ///
+    /// The lock is taken once per *outer* attempt, never retried inside it:
+    /// pairing [`Db::acquire`] (its own 50 × 100 ms loop) with `retrying`'s
+    /// 50 outer attempts would multiply into a ~255 s budget, hanging every
+    /// direct-mode read and write for minutes under contention.
     fn acquire_and_connect(&self) -> Result<(DbLock, Connection)> {
-        self.retrying(Db::acquire, |guard, conn| (guard, conn))
+        self.retrying(Db::acquire_once, |guard, conn| (guard, conn))
     }
 
-    /// Shared retry loop: take `prelude` (the advisory lock, or nothing),
-    /// then open a connection, backing off and retrying while the failure is
-    /// a transient lock conflict. Any lock taken is released before each
-    /// sleep, so a competing process can make progress.
+    /// Shared retry loop: take `prelude` (the advisory lock), then open a
+    /// connection, backing off and retrying while the failure is a transient
+    /// lock conflict. Any lock taken is released before each sleep, so a
+    /// competing process can make progress.
     fn retrying<P, T>(
         &self,
         prelude: impl Fn(&Self) -> Result<P>,
@@ -1237,10 +1280,10 @@ impl Db {
     /// its whole lifetime (spec: data-storage — single daemon writer,
     /// resident reader connection), which no amount of waiting clears. So
     /// this is deliberately a single immediate attempt, unlike
-    /// [`Db::connect`]'s retry loop: it exists to let a direct-mode caller
-    /// decide *now* to go through the daemon's HTTP API instead (spec: cli —
-    /// dual modes), rather than spend seconds retrying an open that cannot
-    /// succeed.
+    /// [`Db::acquire_and_connect`]'s retry loop: it exists to let a
+    /// direct-mode caller decide *now* to go through the daemon's HTTP API
+    /// instead (spec: cli — dual modes), rather than spend seconds retrying
+    /// an open that cannot succeed.
     ///
     /// Failing to take the *advisory* lock is not reported as a conflict:
     /// that means another short-lived process is mid-operation, which really
@@ -1266,8 +1309,12 @@ impl Db {
     }
 
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let _guard = self.acquire()?;
-        let conn = self.connect()?;
+        // `acquire_and_connect`, not `acquire` + `connect`: holding the
+        // advisory lock across `connect`'s own retry loop would park every
+        // other process's `acquire` for the whole window, breaking the
+        // "any lock taken is released before each sleep" invariant `retrying`
+        // documents.
+        let (_guard, conn) = self.acquire_and_connect()?;
         f(&conn)
     }
 
@@ -1553,7 +1600,10 @@ impl Db {
 
     /// Fetch logs with optional error-only filter and pagination (spec: web-ui).
     /// `limit` and `offset` are clamped to valid ranges; `errors_only` filters
-    /// to rows with a non-null `error`.
+    /// to rows with a non-null `error`. The offset bound matters as much as
+    /// the limit: `OFFSET` is served by no index, so a `?page=` far past the
+    /// end (a u32 page number times the page size) makes `DuckDB` materialize
+    /// and discard every matching row.
     pub async fn logs_filtered(
         &self,
         source: Option<&str>,
@@ -1563,7 +1613,7 @@ impl Db {
     ) -> Result<Vec<LogRow>> {
         let sources: Vec<String> = source.map(str::to_string).into_iter().collect();
         let limit = limit.clamp(1, MAX_LOGS_LIMIT);
-        let offset = offset.max(0);
+        let offset = offset.clamp(0, MAX_LOGS_LIMIT.saturating_mul(MAX_LOGS_OFFSET_PAGES));
         if let Some(reader) = &self.reader {
             let (reply, rx) = oneshot::channel();
             reader
@@ -1675,19 +1725,7 @@ impl Db {
             return rx.await.context("db writer task dropped the reply")?;
         }
         let (_guard, conn) = self.connect_async().await?;
-        conn.execute(
-            "DELETE FROM readings WHERE ts_epoch < ?",
-            params![cutoff_epoch],
-        )?;
-        conn.execute(
-            "DELETE FROM fetch_logs WHERE ts_epoch < ?",
-            params![cutoff_epoch],
-        )?;
-        conn.execute(
-            "DELETE FROM health_events WHERE ts_epoch < ?",
-            params![cutoff_epoch],
-        )?;
-        Ok(())
+        purge_older_than(&conn, cutoff_epoch)
     }
 }
 
@@ -1907,6 +1945,105 @@ mod tests {
 
         let last = db.last_success("a").await.unwrap().unwrap();
         assert_eq!(last.value.as_deref(), Some("second"));
+    }
+
+    /// `reset` is the only path that drops the schema outright, so it has to
+    /// leave a database that is *usable*, not merely empty: every table and
+    /// sequence has to come back, or the next write fails until the file is
+    /// deleted by hand.
+    #[tokio::test]
+    async fn reset_empties_the_database_and_leaves_it_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_reading("cpu", "42", None, None, None, None)
+            .await
+            .unwrap();
+        db.insert_log("cpu", 1, None, Some("42"), Origin::Poll)
+            .await
+            .unwrap();
+
+        db.reset().unwrap();
+
+        assert!(db.latest_values().await.unwrap().is_empty());
+        assert!(db.logs(None, 50).await.unwrap().is_empty());
+        // The schema itself is back: the ids' sequences in particular are
+        // dropped and recreated, and a stale one would reject every write.
+        db.insert_reading("cpu", "43", None, None, None, None)
+            .await
+            .unwrap();
+        let after = db.latest_values().await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].value, "43");
+    }
+
+    /// Retention deletes across three tables, and the logs one is what
+    /// health's consecutive-failure count and schedule resumption read, so a
+    /// cutoff past some rows but not others must leave the two agreeing
+    /// (spec: data-storage — retention).
+    #[tokio::test]
+    async fn purge_removes_old_rows_from_every_table_and_keeps_recent_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO readings (id, source, value, unit, ts_epoch, ts)
+                 SELECT nextval('readings_id_seq'), 'cpu', 'old', NULL, 100, 't'
+                 FROM range(2);
+                INSERT INTO fetch_logs (id, source, ts_epoch, ts, duration_ms, error, value, origin)
+                 SELECT nextval('fetch_logs_id_seq'), 'cpu', 100, 't', 1, 'boom', NULL, 'poll'
+                 FROM range(2);
+                INSERT INTO health_events (id, source, ts_epoch, ts, status)
+                 SELECT nextval('health_events_id_seq'), 'cpu', 100, 't', 'failing'
+                 FROM range(2);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // A recent row in each of the two tables the API reads back: the
+        // purge must leave it alone, so "everything is gone" is not a
+        // passing result.
+        db.insert_reading("cpu", "fresh", None, None, None, None)
+            .await
+            .unwrap();
+        db.insert_log("cpu", 1, None, Some("fresh"), Origin::Poll)
+            .await
+            .unwrap();
+
+        db.purge_older_than(1_000.0).await.unwrap();
+
+        let latest = db.latest_values().await.unwrap();
+        assert_eq!(latest.len(), 1, "only the old readings should be gone");
+        assert_eq!(latest[0].value, "fresh");
+        let logs = db.logs(Some("cpu"), 50).await.unwrap();
+        assert_eq!(logs.len(), 1, "only the old fetch logs should be gone");
+        assert_eq!(
+            db.health_inputs(10)
+                .await
+                .unwrap()
+                .recent
+                .get("cpu")
+                .map_or(0, Vec::len),
+            1,
+            "the failure streak reads these rows, so they are purged together"
+        );
+    }
+
+    /// A page number from the query string is attacker-controlled and reaches
+    /// `OFFSET` unindexed, so a far-out-of-range page is clamped rather than
+    /// turned into a full-table scan.
+    #[tokio::test]
+    async fn logs_filtered_clamps_a_far_out_of_range_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_rw(&dir.path().join("t.duckdb")).unwrap();
+        db.insert_reading("cpu", "42", None, None, None, None)
+            .await
+            .unwrap();
+
+        let rows = db
+            .logs_filtered(Some("cpu"), 10, i64::MAX, false)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "a clamped offset is past the last row");
     }
 
     /// A quiet source's rows survive the global limit when filtered by

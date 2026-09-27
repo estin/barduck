@@ -106,7 +106,14 @@ fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Con
         .with_context(|| format!("reading config {}", path.display()))?;
     let mut cfg: Config =
         toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
-    cfg.config_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // `Path::parent` yields `Some("")` for a bare relative path like
+    // `config.toml` — treat that as `.` so `config_dir.join(...)` and
+    // `Command::current_dir(config_dir)` resolve against the launch
+    // directory instead of failing with ENOENT.
+    cfg.config_dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
     // Env overrides apply before the relative-path resolution below, so a
     // `BARDUCK_DATABASE_PATH` override is resolved against the config file's
     // own directory exactly like a TOML-declared one — not the process's
@@ -121,17 +128,30 @@ fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Con
     Ok(cfg)
 }
 pub fn validate(cfg: &Config) -> Result<()> {
-    if cfg.history_points == 0 {
-        bail!("history_points must be > 0");
+    // `history_points` sizes a per-panel allocation in the web renderer,
+    // while the DB read behind it is capped at `MAX_HISTORY_LIMIT` — a
+    // larger value can only pad with empty entries, so bound it to the cap.
+    if cfg.history_points == 0 || i64::from(cfg.history_points) > crate::db::MAX_HISTORY_LIMIT {
+        bail!(
+            "history_points must be in 1..={}",
+            crate::db::MAX_HISTORY_LIMIT
+        );
     }
     if cfg.logs_per_page == 0 {
         bail!("logs_per_page must be > 0");
     }
-    if cfg.failure_threshold == 0 {
-        // `health::compute` treats "0 consecutive failures >= threshold" as
-        // failing, so a 0 threshold would mark every source permanently
-        // failing from its very first health check, healthy or not.
-        bail!("failure_threshold must be > 0");
+    // `failure_threshold` counts consecutive failures from the newest
+    // `failure_threshold` log rows, but `db.logs`/`db.health_inputs` clamp
+    // that row count to `MAX_LOGS_LIMIT` — a larger threshold could never be
+    // reached, so the source would degrade to `stale` instead of `failing`.
+    // A 0 threshold would likewise mark every source permanently failing
+    // from its very first health check (spec: data-collection — consecutive
+    // failures flip to failing).
+    if cfg.failure_threshold == 0 || i64::from(cfg.failure_threshold) > crate::db::MAX_LOGS_LIMIT {
+        bail!(
+            "failure_threshold must be in 1..={}",
+            crate::db::MAX_LOGS_LIMIT
+        );
     }
     if let Some(r) = cfg.retention
         && r.is_zero()
@@ -560,6 +580,67 @@ mod tests {
         );
     }
 
+    /// A `colspan` wider than any real column is a mistake, and it also
+    /// sizes the layout's column count (and the renderer's grid) directly.
+    #[test]
+    fn space_cell_colspan_above_maximum_rejected() {
+        let toml = format!(
+            "[[layouts]]\ntitle = \"L\"\nrows = [[{{ kind = \"space\", colspan = {} }}]]\n",
+            super::layout::MAX_COLSPAN + 1
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("maximum"),
+            "error should name the maximum: {err}"
+        );
+    }
+
+    #[test]
+    fn space_cell_colspan_at_maximum_accepted() {
+        let toml = format!(
+            "[[layouts]]\ntitle = \"L\"\nrows = [[{{ kind = \"space\", colspan = {} }}]]\n",
+            super::layout::MAX_COLSPAN
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn pane_cell_empty_title_rejected() {
+        let toml = format!(
+            "{}\n[[layouts]]\ntitle = \"L\"\nrows = [[{{ id = \"cpu\", title = \"\" }}]]\n",
+            source_toml("")
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("empty title"),
+            "error should mention the empty title: {err}"
+        );
+    }
+
+    #[test]
+    fn text_cell_empty_title_rejected() {
+        let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ title = \"\", text = \"hi\" }]]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("empty title"),
+            "error should mention the empty title: {err}"
+        );
+    }
+
+    #[test]
+    fn pane_and_text_cells_without_title_accepted() {
+        let toml = format!(
+            "{}\n[[layouts]]\ntitle = \"L\"\nrows = [[{{ id = \"cpu\" }}, {{ text = \"hi\" }}]]\n",
+            source_toml("")
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        validate(&cfg).unwrap();
+    }
+
     #[test]
     fn space_cell_accepted() {
         let toml = "[[layouts]]\ntitle = \"L\"\nrows = [[{ kind = \"space\", colspan = 2 }]]\n";
@@ -632,6 +713,25 @@ mod tests {
         apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_HISTORY_POINTS", "100")]))
             .unwrap();
         assert_eq!(cfg.history_points, 100);
+    }
+
+    /// `BARDUCK_TUI_WIDTH` is trimmed like every other env value before it's
+    /// compared, so `" auto "` is accepted rather than rejected with a
+    /// confusing parse error (spec: source-configuration — environment
+    /// variables override top-level settings).
+    #[test]
+    fn env_tui_width_accepts_surrounding_whitespace() {
+        for (raw, expect_named) in [(" auto ", true), ("auto", true), (" 12 ", false)] {
+            let mut cfg = Config::default();
+            apply_env_overrides_from(&mut cfg, |name| {
+                (name == "BARDUCK_TUI_WIDTH").then(|| raw.to_string())
+            })
+            .unwrap();
+            match cfg.tui_width {
+                TuiWidth::Named(s) => assert!(expect_named, "`{raw}` parsed as a name: {s}"),
+                TuiWidth::Fixed(n) => assert!(!expect_named, "`{raw}` parsed as fixed: {n}"),
+            }
+        }
     }
 
     #[test]
@@ -885,6 +985,154 @@ mod tests {
             err.to_string().contains("failure_threshold"),
             "error should name the field: {err}"
         );
+    }
+
+    /// A `failure_threshold` above `MAX_LOGS_LIMIT` counts more log rows than
+    /// the health read ever returns, so the source could never flip to
+    /// `failing` — it would silently degrade to `stale` forever.
+    #[test]
+    fn failure_threshold_above_max_logs_limit_rejected() {
+        let cap = crate::db::MAX_LOGS_LIMIT.to_string();
+        let cfg: Config = toml::from_str(&format!(
+            "failure_threshold = {}",
+            crate::db::MAX_LOGS_LIMIT + 1
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains(&cap),
+            "error should name the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn failure_threshold_at_max_logs_limit_accepted() {
+        let cfg: Config = toml::from_str(&format!(
+            "failure_threshold = {}",
+            crate::db::MAX_LOGS_LIMIT
+        ))
+        .unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    /// `history_points` sizes the web renderer's per-panel allocation while
+    /// the DB read behind it is capped at `MAX_HISTORY_LIMIT`.
+    #[test]
+    fn history_points_above_max_history_limit_rejected() {
+        let cap = crate::db::MAX_HISTORY_LIMIT.to_string();
+        let cfg: Config = toml::from_str(&format!(
+            "history_points = {}",
+            crate::db::MAX_HISTORY_LIMIT + 1
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains(&cap),
+            "error should name the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn history_points_at_max_history_limit_accepted() {
+        let cfg: Config = toml::from_str(&format!(
+            "history_points = {}",
+            crate::db::MAX_HISTORY_LIMIT
+        ))
+        .unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn per_source_history_points_above_max_rejected() {
+        let cap = crate::db::MAX_HISTORY_LIMIT.to_string();
+        let cfg: Config = toml::from_str(&source_toml(&format!(
+            "history_points = {}",
+            crate::db::MAX_HISTORY_LIMIT + 1
+        )))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cpu") && msg.contains(&cap),
+            "error should name the source and the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn per_source_history_points_at_max_accepted() {
+        let cfg: Config = toml::from_str(&source_toml(&format!(
+            "history_points = {}",
+            crate::db::MAX_HISTORY_LIMIT
+        )))
+        .unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    /// A zero `timeout` loads fine but makes every fetch of the source time
+    /// out instantly, forever (spec: source-configuration — Human-readable
+    /// duration configuration).
+    #[test]
+    fn zero_timeout_rejected() {
+        for toml in [
+            source_toml("timeout = \"0s\""),
+            "[[sources]]\nname = \"s\"\ntype = \"stream\"\ncommand = \"cat\"\nexpected_interval = \"1m\"\ntimeout = \"0s\"\n".to_string(),
+        ] {
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            let err = validate(&cfg).unwrap_err();
+            assert!(
+                err.to_string().contains("timeout"),
+                "error should name the field: {err}"
+            );
+        }
+    }
+
+    /// A duplicate band bound makes one of the two bands sharing it
+    /// unreachable with no diagnostic.
+    #[test]
+    fn duplicate_threshold_bound_rejected() {
+        let cfg: Config = toml::from_str(&source_toml(
+            "thresholds = [{bound = 60.0, level = \"green\"}, {bound = 60.0, level = \"red\"}]",
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("cpu") && err.to_string().contains("60"),
+            "error should name the source and the repeated bound: {err}"
+        );
+    }
+
+    #[test]
+    fn distinct_threshold_bounds_accepted() {
+        let cfg: Config = toml::from_str(&source_toml(
+            "thresholds = [{bound = 60.0, level = \"green\"}, {bound = 85.0, level = \"yellow\"}, {bound = 100.0, level = \"red\"}]",
+        ))
+        .unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    /// A bare relative config path (`config.toml`) has an *empty* parent,
+    /// which is not a usable working directory — it must resolve to `.` so
+    /// `config_dir.join(database_path)` and every source command's
+    /// `current_dir` keep working (spec: source-configuration —
+    /// config-relative working directory).
+    #[test]
+    fn bare_relative_config_path_yields_usable_config_dir() {
+        // A uniquely named file in the process's own working directory,
+        // addressed by its single path component — the shape whose
+        // `parent()` is `Some("")` rather than a real directory. Auto-deleted
+        // on drop, so no process-wide `set_current_dir` race.
+        let file = tempfile::Builder::new()
+            .prefix("barduck-cfg-test-")
+            .suffix(".toml")
+            .tempfile_in(".")
+            .unwrap();
+        std::fs::write(file.path(), "listen = \"127.0.0.1:0\"\n").unwrap();
+        let name = file.path().file_name().unwrap().to_str().unwrap();
+
+        let cfg = load_from(Path::new(name), lookup_from(&[])).unwrap();
+
+        assert_eq!(cfg.config_dir, Path::new("."));
+        assert_eq!(cfg.database_path, Path::new("./dashboard.duckdb"));
     }
 
     /// A relative `BARDUCK_DATABASE_PATH` override must resolve against the

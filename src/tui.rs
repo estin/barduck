@@ -9,7 +9,7 @@ use crate::{
     health::Health,
     query::Backend,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -43,6 +43,7 @@ fn event_loop(terminal: &mut TerminalGuard, backend: &Backend, cfg: &Config) -> 
     let mut state = UiState {
         error: None,
         scroll_offset: 0,
+        loaded: false,
         rows: Vec::new(),
     };
     let mut refresher = Refresher::start(backend.clone(), cfg.clone());
@@ -64,8 +65,18 @@ fn event_loop(terminal: &mut TerminalGuard, backend: &Backend, cfg: &Config) -> 
         // `scroll_offset` pointing past the end (spec: tui — TUI scrolls
         // when content overflows the terminal).
         let rows = visible_rows(&state.rows);
-        let (heights, _) = row_heights(&rows);
-        let (_, term_height) = crossterm::terminal::size()?;
+        let (term_width, term_height) = crossterm::terminal::size()?;
+        // The width half of what the height pass measures against: a
+        // logical line that wraps occupies several terminal rows, so the
+        // row heights — and the scroll clamp built from them — have to be
+        // computed against the columns a cell actually gets, not against
+        // the logical line count alone.
+        let inner = cell_inner_width(
+            &rows,
+            ratatui::layout::Rect::new(0, 0, term_width, term_height),
+            &cfg.tui_width,
+        );
+        let (heights, _) = row_heights(&rows, inner);
         let available = term_height.saturating_sub(1 + u16::from(state.error.is_some()));
         state.scroll_offset = state
             .scroll_offset
@@ -216,6 +227,10 @@ struct UiState {
     /// terminal). Clamped to `max_scroll_offset` inside `draw` on every
     /// frame, so a resize or a data refresh can never leave it stale.
     scroll_offset: usize,
+    /// Whether a refresh has ever completed. The empty-grid hint is only
+    /// true advice once it has: on the first frames, before any read has
+    /// returned, an empty grid just means "not loaded yet".
+    loaded: bool,
 }
 
 enum Outcome {
@@ -308,7 +323,12 @@ impl Refresher {
 /// count (see `health::compute_all`), which is what actually made refreshes
 /// cheap.
 async fn fetch(backend: &Backend, cfg: &Config) -> Outcome {
-    match (backend.latest().await, backend.health(cfg).await) {
+    // Each read named separately: in daemon mode a 500 from the values
+    // endpoint is indistinguishable from the daemon being down unless the
+    // banner says which read failed.
+    let latest = backend.latest().await.context("reading latest values");
+    let healths = backend.health(cfg).await.context("reading health");
+    match (latest, healths) {
         (Ok(latest), Ok(healths)) => Outcome::Data(latest, healths),
         (Err(e), _) | (_, Err(e)) => Outcome::Failed(format!("{e:#}")),
     }
@@ -449,6 +469,7 @@ fn apply_outcome(cfg: &Config, outcome: Outcome, state: &mut UiState) {
     match outcome {
         Outcome::Data(latest, healths) => {
             state.error = None;
+            state.loaded = true;
             let mut rows = Vec::new();
             for layout in &cfg.layouts {
                 for row_cells in &layout.rows {
@@ -521,7 +542,9 @@ fn content_rect(
     }
     let desired = match tui_width {
         TuiWidth::Fixed(cols) => *cols,
-        TuiWidth::Named(_) => (max_columns as u16).saturating_mul(AUTO_COLUMN_WIDTH),
+        TuiWidth::Named(_) => u16::try_from(max_columns)
+            .unwrap_or(u16::MAX)
+            .saturating_mul(AUTO_COLUMN_WIDTH),
     };
     let width = desired.min(area.width);
     let x = area.x + (area.width - width) / 2;
@@ -533,17 +556,98 @@ fn content_rect(
     }
 }
 
+/// Columns one grid cell gives up to chrome: the panel border's left and
+/// right edges, plus the single column `draw` reserves on the right for the
+/// scroll indicator. The indicator only exists once the grid overflows, so
+/// counting it here over-states a cell's inner width on the fits-on-screen
+/// path — deliberately, since a row's height is only a *minimum* there, and
+/// under-stating it is exactly what clipped wrapped-off content for good.
+const CELL_CHROME_WIDTH: u16 = 3;
+
+/// Room reserved on a single-source panel's last value line for the unit
+/// and age suffix `panel_widget` appends to it — [`crate::age::ago`] renders
+/// at most a handful of characters for any plausible timestamp.
+const SUFFIX_RESERVE: usize = 12;
+
+/// The widest row's column count — the basis for both the `"auto"` content
+/// width and the per-cell inner width.
+fn max_columns(rows: &[&Vec<Slot>]) -> usize {
+    rows.iter()
+        .map(|r| r.iter().map(|c| c.span).sum::<usize>())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The columns one grid cell can draw into: the content area split by the
+/// widest row's column count, less the chrome every cell gives up. Fed to
+/// the height pass so a logical line wider than a cell is counted as the
+/// several terminal rows it wraps onto (spec: tui — TUI scrolls when
+/// content overflows the terminal).
+fn inner_width(content: ratatui::layout::Rect, max_columns: usize) -> u16 {
+    content
+        .width
+        .saturating_div(u16::try_from(max_columns).unwrap_or(u16::MAX).max(1))
+        .saturating_sub(CELL_CHROME_WIDTH)
+}
+
+/// [`inner_width`] for a whole grid in the given area — what `event_loop`
+/// measures with, from the terminal's own size, so its `scroll_offset` clamp
+/// is built from the same heights `draw` lays out with.
+fn cell_inner_width(rows: &[&Vec<Slot>], area: ratatui::layout::Rect, tui_width: &TuiWidth) -> u16 {
+    let max_columns = max_columns(rows);
+    inner_width(content_rect(area, tui_width, max_columns), max_columns)
+}
+
+/// One line's rendered width — display columns, not bytes or `char`s, so a
+/// CJK value wraps where the terminal actually breaks it.
+fn line_width(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+/// Terminal rows that `Wrap { trim: false }` needs for the given per-line
+/// widths at `inner_width` columns each.
+///
+/// This is the count that has to be right: the row height and the scroll
+/// range both come from it, so a logical-line count that ignored wrapping
+/// shrank a row below what it renders and put the remainder of the text
+/// permanently out of reach (spec: tui — TUI scrolls when content overflows
+/// the terminal).
+fn wrapped_rows(widths: impl Iterator<Item = usize>, inner_width: u16) -> usize {
+    let per_row = usize::from(inner_width.max(1));
+    widths.map(|w| w.div_ceil(per_row).max(1)).sum()
+}
+
 /// One `Slot`'s content-line count — the number of terminal lines
 /// `panel_widget` will draw inside its border for this cell, mirroring that
 /// function's own branch order so the two never disagree (spec: tui — TUI
 /// scrolls when content overflows the terminal). A spacer slot (nothing set)
 /// contributes 0 and so never constrains its row's height.
-fn slot_content_lines(slot: &Slot) -> usize {
+fn slot_content_lines(slot: &Slot, inner_width: u16) -> usize {
     if let Some(text) = &slot.text {
-        text.lines().count()
+        wrapped_rows(text.lines().map(line_width), inner_width)
     } else if slot.secondary.is_empty() && slot.table.is_empty() {
-        slot.main.as_ref().map_or(0, |p| p.value.lines().count())
+        slot.main.as_ref().map_or(0, |p| {
+            let mut lines: Vec<&str> = p.value.lines().collect();
+            // An empty value still renders one line — the suffix-only one.
+            if lines.is_empty() {
+                lines.push("");
+            }
+            let last = lines.len() - 1;
+            wrapped_rows(
+                lines.iter().enumerate().map(|(i, l)| {
+                    line_width(l)
+                        + if i == last {
+                            line_width(&p.unit) + SUFFIX_RESERVE
+                        } else {
+                            0
+                        }
+                }),
+                inner_width,
+            )
+        })
     } else {
+        // A generalized pane renders one row per member and does not wrap
+        // them, so a member wider than the cell is cut, not continued below.
         usize::from(slot.main.is_some()) + slot.secondary.len() + slot.table.len()
     }
 }
@@ -552,16 +656,23 @@ fn slot_content_lines(slot: &Slot) -> usize {
 /// content lines plus the panel border's top and bottom, floored at 3 so an
 /// empty/near-empty panel still shows a border around something (spec: tui —
 /// TUI scrolls when content overflows the terminal).
-fn row_natural_height(row: &[Slot]) -> u16 {
-    let content = row.iter().map(slot_content_lines).max().unwrap_or(0);
-    (2 + content).max(3) as u16
+fn row_natural_height(row: &[Slot], inner_width: u16) -> u16 {
+    let content = row
+        .iter()
+        .map(|s| slot_content_lines(s, inner_width))
+        .max()
+        .unwrap_or(0);
+    u16::try_from(2 + content).unwrap_or(u16::MAX).max(3)
 }
 
 /// Natural heights for every row, plus their total — the two numbers `draw`
 /// needs to decide whether the grid fits the terminal or must scroll (spec:
 /// tui — TUI scrolls when content overflows the terminal).
-fn row_heights(rows: &[&Vec<Slot>]) -> (Vec<u16>, u16) {
-    let heights: Vec<u16> = rows.iter().map(|r| row_natural_height(r)).collect();
+fn row_heights(rows: &[&Vec<Slot>], inner_width: u16) -> (Vec<u16>, u16) {
+    let heights: Vec<u16> = rows
+        .iter()
+        .map(|r| row_natural_height(r, inner_width))
+        .collect();
     let total = heights.iter().fold(0u16, |acc, h| acc.saturating_add(*h));
     (heights, total)
 }
@@ -621,12 +732,9 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
     // Grid rows stacked vertically (equal height each), columns within a row
     // proportional to cell spans.
     let rows: Vec<&Vec<Slot>> = visible_rows(&state.rows);
-    let max_columns = rows
-        .iter()
-        .map(|r| r.iter().map(|c| c.span).sum::<usize>())
-        .max()
-        .unwrap_or(0);
+    let max_columns = max_columns(&rows);
     let content = content_rect(area, tui_width, max_columns);
+    let inner = inner_width(content, max_columns);
 
     let mut idx = 0usize;
     let next_line = |idx: &mut usize| -> u16 {
@@ -652,7 +760,19 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
         );
     }
 
-    if rows.is_empty() {
+    if rows.is_empty() && state.loaded {
+        // Nothing to lay out *and* a read has come back: a config with no
+        // `[[layouts]]` at all, or one whose every panel is hidden from the
+        // TUI. A bare title bar reads as a hang, so name the situation —
+        // but only once it is one, since an empty grid before the first
+        // refresh lands is just "not loaded yet".
+        header_line(
+            f,
+            content,
+            next_line(&mut idx),
+            " no layouts configured, or every panel is hidden from the tui ".into(),
+            Style::default().fg(Color::DarkGray),
+        );
         return;
     }
     let body = ratatui::layout::Rect {
@@ -662,7 +782,7 @@ fn draw(f: &mut ratatui::Frame, state: &UiState, tui_width: &TuiWidth) {
         height: content.height.saturating_sub(idx as u16),
     };
 
-    let (heights, total_natural) = row_heights(&rows);
+    let (heights, total_natural) = row_heights(&rows, inner);
     if total_natural <= body.height {
         // Unchanged from before this change: every row stretches to fill
         // whatever height is available (spec: tui — TUI scrolls when
@@ -757,6 +877,15 @@ fn header_line(
 /// by the worst member across all three sections (spec: tui — group panes
 /// show multiple labeled, independently colored values).
 fn panel_widget(slot: &Slot) -> Paragraph<'_> {
+    // One clock read for the whole panel, so every section of a cell ages
+    // against the same instant. The pre-epoch fallback is 0.0, which
+    // `crate::age::ago` clamps to a zero age: an honest "cannot tell",
+    // where the single-source branch used to fall back to the value's own
+    // timestamp and so report every age as "just now".
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+
     if let Some(text) = &slot.text {
         // Shown as-is: the TUI never interprets `markdown`/`json` formatting
         // (spec: tui — static-text panel rendering). No age suffix and no
@@ -776,9 +905,6 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
         && let Some(p) = &slot.main
     {
         let style = status_style(p.level, p.status);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(p.ts_epoch, |d| d.as_secs_f64());
         let updated =
             crate::age::ago(now, p.ts_epoch).map_or_else(String::new, |s| format!(" - {s}"));
         // A value can itself span multiple lines (e.g. a markdown-format
@@ -822,9 +948,6 @@ fn panel_widget(slot: &Slot) -> Paragraph<'_> {
                 )),
         )
     } else {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
         let colors: Vec<Level> = slot
             .main
             .iter()
@@ -986,7 +1109,7 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     fn key(code: crossterm::event::KeyCode) -> crossterm::event::Event {
@@ -1109,6 +1232,7 @@ mod tests {
         let state = UiState {
             error: Some("daemon unreachable".into()),
             scroll_offset: 0,
+            loaded: true,
             // Two rows: [echo | balance] and [spacer(span2) | dead].
             rows: vec![
                 vec![
@@ -1208,6 +1332,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("ihor".into()),
@@ -1324,6 +1449,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("grp".into()),
@@ -1410,6 +1536,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("CPU".into()),
@@ -1470,6 +1597,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("Server".into()),
@@ -1544,6 +1672,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("Links".into()),
@@ -1586,6 +1715,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: None,
@@ -1619,6 +1749,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("Note".into()),
@@ -1655,6 +1786,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("Links".into()),
@@ -1698,6 +1830,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: None,
@@ -1803,6 +1936,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: None,
@@ -1847,6 +1981,7 @@ mod tests {
         let state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![Slot {
                 span: 1,
                 group_title: Some("ihor".into()),
@@ -1983,6 +2118,7 @@ mod tests {
         let mut state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: Vec::new(),
         };
         apply_outcome(cfg, Outcome::Data(Vec::new(), Vec::new()), &mut state);
@@ -2146,6 +2282,7 @@ mod tests {
         let mut visible_state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: Vec::new(),
         };
         apply_outcome(
@@ -2156,6 +2293,7 @@ mod tests {
         let mut hidden_state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: Vec::new(),
         };
         apply_outcome(
@@ -2247,36 +2385,73 @@ mod tests {
         }
     }
 
+    /// A cell width no test panel's content wraps at, so these counts are
+    /// the plain line counts.
+    const ROOMY: u16 = 40;
+
     /// One `Slot`'s content-line count matches what `panel_widget` actually
     /// draws for each of its branches (spec: tui — TUI scrolls when content
     /// overflows the terminal).
     #[test]
     fn slot_content_lines_matches_each_panel_widget_branch() {
         assert_eq!(
-            slot_content_lines(&spacer_slot()),
+            slot_content_lines(&spacer_slot(), ROOMY),
             0,
             "a spacer needs no lines"
         );
         assert_eq!(
-            slot_content_lines(&main_slot("p", 1)),
+            slot_content_lines(&main_slot("p", 1), ROOMY),
             1,
             "single-line value"
         );
         assert_eq!(
-            slot_content_lines(&main_slot("p", 3)),
+            slot_content_lines(&main_slot("p", 3), ROOMY),
             3,
             "multi-line value"
         );
-        assert_eq!(slot_content_lines(&text_slot(2)), 2, "static text");
+        assert_eq!(slot_content_lines(&text_slot(2), ROOMY), 2, "static text");
         assert_eq!(
-            slot_content_lines(&group_slot(true, 2, 1)),
+            slot_content_lines(&group_slot(true, 2, 1), ROOMY),
             4,
             "main (1) + 2 secondary + 1 table line"
         );
         assert_eq!(
-            slot_content_lines(&group_slot(false, 0, 3)),
+            slot_content_lines(&group_slot(false, 0, 3), ROOMY),
             3,
             "table-only group pane"
+        );
+    }
+
+    /// A line wider than the cell wraps onto several terminal rows, and the
+    /// height pass has to count those: sizing the row by the logical line
+    /// count shrank it below what it renders, so the wrapped-off remainder
+    /// was clipped and unreachable by scrolling (spec: tui — TUI scrolls
+    /// when content overflows the terminal).
+    #[test]
+    fn slot_content_lines_counts_the_rows_a_long_line_wraps_onto() {
+        let long = |tag: &str| Slot {
+            span: 1,
+            group_title: Some("Quick Links".into()),
+            main: None,
+            secondary: Vec::new(),
+            table: Vec::new(),
+            text: Some(format!("{} {tag}", "x".repeat(38))),
+        };
+        // A 43-column line in a 37-column cell: two rows, not one.
+        assert_eq!(slot_content_lines(&long("tail"), 37), 2);
+        assert_eq!(
+            row_natural_height(&[long("tail")], 37),
+            4,
+            "2 border + 2 wrapped rows"
+        );
+        // A single value line (plus the unit/age suffix reserved for its
+        // last line) is counted the same way.
+        let mut slot = main_slot("p", 1);
+        slot.main.as_mut().unwrap().value = "x".repeat(90);
+        assert_eq!(
+            slot_content_lines(&slot, 37),
+            3,
+            "90 + 12 reserved columns at 37 per row"
         );
     }
 
@@ -2287,17 +2462,17 @@ mod tests {
     #[test]
     fn row_natural_height_is_tallest_cell_plus_border_floored_at_three() {
         assert_eq!(
-            row_natural_height(&[spacer_slot()]),
+            row_natural_height(&[spacer_slot()], ROOMY),
             3,
             "floor for an empty row"
         );
         assert_eq!(
-            row_natural_height(&[main_slot("p", 1)]),
+            row_natural_height(&[main_slot("p", 1)], ROOMY),
             3,
             "2 border + 1 line"
         );
         assert_eq!(
-            row_natural_height(&[main_slot("p", 1), main_slot("q", 5)]),
+            row_natural_height(&[main_slot("p", 1), main_slot("q", 5)], ROOMY),
             7,
             "tallest cell in the row wins: 2 border + 5 lines"
         );
@@ -2310,7 +2485,7 @@ mod tests {
         let row_a = vec![spacer_slot()];
         let row_b = vec![main_slot("p", 1), main_slot("q", 4)];
         let rows: Vec<&Vec<Slot>> = vec![&row_a, &row_b];
-        let (heights, total) = row_heights(&rows);
+        let (heights, total) = row_heights(&rows, ROOMY);
         assert_eq!(heights, vec![3, 6]);
         assert_eq!(total, 9);
     }
@@ -2343,6 +2518,11 @@ mod tests {
         terminal
             .draw(|f| draw(f, state, &TuiWidth::Named("auto".into())))
             .unwrap();
+        frame_text(&terminal)
+    }
+
+    /// The drawn frame as one string per terminal row.
+    fn frame_text(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
         let buf = terminal.backend().buffer().clone();
         (0..buf.area().height)
             .map(|y| {
@@ -2365,6 +2545,7 @@ mod tests {
         let mut state = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![
                 vec![main_slot("row0", 1)],
                 vec![main_slot("row1", 1)],
@@ -2389,6 +2570,97 @@ mod tests {
         assert!(text.contains("row2"), "second visible row at offset 1");
     }
 
+    /// A panel whose lines wrap is sized by the rows they actually occupy,
+    /// so the wrapped-off remainder of every line is on screen instead of
+    /// being clipped away with no way to scroll into it (spec: tui — TUI
+    /// scrolls when content overflows the terminal).
+    #[test]
+    fn wrapped_panel_content_is_not_clipped_by_its_row_height() {
+        // Each text line is 42 columns wide. At a 40-column content width a
+        // cell has 37 inner columns, so each wraps onto two rows and the
+        // panel needs 8 — counting one row per line budgeted 5, which is
+        // what made the grid "fit" and left four of the six rendered rows
+        // off the bottom of the panel for good.
+        let line = |tag: &str| format!("{} {tag}", "x".repeat(38));
+        let state = UiState {
+            error: None,
+            scroll_offset: 0,
+            loaded: true,
+            rows: vec![
+                vec![Slot {
+                    span: 1,
+                    group_title: Some("Quick Links".into()),
+                    main: None,
+                    secondary: Vec::new(),
+                    table: Vec::new(),
+                    text: Some([line("one"), line("two"), line("three")].join("\n")),
+                }],
+                vec![main_slot("row1", 1)],
+                vec![main_slot("row2", 1)],
+            ],
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, &TuiWidth::Fixed(40)))
+            .unwrap();
+        let text = frame_text(&terminal);
+        for tag in ["one", "two", "three"] {
+            assert!(
+                text.contains(&format!(" {tag}")),
+                "the wrapped tail of line {tag} is off the panel:\n{text}"
+            );
+        }
+    }
+
+    /// Nothing to draw — a config with no `[[layouts]]`, or one whose every
+    /// panel is hidden from the TUI — says so rather than leaving a bare
+    /// title bar (spec: tui — hidden sources render as space in the TUI).
+    #[test]
+    fn draw_explains_an_empty_dashboard() {
+        let state = UiState {
+            error: None,
+            scroll_offset: 0,
+            loaded: true,
+            rows: Vec::new(),
+        };
+        // Wide enough to hold the whole hint — a narrower terminal would
+        // truncate the tail of it, which is a different thing to assert.
+        let text = render_to_text(&state, 80, 6);
+        assert!(text.contains("no layouts configured"), "{text}");
+        assert!(text.contains("hidden from the tui"), "{text}");
+    }
+
+    /// The same empty grid is not yet a diagnosis before the first refresh
+    /// lands: claiming the config is wrong on the opening frames would be a
+    /// confident lie about a dashboard that is simply still loading.
+    #[test]
+    fn draw_stays_quiet_about_an_empty_dashboard_before_the_first_refresh() {
+        let state = UiState {
+            error: None,
+            scroll_offset: 0,
+            loaded: false,
+            rows: Vec::new(),
+        };
+        let text = render_to_text(&state, 80, 6);
+        assert!(!text.contains("no layouts configured"), "{text}");
+    }
+
+    /// A failed refresh names the read that failed. In daemon mode a 500
+    /// from the values endpoint and the daemon being down are both just
+    /// "the refresh failed" unless the banner says which one it was.
+    #[tokio::test]
+    async fn fetch_failure_names_the_read_that_failed() {
+        // Port 1 is privileged and unbound, so the request is refused
+        // outright rather than hanging until the client's timeout.
+        let cfg: Config = toml::from_str("listen = \"127.0.0.1:1\"").unwrap();
+        let backend = Backend::new(&cfg, true).unwrap();
+        let Outcome::Failed(msg) = fetch(&backend, &cfg).await else {
+            panic!("a refused read must report a failure");
+        };
+        assert!(msg.contains("reading latest values"), "{msg}");
+    }
+
     /// A scroll indicator appears only while content is actually scrolled
     /// (spec: tui — TUI scrolls when content overflows the terminal). `█` is
     /// ratatui's default scrollbar thumb symbol — distinct from any
@@ -2399,6 +2671,7 @@ mod tests {
         let fitting = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![vec![main_slot("a", 1)], vec![main_slot("b", 1)]],
         };
         let text = render_to_text(&fitting, 40, 8);
@@ -2410,6 +2683,7 @@ mod tests {
         let overflowing = UiState {
             error: None,
             scroll_offset: 0,
+            loaded: true,
             rows: vec![
                 vec![main_slot("a", 1)],
                 vec![main_slot("b", 1)],

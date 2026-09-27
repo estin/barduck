@@ -30,6 +30,11 @@ topcoat = { version = "0.9", default-features = false, features = ["tailwind"] }
 
 [dev-dependencies]
 tempfile = "3.27"
+# `topcoat`'s own feature set has no passthrough for the asset *bundler*, so
+# it's enabled here directly: the page-rendering tests build their own asset
+# bundle in-process (see `test_asset_bundle`), which needs it. Dev-only, so the
+# shipped binary never links the bundler.
+topcoat-asset = { version = "0.9", features = ["bundler"] }
 
 [features]
 bundled = ["duckdb/bundled"]

@@ -106,8 +106,34 @@ name = "webhook"
 type = "ingest"
 expected_interval = "1m"
 unit = "events"
-format = "json"
 ```
+
+### Top-Level Settings
+
+Every key below sits alongside `sources` and `layouts` at the top level of the
+config file, and every one is optional. Durations use humantime format
+(`"30s"`, `"5m"`, `"30d"`).
+
+| Key | Default | Environment override | Description |
+|-----|---------|----------------------|-------------|
+| `database_path` | `"dashboard.duckdb"` | `BARDUCK_DATABASE_PATH` | The DuckDB file. Resolved against the config file's own directory, not the directory the daemon was launched from. |
+| `listen` | `"127.0.0.1:8420"` | `BARDUCK_LISTEN` | The daemon's HTTP bind address. |
+| `interval` | `"5m"` | `BARDUCK_INTERVAL` | Staleness fallback for a source that has no config entry. A declared source's own `interval`/`cron` is unaffected by it. |
+| `failure_threshold` | `3` | `BARDUCK_FAILURE_THRESHOLD` | Consecutive failed attempts before a source reports `failing`. |
+| `history_points` | `30` | `BARDUCK_HISTORY_POINTS` | Default readings in a banded source's web history bar; a source's own `history_points` wins. |
+| `logs_per_page` | `50` | `BARDUCK_LOGS_PER_PAGE` | Rows per page in the web log view (`/logs/<source>`). |
+| `retention` | unset — keep everything forever | — | How long collected data is kept before the daemon prunes it, e.g. `"30d"`. |
+| `tui_width` | `"auto"` | `BARDUCK_TUI_WIDTH` | TUI content width: `"auto"` or a fixed column count. |
+
+An environment override wins over both the config file's value and the
+built-in default, and its value is taken verbatim. The structural keys
+(`sources`, `layouts`) have no environment override. `BARDUCK_DATABASE_PATH`
+is the one exception to "verbatim": like `database_path` itself, it is
+resolved against the config file's directory.
+
+Log verbosity comes from `RUST_LOG` (standard `tracing-subscriber`
+`EnvFilter` syntax, e.g. `RUST_LOG=debug` or `RUST_LOG=barduck=trace`) and
+defaults to `info`.
 
 ### Key Fields
 
@@ -119,11 +145,11 @@ format = "json"
 | `title` | No | Display label shown in the UI |
 | `type` | Yes | `query` or `stream` |
 | `command` | Yes | Shell command to execute |
-| `timeout` | Yes | Command timeout (humantime format) |
+| `unit` | No | Display unit (e.g. `"days"`, `"%"`, `"RUB"`) |
+| `timeout` | No | Command timeout (humantime format); defaults to `30s`. On a `stream` source this bounds the `setup` command only — the stream itself runs until it exits. |
 | `interval` | query only | Schedule interval (`"10s"`, `"1m"`, `"1h"`). Mutually exclusive with `cron`. |
 | `cron` | query only | Cron expression (e.g. `"0 0 3 * * *"`). Mutually exclusive with `interval`. |
-| `unit` | No | Display unit (e.g. `"days"`, `"%"`, `"RUB"`) |
-| `format` | No | Rendering format: `text`, `markdown`, or `json` |
+| `format` | No | Rendering format: `text` (default) or `markdown`. Any other value is rejected at parse time. |
 | `thresholds` | No | Color bands: `[{ bound = 60.0, level = "green" }, { bound = 85.0, level = "yellow" }]` |
 | `show_history` | No | Whether to show history bar in web UI (default `true`) |
 | `show_in` | No | Which UI surfaces display this source: `all` (default), `tui`, or `web` |
@@ -147,8 +173,7 @@ format = "json"
 **Query-only fields:**
 
 | Field | Required | Description |
-|-------|----------|-------------|
-| `interval` or `cron` | Yes | Schedule (mutually exclusive) |
+| `interval` or `cron` | No | Schedule (mutually exclusive). With neither declared, the source falls back to the built-in `5m` interval. |
 | `history_points` | No | Override web UI history point count |
 | `children` | No | Declares this a composite source (see [Composite Sources](#composite-sources)); each `[[sources.children]]` entry takes `name` plus a child's own `title`/`unit`/`format`/`thresholds`/`history_points`/`show_history`/`show_in`/`value_type` |
 
@@ -186,7 +211,7 @@ Validate a source configuration before applying it using `barduck fetch --source
 - If authentication is needed, use environment variables or scripts that read secrets from secure stores outside the config
 - Never put API keys, passwords, or tokens directly in `command` fields
 
-**Scripts resolve relative to the config directory.** barduck changes its working directory to the config file's directory at startup, so scripts referenced in `command` can use relative paths. For example, if `config.toml` is at `~/.config/barduck/config.toml` and `scripts/` is in the same directory, use `command = "nu scripts/metric.nu"` (not an absolute path).
+**Scripts resolve relative to the config directory.** barduck never changes its own working directory; instead each `command`, `setup`, and `database_path` runs/resolves against the config file's own directory. For example, if `config.toml` is at `~/.config/barduck/config.toml` and `scripts/` is in the same directory, use `command = "nu scripts/metric.nu"` (not an absolute path), and it resolves the same way no matter where you launched barduck from.
 
 ### Agent Workflow
 

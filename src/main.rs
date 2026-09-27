@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use barduck::{cli_report, config, db::Db, query::Backend, run_daemon, tui};
 use clap::{Args, Parser, Subcommand};
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 
 #[derive(Parser)]
 #[command(name = "barduck", version, about = "Single-binary home dashboard")]
@@ -94,9 +94,15 @@ enum Cmd {
 }
 
 /// Asks the user to type "yes" on stdin; any other input (including empty)
-/// answers no. Returns false on a non-interactive/closed stdin rather than
-/// erroring, so piping into this command can never accidentally confirm.
+/// answers no. Refuses to prompt at all when stdin is not a terminal — the
+/// reset it guards is an irreversible `DROP TABLE`, and a piped or heredoc
+/// stdin is exactly how `echo yes | barduck reset` reaches the wipe by
+/// accident. `--yes` is the explicit non-interactive path.
 fn confirm(prompt: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        println!("Refusing to prompt on a non-interactive stdin; re-run with --yes to confirm.");
+        return Ok(false);
+    }
     print!("{prompt} [yes/N] ");
     std::io::stdout().flush()?;
     let mut answer = String::new();

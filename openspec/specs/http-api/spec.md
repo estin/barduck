@@ -34,7 +34,7 @@ The daemon SHALL expose `GET /api/ping`, answering any request with a JSON body 
 - **WHEN** a client requests `GET /api/ping`
 - **THEN** the response is JSON containing the server's current time and a success status
 ### Requirement: HTTP ingest endpoint
-The daemon SHALL expose `POST /api/ingest` accepting a JSON reading that is stored exactly like a successfully fetched value: one reading plus one successful fetch-log entry with origin `push`. The body fields are `source` (required string), `value` (required string), `ts` (optional timestamp; defaults to arrival time), and `thresholds` (optional band list validated like config-declared bands, applied as a session-only override — never written back to config). The value goes through the same type conversion as fetched values for the source's configured value type. A request naming a source not declared in config MUST fail with a 4xx JSON error naming the unknown source; a malformed body (missing `source`/`value`, unparseable `ts`, invalid bands, value failing type conversion) MUST fail with a 4xx JSON error naming the problem, recording nothing. A stored ingest returns success JSON echoing the stored row. Ingest is served from the same listen socket with no additional auth: the endpoint trusts the daemon's listen address.
+The daemon SHALL expose `POST /api/ingest` accepting a JSON reading that is stored exactly like a successfully fetched value: one reading plus one successful fetch-log entry with origin `push`. The body fields are `source` (required string), `value` (required string), `ts` (optional timestamp; defaults to arrival time), and `thresholds` (optional band list validated like config-declared bands, applied as a session-only override — never written back to config). The value goes through the same type conversion as fetched values for the source's configured value type. A request naming a source not declared in config MUST fail with a 4xx JSON error naming the unknown source; a malformed body (missing `source`/`value`, unparseable `ts`, invalid bands, value failing type conversion) MUST fail with a 4xx JSON error naming the problem, recording nothing. A stored ingest returns success JSON echoing the stored row. A parseable request the daemon then fails to persist MUST NOT report success: it SHALL answer with a server error, so a pusher can tell a delivered value from a lost one. Ingest is served from the same listen socket with no additional auth: the endpoint trusts the daemon's listen address.
 
 #### Scenario: Ingest stores value and log entry
 - **WHEN** `POST /api/ingest` carries `{"source": "deploy-count", "value": "42"}`
@@ -51,6 +51,10 @@ The daemon SHALL expose `POST /api/ingest` accepting a JSON reading that is stor
 #### Scenario: Session-only threshold override
 - **WHEN** an ingest carries valid `thresholds`
 - **THEN** the source is colored with those bands until the next reading or restart, and the config file is unchanged
+
+#### Scenario: Persisting failure is not reported as success
+- **WHEN** a well-formed `POST /api/ingest` request cannot be persisted
+- **THEN** the response is a server error rather than the success row, and the source's schedule is not reset as if a value had arrived
 ### Requirement: Force poll endpoint
 The daemon SHALL expose `POST /api/sources/{name}/poll`, which fetches that source immediately regardless of its schedule and records the result exactly as a scheduled fetch does: a reading on success, a fetch-log entry with origin `poll` in either outcome, a health refresh, and any threshold override the fetched value carries. The request body is ignored; no body is required.
 

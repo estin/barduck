@@ -153,10 +153,27 @@ pub struct Threshold {
 
 /// Validates one band list — declared or `jsonl`-supplied — with a single
 /// rule set (spec: source-configuration — Threshold bands): a lone band
-/// cannot color anything, so it is rejected naming the source.
+/// cannot color anything, and a repeated bound makes one of the two bands
+/// sharing it permanently unreachable, both rejected naming the source.
+///
+/// The uniqueness scan allocates a bounded one-off `Vec` of the bounds rather
+/// than a `HashSet` — validate-time only, and never on the render path that
+/// [`level_for`] deliberately keeps allocation-free.
 pub fn validate_thresholds(source: &str, thresholds: &[Threshold]) -> Result<()> {
-    if thresholds.len() == 1 {
-        bail!("source `{source}` needs at least 2 thresholds to form bands");
+    if thresholds.len() < 2 {
+        if thresholds.len() == 1 {
+            bail!("source `{source}` needs at least 2 thresholds to form bands");
+        }
+        return Ok(());
+    }
+    let mut bounds: Vec<f64> = thresholds.iter().map(|t| t.bound).collect();
+    bounds.sort_by(f64::total_cmp);
+    for pair in bounds.windows(2) {
+        if let [a, b] = *pair
+            && a.total_cmp(&b).is_eq()
+        {
+            bail!("source `{source}` has duplicate threshold bound `{a}`");
+        }
     }
     Ok(())
 }
@@ -164,7 +181,9 @@ pub fn validate_thresholds(source: &str, thresholds: &[Threshold]) -> Result<()>
 /// Resolves the color level for a reading against the source's thresholds.
 /// Bands are interpreted ascending by bound ("value ≤ bound"); encoding the
 /// levels green→red or red→green gives either direction.
-/// Returns None for non-numeric readings.
+/// Returns None for non-numeric — and for non-finite — readings: `f64`'s
+/// parser accepts `nan`/`inf`, and `nan`/`inf` are not a measurement, so
+/// banding them would paint garbage with a real level's color.
 ///
 /// One allocation-free pass rather than sorting a borrowed copy: the answer
 /// is just "the lowest bound at or above `v`, else the highest bound
@@ -174,6 +193,9 @@ pub fn validate_thresholds(source: &str, thresholds: &[Threshold]) -> Result<()>
 #[must_use]
 pub fn level_for(thresholds: &[Threshold], value: &str) -> Option<Level> {
     let v: f64 = value.trim().parse().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
     let mut covering: Option<&Threshold> = None;
     let mut highest: Option<&Threshold> = None;
     for t in thresholds {
@@ -699,6 +721,7 @@ pub fn expand_composites(cfg: &mut Config) -> Result<()> {
             value_type,
             format,
             show_history,
+            history_points,
             ..
         } = s
         else {
@@ -721,6 +744,9 @@ pub fn expand_composites(cfg: &mut Config) -> Result<()> {
         }
         if show_history.is_some() {
             bail!("composite source `{name}` must not declare `show_history`");
+        }
+        if history_points.is_some() {
+            bail!("composite source `{name}` must not declare `history_points`");
         }
         let mut seen = std::collections::HashSet::new();
         for c in children {
@@ -848,7 +874,7 @@ pub fn parse_jsonl_row(
 
 /// Converts a row's raw `threshold` JSON into validated bands, returning
 /// `None` (bands unchanged) for anything unusable: wrong shape, unknown
-/// level, non-finite bound, or a lone band.
+/// level, non-finite bound, a lone band, or a repeated bound.
 fn convert_row_thresholds(source: &str, v: serde_json::Value) -> Option<Vec<Threshold>> {
     let bands: Vec<Threshold> = serde_json::from_value(v).ok()?;
     if bands.iter().any(|t| !t.bound.is_finite()) {
@@ -1052,6 +1078,70 @@ mod tests {
         assert_eq!(level_for(&[], "1"), None);
     }
 
+    /// `f64`'s parser accepts `nan`/`inf`/`-inf`, which are not measurements:
+    /// banding them paints garbage with a real level's color. A non-finite
+    /// reading is unbanded, like any other non-numeric one (spec:
+    /// source-configuration — Threshold bands).
+    #[test]
+    fn level_for_treats_non_finite_readings_as_unbanded() {
+        let bands = [
+            Threshold {
+                bound: 60.0,
+                level: Level::Green,
+            },
+            Threshold {
+                bound: 100.0,
+                level: Level::Red,
+            },
+        ];
+        assert_eq!(level_for(&bands, "nan"), None);
+        assert_eq!(level_for(&bands, "NaN"), None);
+        assert_eq!(level_for(&bands, "inf"), None);
+        assert_eq!(level_for(&bands, "-inf"), None);
+        assert_eq!(level_for(&bands, " 10 "), Some(Level::Green));
+    }
+
+    /// Two bands sharing a bound make one of them permanently unreachable
+    /// (`level_for` resolves the tie to one level), so the repeat is rejected
+    /// rather than silently accepted (spec: source-configuration — Threshold
+    /// bands).
+    #[test]
+    fn duplicate_threshold_bound_is_rejected() {
+        let dup = [
+            Threshold {
+                bound: 60.0,
+                level: Level::Green,
+            },
+            Threshold {
+                bound: 60.0,
+                level: Level::Red,
+            },
+        ];
+        let err = validate_thresholds("cpu", &dup).unwrap_err();
+        assert!(
+            err.to_string().contains("cpu") && err.to_string().contains("60"),
+            "error should name the source and the repeated bound: {err}"
+        );
+    }
+
+    #[test]
+    fn distinct_threshold_bounds_pass_validation() {
+        validate_thresholds(
+            "cpu",
+            &[
+                Threshold {
+                    bound: 100.0,
+                    level: Level::Red,
+                },
+                Threshold {
+                    bound: 60.0,
+                    level: Level::Green,
+                },
+            ],
+        )
+        .unwrap();
+    }
+
     /// (spec: source-configuration — Ingest source type)
     #[test]
     fn ingest_source_parses() {
@@ -1189,6 +1279,7 @@ type = "ingest""#,
             "value_type = \"double\"",
             "format = \"markdown\"",
             "show_history = false",
+            "history_points = 10",
         ] {
             let mut cfg = composite_cfg(extra, &child_toml("1m", ""));
             let err = expand_composites(&mut cfg).unwrap_err();

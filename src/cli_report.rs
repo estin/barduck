@@ -71,15 +71,15 @@ pub async fn print_latest(
         return Ok(());
     }
     header("latest values");
-    println!("{:<24} {:>14}  {:<6} TIMESTAMP", "SOURCE", "VALUE", "UNIT");
+    println!(
+        "{:<24} {:>width$}  {:<6} TIMESTAMP",
+        "SOURCE",
+        "VALUE",
+        "UNIT",
+        width = LATEST_VALUE_WIDTH
+    );
     for r in values {
-        println!(
-            "{:<24} {:>14}  {:<6} {}",
-            r.source,
-            r.value,
-            r.unit.unwrap_or_default(),
-            r.ts
-        );
+        println!("{}", latest_table_row(&r));
     }
     if !text.is_empty() {
         println!();
@@ -120,34 +120,72 @@ pub async fn print_logs(
     header("recent fetch logs");
     writeln!(
         out,
-        "{:<24} {:<40} {:<6} {:<6} {:>9}  TIMESTAMP  ERROR",
-        "SOURCE", "VALUE", "UNIT", "ORIGIN", "MS"
+        "{:<24} {:<width$} {:<6} {:<6} {:>9}  TIMESTAMP  ERROR",
+        "SOURCE",
+        "VALUE",
+        "UNIT",
+        "ORIGIN",
+        "MS",
+        width = LOG_VALUE_WIDTH
     )?;
     for l in rows {
         writeln!(
             out,
-            "{:<24} {:<40} {:<6} {:<6} {:>9}  {}  {}",
+            "{:<24} {:<width$} {:<6} {:<6} {:>9}  {}  {}",
             l.source,
-            short_value(l.value.as_deref().unwrap_or("—")),
+            short_value_n(l.value.as_deref().unwrap_or("—"), LOG_VALUE_WIDTH),
             l.unit.as_deref().unwrap_or_default(),
             l.origin,
             l.duration_ms,
             l.ts,
-            l.error.unwrap_or_default()
+            l.error.unwrap_or_default(),
+            width = LOG_VALUE_WIDTH
         )?;
     }
     Ok(())
 }
 
-/// One-line table form of a fetched value: newlines collapsed, long values
-/// (markdown bodies, JSON blobs) truncated. Full values stay in `--json`.
-fn short_value(value: &str) -> String {
+/// A fetched value as one fixed-width table cell: every run of whitespace —
+/// newlines included — collapsed to a single space, then cut to `max`
+/// characters with an ellipsis marking the truncation.
+///
+/// One implementation for every table that prints a value, because a
+/// `text`-format source stores prose and the same value rendered two
+/// different ways by two sibling commands reads as a bug in one of them.
+/// The full value is always available in `--json` (spec: cli — Query
+/// commands; Force poll command).
+fn short_value_n(value: &str, max: usize) -> String {
     let one_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() > 40 {
-        format!("{}…", one_line.chars().take(39).collect::<String>())
+    if one_line.chars().count() > max {
+        let keep = max.saturating_sub(1);
+        format!("{}…", one_line.chars().take(keep).collect::<String>())
     } else {
         one_line
     }
+}
+
+/// Width of the `latest` table's VALUE column.
+const LATEST_VALUE_WIDTH: usize = 14;
+
+/// Width of the `logs` table's VALUE column.
+const LOG_VALUE_WIDTH: usize = 40;
+
+/// Width `poll` gives a value before its timestamp.
+const POLL_VALUE_WIDTH: usize = 60;
+
+/// One `latest` table row. The value goes through [`short_value_n`] rather
+/// than being printed raw: a `text`-format source's stored value is its
+/// command's whole trimmed stdout, newlines and all, which would tear this
+/// fixed-width table apart and push UNIT/TIMESTAMP out of alignment.
+fn latest_table_row(r: &ReadingRow) -> String {
+    format!(
+        "{:<24} {:>width$}  {:<6} {}",
+        r.source,
+        short_value_n(&r.value, LATEST_VALUE_WIDTH),
+        r.unit.as_deref().unwrap_or_default(),
+        r.ts,
+        width = LATEST_VALUE_WIDTH
+    )
 }
 
 /// Runs one source once and prints the parsed result without touching the
@@ -242,7 +280,7 @@ pub async fn print_poll(
             let detail = if o.success {
                 format!(
                     "{}  {}",
-                    one_line(o.value.as_deref().unwrap_or("")),
+                    short_value_n(o.value.as_deref().unwrap_or(""), POLL_VALUE_WIDTH),
                     o.ts.as_deref().unwrap_or("")
                 )
             } else {
@@ -261,19 +299,6 @@ pub async fn print_poll(
         );
     }
     Ok(())
-}
-
-/// A value as one table cell: markdown-format sources store prose, and a
-/// multi-line (or very long) value would otherwise tear the row apart. The
-/// full value is always available in `--json`.
-fn one_line(value: &str) -> String {
-    let first = value.lines().next().unwrap_or_default().trim();
-    let truncated: String = first.chars().take(60).collect();
-    if truncated.len() < first.len() || value.lines().nth(1).is_some() {
-        format!("{truncated}…")
-    } else {
-        truncated
-    }
 }
 
 fn print_debug_row(row: &DebugRow) {
@@ -329,14 +354,60 @@ mod tests {
         assert_eq!(filtered[0].source, "b");
     }
 
+    /// The table-cell form of a value collapses every run of whitespace
+    /// across the whole value — newlines included — and cuts the result to
+    /// the column width, so a multi-line markdown body cannot tear a
+    /// fixed-width table apart (spec: cli — Query commands; Force poll
+    /// command).
     #[test]
-    fn one_line_keeps_short_values_and_collapses_prose() {
-        assert_eq!(one_line("42"), "42");
+    fn value_table_form_collapses_whitespace_and_truncates() {
+        assert_eq!(short_value_n("42", 60), "42");
         assert_eq!(
-            one_line("# Weekly report\n\nHours: 36.5"),
-            "# Weekly report…"
+            short_value_n("# Weekly report\n\nHours: 36.5", 60),
+            "# Weekly report Hours: 36.5",
+            "prose is collapsed, not cut at the first newline"
         );
-        assert_eq!(one_line(&"x".repeat(80)), format!("{}…", "x".repeat(60)));
+        assert_eq!(
+            short_value_n(&"x".repeat(80), 60),
+            format!("{}…", "x".repeat(59)),
+            "an over-long value is cut to the column width"
+        );
+    }
+
+    /// The `latest` table's value column is a fixed width, so a
+    /// `text`-format source's whole-stdout value is collapsed and cut
+    /// there — the row stays one line, with UNIT and TIMESTAMP still in
+    /// their columns.
+    #[test]
+    fn latest_row_keeps_a_multi_line_value_in_one_line() {
+        let row = ReadingRow {
+            source: "notes".into(),
+            value: "42\n\n7.5\nok".into(),
+            unit: Some("h".into()),
+            ts_epoch: 0.0,
+            ts: "2026-01-02 03:04:05".into(),
+        };
+        let line = latest_table_row(&row);
+        assert_eq!(line.lines().count(), 1, "one row, one line:\n{line}");
+        assert!(
+            line.contains("42 7.5 ok"),
+            "the newlines collapse into the value cell: {line}"
+        );
+        assert!(line.contains(" h "), "the unit column is intact: {line}");
+        assert!(line.ends_with("2026-01-02 03:04:05"), "{line}");
+
+        // A value too long for the column is cut there, not past it.
+        let long = ReadingRow {
+            value: "x".repeat(80),
+            ..row
+        };
+        let line = latest_table_row(&long);
+        assert_eq!(line.lines().count(), 1, "one row, one line:\n{line}");
+        assert!(
+            line.contains(&format!("{}…", "x".repeat(13))),
+            "cut to the column width: {line}"
+        );
+        assert!(line.ends_with("2026-01-02 03:04:05"), "{line}");
     }
 
     fn poll_config(db_path: &std::path::Path) -> Config {

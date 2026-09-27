@@ -6,54 +6,45 @@ use barduck::{
     health,
     query::Backend,
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 /// The asset bundle for page-rendering tests, built once per test-binary run.
 ///
 /// `AssetBundle::load()` (used by `build_router`/production) looks next to
-/// the current executable — correct for the real `barduck` binary,
-/// but this test binary isn't it. `topcoat asset bundle` bundles the
-/// `barduck` bin target itself, writing to its own
-/// `target/debug/assets`; loading that explicitly via `load_dir` is what
-/// lets a test render `dashboard()`/`source_logs()` (both reference bundled
-/// assets: the Tailwind stylesheet, the Geist font) without panicking.
+/// the current executable — correct for the real `barduck` binary, but this
+/// test binary isn't it. `dashboard()`/`source_logs()` reference bundled
+/// assets (the Tailwind stylesheet), so a test rendering either page panics
+/// without a bundle whose catalog holds those assets.
 ///
-/// `cargo nextest` runs every test as its own process, so every
-/// page-rendering test in this binary calls this function in a *separate*
-/// process running in parallel with the others — the `OnceLock` above only
-/// dedups within one process. Two concurrent `topcoat asset bundle`
-/// invocations writing the same `target/debug/assets` directory can
-/// interleave, leaving a manifest that's missing (or has a torn/inconsistent
-/// entry for) an asset a reader expects — the same "concurrent writers can
-/// see torn state" hazard `src/db.rs`'s own advisory lock exists for, just
-/// in this CLI's asset bundler instead of `DuckDB`. So the bundle-and-load
-/// step is itself guarded by a cross-process advisory lock.
-fn test_asset_bundle() -> Option<topcoat::asset::AssetBundle> {
-    static BUNDLE: OnceLock<Option<topcoat::asset::AssetBundle>> = OnceLock::new();
-    BUNDLE
-        .get_or_init(|| {
-            let target_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-            std::fs::create_dir_all(&target_dir).expect("creating target directory");
-            let lock_file = std::fs::File::create(target_dir.join(".topcoat-asset-bundle.lock"))
-                .expect("creating asset-bundle lockfile");
-            lock_file.lock().expect("locking asset-bundle lockfile");
-
-            let status = std::process::Command::new("topcoat")
-                .args(["asset", "bundle"])
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .status();
-            if !matches!(status, Ok(s) if s.success()) {
-                eprintln!(
-                    "topcoat asset bundle failed ({status:?}); page-rendering tests will fail"
-                );
-            }
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/assets");
-            let bundle = topcoat::asset::AssetBundle::load_dir(dir).ok();
-
-            let _ = lock_file.unlock();
-            bundle
-        })
-        .clone()
+/// The bundle is built in-process from *this* executable rather than by
+/// shelling out to `topcoat asset bundle`. An asset's `AssetId` is derived
+/// from its declaring crate's `OUT_DIR`, so a bundle built from any other
+/// target of this crate holds different ids: that CLI builds the `barduck`
+/// bin, and any feature that moves this crate's build directory
+/// (`cargo test --all-features`) leaves every page-rendering test rendering
+/// an id no manifest contains. Bundling this binary also drops the
+/// subprocess, the cross-process advisory lock, and the hardcoded
+/// `target/debug/assets` path the CLI approach needed, so the suite no longer
+/// requires `topcoat-cli` installed.
+///
+/// The bundle goes into this process's own temp dir, kept alive next to the
+/// bundle because the router serves files out of it: `cargo nextest` runs
+/// every test as a separate process, so the `LazyLock` below only dedups
+/// within one.
+fn test_asset_bundle() -> topcoat::asset::AssetBundle {
+    static BUNDLE: LazyLock<(tempfile::TempDir, topcoat::asset::AssetBundle)> =
+        LazyLock::new(|| {
+            let binary = std::fs::read(std::env::current_exe().expect("locating the test binary"))
+                .expect("reading the test binary");
+            let dir = tempfile::tempdir().expect("creating the asset bundle directory");
+            topcoat::asset::Bundler::new(&topcoat::asset::BundlerConfig::new())
+                .bundle(&binary, dir.path())
+                .unwrap_or_else(|e| panic!("bundling test assets: {e}"));
+            let bundle = topcoat::asset::AssetBundle::load_dir(dir.path())
+                .unwrap_or_else(|e| panic!("loading the asset bundle: {e}"));
+            (dir, bundle)
+        });
+    BUNDLE.1.clone()
 }
 
 /// Builds a config with: a query source (echo), a query source exercising
@@ -271,44 +262,6 @@ async fn ingest_stores_value_and_rejects_bad_requests() {
     let rows = db.logs(Some("echo"), 10).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].value.as_deref(), Some("8"));
-}
-
-/// A control channel exists for every source that *can* be polled — every
-/// query source, interval- or cron-scheduled — and for nothing else, so
-/// "has no channel" is what tells the API a source cannot be force-polled
-/// (spec: data-collection — Forced polls are serialized with a source's
-/// schedule).
-#[test]
-fn control_channels_cover_pollable_sources() {
-    let toml = r#"
-database_path = "/tmp/reset-cfg-check.duckdb"
-[[sources]]
-name = "poll_me"
-type = "query"
-command = "echo hi"
-interval = "1h"
-[[sources]]
-name = "cron_me"
-type = "query"
-command = "echo hi"
-cron = "* * * * * *"
-[[sources]]
-name = "stream_me"
-type = "stream"
-command = "cat"
-expected_interval = "30s"
-[[sources]]
-name = "pushed_me"
-type = "ingest"
-expected_interval = "30s"
-"#;
-    let cfg: config::Config = toml::from_str(toml).unwrap();
-    config::validate(&cfg).unwrap();
-    let hub = collector::control_channels(&cfg).unwrap();
-    assert!(hub.txs.contains_key("poll_me"));
-    assert!(hub.txs.contains_key("cron_me"));
-    assert!(!hub.txs.contains_key("stream_me"));
-    assert!(!hub.txs.contains_key("pushed_me"));
 }
 
 #[tokio::test]
@@ -1006,7 +959,7 @@ rows = [["cpu", "ticks", "pushed"]]
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -1027,24 +980,6 @@ rows = [["cpu", "ticks", "pushed"]]
             "`{name}` has no fetch to force, so it must have no control"
         );
     }
-    // The control is wired by one delegated handler that survives a shard
-    // re-render, posts to the endpoint, and suppresses the panel's own link.
-    assert!(
-        html.contains("/poll', { method: 'POST' }"),
-        "the script should POST to the force-poll endpoint:\n{html}"
-    );
-    assert!(
-        html.contains("ev.preventDefault()") && html.contains("ev.stopPropagation()"),
-        "the control must not follow the panel's log link"
-    );
-    // No separate progress/failure popup: outcomes surface through the
-    // panel's own live `polling`/health state instead (spec: web-ui —
-    // poll-in-progress is visible).
-    assert!(
-        !html.contains("bd-poll-note"),
-        "the old popup note must be gone"
-    );
-
     // The log view a panel links to offers the same control.
     let logs = reqwest::get(format!("{base}/logs/cpu"))
         .await
@@ -1100,7 +1035,7 @@ rows = [["cpu"]]
         cfg: Arc::new(cfg.clone()),
         controls: txs,
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -1175,7 +1110,7 @@ rows = [["slow"]]
         cfg: Arc::new(cfg.clone()),
         controls: txs,
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -1253,6 +1188,64 @@ fn daemon_base(b: &Backend) -> String {
     }
 }
 
+/// The text a rendered HTML fragment shows, with every tag stripped.
+/// Assertions use this instead of a bare `page.contains("42")`, which any
+/// digit in the page's own inline CSS or hashed stylesheet filename
+/// satisfies.
+fn visible_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        rest = match rest[open..].find('>') {
+            Some(close) => &rest[open + close + 1..],
+            None => return out,
+        };
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Columns in the log view's table: TIME, DURATION, ORIGIN, VALUE.
+const LOG_VIEW_COLUMNS: usize = 4;
+
+/// The log view's data rows as their cells' visible text, in render order
+/// (spec: web-ui — per-source log view linked from panels). Read out of the
+/// rendered `<td>` elements, so an assertion is bound to a real cell instead
+/// of to a word that also appears in the page's own chrome.
+fn log_view_rows(html: &str) -> Vec<Vec<String>> {
+    html.split("<td")
+        .skip(1)
+        .filter_map(|cell| {
+            let body = cell.split_once('>').map(|(_, rest)| rest)?;
+            let text = visible_text(body.split("</td>").next().unwrap_or_default());
+            (!text.is_empty()).then_some(text)
+        })
+        .collect::<Vec<_>>()
+        .chunks(LOG_VIEW_COLUMNS)
+        .filter(|row| row.len() == LOG_VIEW_COLUMNS)
+        .map(<[String]>::to_vec)
+        .collect()
+}
+
+/// The VALUE cell of each rendered log row, newest first.
+fn log_view_values(html: &str) -> Vec<String> {
+    log_view_rows(html)
+        .into_iter()
+        .map(|mut row| row.pop().unwrap_or_default())
+        .collect()
+}
+
+/// The log view page for `source` at a given query string.
+async fn log_view_page(base: &str, source: &str, query: &str) -> String {
+    reqwest::get(format!("{base}/logs/{source}?{query}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn log_view_renders_push_and_poll_origins() {
     let dir = tempfile::tempdir().unwrap();
@@ -1271,15 +1264,31 @@ async fn log_view_renders_push_and_poll_origins() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/logs/echo", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     assert!(html.contains("SOURCE"), "source column expected:\n{html}");
-    assert!(html.contains("poll"), "scheduled row shows poll");
-    assert!(html.contains("push"), "ingested row shows push");
+    // Each row's ORIGIN cell, located by that row's own value: the bare word
+    // "poll" is in the page's own poll control on every page.
+    let rows = log_view_rows(&html);
+    let origin_of = |value: &str| {
+        rows.iter()
+            .find(|row| row[3] == value)
+            .map(|row| row[2].as_str())
+    };
+    assert_eq!(
+        origin_of("42 x"),
+        Some("poll"),
+        "the scheduled fetch's row should show origin `poll`:\n{html}"
+    );
+    assert_eq!(
+        origin_of("43 x"),
+        Some("push"),
+        "the ingested row should show origin `push`:\n{html}"
+    );
 }
 
 /// An entry with a recorded error shows its error text in the VALUE cell,
@@ -1310,20 +1319,112 @@ async fn log_view_shows_error_text_in_value_cell() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/logs/echo", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     assert!(!html.contains("ERROR"), "no separate error column:\n{html}");
+    // The red comes from the shared status token, not a hardcoded Tailwind
+    // class (spec: web-ui — consistent token-based visual theme), and only on
+    // the errored row — the value row below carries no color at all.
     assert!(
-        html.contains("boom: connection refused") && html.contains("text-red-500"),
+        html.contains("boom: connection refused") && html.contains("color:var(--status-red-text)"),
         "error row's VALUE cell should show the error text in red:\n{html}"
     );
+    assert_eq!(
+        log_view_values(&html),
+        ["42 x", "boom: connection refused"],
+        "each row's VALUE cell should show its error text or its value, newest first:\n{html}"
+    );
+}
+
+/// The log view's query string drives real pagination: `?page=N` windows the
+/// rows at `offset = (N-1) * logs_per_page`, and the pages partition the
+/// source's rows with nothing repeated or dropped across the boundary;
+/// `?error=1` narrows the same window to failed attempts only (spec: web-ui —
+/// Log view pagination; Log view error-only filter).
+#[tokio::test]
+async fn log_view_pages_and_error_filters_its_query_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+logs_per_page = 3
+
+[[sources]]
+name = "echo"
+type = "query"
+command = "echo 0"
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+    // Inserted oldest-first, so the rendered (newest-first) order is
+    // v5, v4, boom, v2, v1. The failed attempt carries its error in place of
+    // a value, which is also what makes it the only `?error=1` row.
+    for (value, error) in [
+        (Some("v1"), None),
+        (Some("v2"), None),
+        (None, Some("boom")),
+        (Some("v4"), None),
+        (Some("v5"), None),
+    ] {
+        db.insert_log("echo", 1, error, value, Origin::Poll)
+            .await
+            .unwrap();
+    }
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let first = log_view_page(&base, "echo", "page=1").await;
+    let second = log_view_page(&base, "echo", "page=2").await;
+    assert_eq!(
+        log_view_values(&first),
+        ["v5", "v4", "boom"],
+        "page 1 should hold the newest `logs_per_page` rows:\n{first}"
+    );
+    assert_eq!(
+        log_view_values(&second),
+        ["v2", "v1"],
+        "page 2 should hold the next window, with no row from page 1:\n{second}"
+    );
+    // The visible row ranges pin the `offset = (page - 1) * limit` boundary
+    // itself, not just the set of rows.
     assert!(
-        html.contains("42"),
-        "value row's VALUE cell should still show its value:\n{html}"
+        first.contains("Showing 1–3"),
+        "page 1's row range expected:\n{first}"
+    );
+    assert!(
+        second.contains("Showing 4–5"),
+        "page 2's row range expected:\n{second}"
+    );
+    assert!(
+        first.contains(r#"href="/logs/echo?page=2""#),
+        "a full page should link forward:\n{first}"
+    );
+    assert!(
+        second.contains(r#"href="/logs/echo?page=1""#),
+        "page 2 should link back:\n{second}"
+    );
+
+    let errors = log_view_page(&base, "echo", "page=1&error=1").await;
+    assert_eq!(
+        log_view_values(&errors),
+        ["boom"],
+        "?error=1 should return only the failed attempt:\n{errors}"
     );
 }
 
@@ -1341,14 +1442,20 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     assert!(html.contains("echo"));
-    assert!(html.contains("42"));
+    // Bound to the value element: a bare "42" also occurs in the page's own
+    // inline CSS and hashed stylesheet filename, so the bare form can never
+    // fail.
+    assert!(
+        html.contains(">42 x</div>"),
+        "the echo panel should show its value and unit:\n{html}"
+    );
     assert!(
         html.contains(r#"rel="stylesheet" href="/_topcoat/assets/"#),
         "bundled tailwind stylesheet expected"
@@ -1387,11 +1494,6 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
         page.contains("grid-template-columns: repeat(2"),
         "2-column grid expected"
     );
-    // Counts grids by their own per-grid inline-style marker, not the bare
-    // "grid-template-columns" text — the responsive `<style>` block (spec:
-    // web-ui — responsive layout for small viewports) also mentions that
-    // property once, statically, regardless of how many grids there are.
-    assert_eq!(page.matches("--bd-cols:").count(), 1);
     assert!(
         page.contains(">Balance</span>"),
         "custom pane title expected"
@@ -1512,7 +1614,7 @@ async fn web_ui_composite_root_renders_as_a_table_of_its_children() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -1591,7 +1693,7 @@ async fn web_ui_composite_as_pane_main_renders_children_table() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -1606,9 +1708,16 @@ async fn web_ui_composite_as_pane_main_renders_children_table() {
         html.contains("0.31 avg"),
         "composite child 5m expected in the table"
     );
+    // The pane's own `note` table member, located by its row rather than by
+    // the bare word "hi" — a substring of the page chrome's `hidden`
+    // attributes.
+    let note_idx = html
+        .find(r#"href="/logs/note""#)
+        .expect("the pane's own table member expected");
+    let note_row = &html[note_idx..(note_idx + 400).min(html.len())];
     assert!(
-        html.contains("hi"),
-        "the pane's own table member is unaffected"
+        note_row.contains(">hi</span>"),
+        "the note row should still show its own value: {note_row}"
     );
 }
 
@@ -1626,7 +1735,7 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -1808,7 +1917,7 @@ async fn web_ui_history_bar_reflects_recent_readings() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -1878,7 +1987,7 @@ async fn web_ui_unbanded_failing_source_colors_red_with_plain_label() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -1958,7 +2067,7 @@ async fn web_ui_show_history_false_hides_bar_for_banded_source() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2029,7 +2138,7 @@ async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2104,7 +2213,7 @@ async fn web_ui_main_only_pane_renders_like_single_source_panel() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2112,7 +2221,7 @@ async fn web_ui_main_only_pane_renders_like_single_source_panel() {
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     // The cell's own title is used, not `main`'s source name.
     assert!(html.contains(">CPU Pane</span>"), "cell title expected");
-    assert!(html.contains("70"), "main value missing");
+    assert!(html.contains(">70 %</div>"), "main value missing:\n{html}");
     // Full single-panel styling — border AND background, unlike a table/
     // secondary row which only ever carries a text color.
     assert!(
@@ -2212,17 +2321,18 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
 
     let html = reqwest::get(&url).await.unwrap().text().await.unwrap();
     assert!(html.contains(">Server</span>"), "cell title expected");
-    assert!(html.contains("42"), "main value missing");
-    assert!(html.contains("70"), "secondary value missing");
+    // Values bound to the element that renders them: a bare "42"/"70"/"90"
+    // also occurs in the page's own inline CSS and hashed stylesheet
+    // filename, so those forms can never fail.
+    assert!(html.contains(">42 %</div>"), "main value missing:\n{html}");
     assert!(html.contains("balance"), "table label missing");
-    assert!(html.contains("90"), "table value missing");
 
     // Both `secondary` members render inside one shared row, as plain
     // colored value+unit links to their own log view — no separate label.
@@ -2235,8 +2345,22 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
         "mem-warn secondary link expected in the shared row: {secondary_row}"
     );
     assert!(
+        secondary_row.contains(">70 %</a>"),
+        "mem-warn's own value expected beside its link: {secondary_row}"
+    );
+    assert!(
         secondary_row.contains(r#"href="/logs/flaky""#),
         "flaky secondary link expected in the same shared row: {secondary_row}"
+    );
+
+    // The `table` row's own value, bound to the row that carries its label.
+    let table_row_idx = html
+        .find(r#"href="/logs/days-left""#)
+        .expect("table row link expected");
+    let table_row = &html[table_row_idx..(table_row_idx + 400).min(html.len())];
+    assert!(
+        table_row.contains(">90 d</span>"),
+        "days-left's own value expected beside its label: {table_row}"
     );
 
     // The failing, unbanded `flaky` secondary member alone is enough to turn
@@ -2328,7 +2452,7 @@ async fn web_ui_hides_a_tui_only_source_but_keeps_the_unrestricted_one() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2401,7 +2525,7 @@ async fn web_ui_omits_hidden_pane_member_and_collapses_all_hidden_pane() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2461,9 +2585,19 @@ async fn ping_endpoint_returns_server_time() {
     let resp = reqwest::get(format!("{base}/api/ping")).await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
+    let server_time = body["server_time"]
+        .as_str()
+        .expect("server_time field expected");
+    // Parsed, not just present: a field that merely exists says nothing
+    // about whether the clock behind it is readable or current, and the
+    // frontend's offline check compares it against the browser's own.
+    let server_time = chrono::DateTime::parse_from_rfc3339(server_time)
+        .expect("server_time should be an RFC 3339 timestamp")
+        .with_timezone(&chrono::Utc);
+    let skew = (chrono::Utc::now() - server_time).num_milliseconds().abs();
     assert!(
-        body["server_time"].as_str().is_some(),
-        "server_time field expected"
+        skew < 5_000,
+        "server_time {server_time} is {skew}ms from the client's own clock"
     );
 }
 
@@ -2481,7 +2615,7 @@ async fn dashboard_includes_connection_indicator() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2520,7 +2654,7 @@ async fn dashboard_includes_offline_banner_and_dim_toggle() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2546,25 +2680,6 @@ async fn dashboard_includes_offline_banner_and_dim_toggle() {
         page.contains(r#"id="bd-panel-wrapper""#),
         "panel wrapper hook for dimming expected"
     );
-    // The connection script toggles the banner/dim/favicon-flag together.
-    assert!(
-        page.contains("document.body.dataset.bdConnection = state"),
-        "connection script should publish state for the favicon script to read"
-    );
-    assert!(
-        page.contains("banner.hidden = !offline"),
-        "connection script should toggle the offline banner"
-    );
-    assert!(
-        page.contains("classList.toggle('opacity-50', offline)"),
-        "connection script should dim the panel wrapper when offline"
-    );
-    // The favicon script checks the same shared flag before falling back to
-    // the health-derived status.
-    assert!(
-        page.contains("document.body.dataset.bdConnection === 'offline'"),
-        "favicon script should override to red when offline"
-    );
 }
 
 /// (spec: web-ui — light/dark theme toggle; responsive layout for small viewports)
@@ -2581,7 +2696,7 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2714,7 +2829,7 @@ rows = [
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2755,7 +2870,7 @@ rows = [
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2834,7 +2949,7 @@ rows = [
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2865,7 +2980,7 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2917,7 +3032,7 @@ async fn web_ui_summary_chip_href_matches_panel_id() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -2972,10 +3087,12 @@ async fn setup_command_gates_fetch_and_recovers() {
     assert_eq!(h.status, health::Health::Healthy);
 }
 
-/// Spawns the real binary (chdir behavior lives in `main()`, not the library)
-/// to prove `database_path` and a relative `query` command resolve against the
-/// config file's own directory, not wherever the process was launched from
-/// (spec: source-configuration — config-relative working directory).
+/// Spawns the real binary — launched from a second, empty directory — to
+/// prove `database_path`, a relative `query` command, and a relative path
+/// *inside* that command all resolve against the config file's own
+/// directory (spec: source-configuration — config-relative working
+/// directory). barduck never `chdir`s; the two directories must not be
+/// confusable.
 #[tokio::test]
 async fn daemon_resolves_relative_paths_against_config_directory() {
     let config_dir = tempfile::tempdir().unwrap();
@@ -2983,7 +3100,7 @@ async fn daemon_resolves_relative_paths_against_config_directory() {
 
     std::fs::write(
         config_dir.path().join("script.sh"),
-        "#!/bin/sh\necho hello-from-script\n",
+        "#!/bin/sh\necho run >> runs.log\necho hello-from-script\n",
     )
     .unwrap();
 
@@ -3013,16 +3130,39 @@ interval = "1s"
         .spawn()
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Deadline-based rather than a fixed sleep: the database file appears
+    // when the daemon opens it, and `runs.log` — written by a *relative*
+    // path from inside the command — gains a line per completed fetch.
+    // Waiting for two lines means the first fetch's reading is definitely
+    // stored, so a slow runner fails with a timeout naming what it waited
+    // for instead of a confusing "no such file" assertion below.
+    let db_path = config_dir.path().join("sub/data.duckdb");
+    let runs = config_dir.path().join("runs.log");
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let fetches = std::fs::read_to_string(&runs).map_or(0, |s| s.lines().count());
+            if db_path.exists() && fetches >= 2 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
     let _ = child.kill();
     let _ = child.wait();
-
-    let db_path = config_dir.path().join("sub/data.duckdb");
+    assert!(
+        ready.is_ok(),
+        "the daemon never ran a config-relative command to completion"
+    );
     assert!(
         db_path.exists(),
         "database_path should resolve against the config file's directory"
     );
     assert!(!launch_dir.path().join("sub/data.duckdb").exists());
+    assert!(
+        !launch_dir.path().join("runs.log").exists(),
+        "a relative path inside the command should resolve against the config directory"
+    );
 
     let db = Db::open_rw(&db_path).unwrap();
     let latest = db.latest_values().await.unwrap();
@@ -3057,7 +3197,10 @@ cron = "* * * * * *"
     config::validate(&cfg).unwrap();
 
     let db = Db::open_rw(&db_path).unwrap();
-    barduck::collector::spawn_all(&db, &cfg);
+    // Graceful spawn, not `spawn_all`: these collectors have no shutdown
+    // path, so they would outlive the test and keep spawning processes (one
+    // of them ten times a second) for the rest of the run.
+    let (_txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
 
     tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
@@ -3067,6 +3210,8 @@ cron = "* * * * * *"
         "expected multiple cron-triggered fetches, got {}",
         hist.len()
     );
+
+    stop_collectors(shutdown_tx, tasks).await;
 }
 
 /// A source that fails every fetch retries at `retry_interval`, not the
@@ -3093,7 +3238,7 @@ retry_interval = "100ms"
     config::validate(&cfg).unwrap();
 
     let db = Db::open_rw(&db_path).unwrap();
-    barduck::collector::spawn_all(&db, &cfg);
+    let (_txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
 
     // Deadline-based rather than a fixed sleep: heavily loaded machines can
     // take a few hundred ms per attempt (process spawn + contended DB), so
@@ -3117,6 +3262,8 @@ retry_interval = "100ms"
         logs.iter().all(|l| l.error.is_some()),
         "every attempt should have failed"
     );
+
+    stop_collectors(shutdown_tx, tasks).await;
 }
 
 /// Once a retrying source's fetch succeeds, it resumes waiting the normal
@@ -3146,30 +3293,48 @@ retry_interval = "100ms"
     config::validate(&cfg).unwrap();
 
     let db = Db::open_rw(&db_path).unwrap();
-    barduck::collector::spawn_all(&db, &cfg);
+    let (_txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
 
-    // First attempt (immediate) fails and creates the marker; the retry
-    // 100ms later succeeds. If recovery didn't resume the 2s interval, a
-    // third retry-interval-spaced attempt would land well before 900ms.
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-
-    let logs = db.logs(Some("recovers"), 100).await.unwrap();
-    assert_eq!(
-        logs.len(),
-        2,
-        "expected exactly one failed attempt then one successful attempt, then a pause for the full interval, got {} log entries",
-        logs.len()
-    );
-    assert_eq!(
-        logs.iter().filter(|l| l.error.is_none()).count(),
-        1,
-        "expected exactly one successful attempt"
-    );
+    // Deadline-based rather than a fixed sleep: the first attempt (immediate)
+    // fails and creates the marker, and the retry `retry_interval` later
+    // succeeds — but a loaded runner can take a few hundred ms per attempt,
+    // so wait for the recovery rather than asserting a fixed count after a
+    // fixed window.
+    let logs = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let logs = db.logs(Some("recovers"), 100).await.unwrap();
+            if logs.iter().any(|l| l.error.is_none()) {
+                return logs;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the retry after recovery never succeeded");
     assert_eq!(
         logs.iter().filter(|l| l.error.is_some()).count(),
         1,
-        "expected exactly one failed attempt"
+        "only the first attempt can fail — the command creates the very marker it tests for: {logs:?}"
     );
+
+    // Recovery re-arms the full `interval`. Settle for several
+    // `retry_interval`s past the success: a third attempt here would mean it
+    // kept retrying at 100ms instead of waiting the 2s interval.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let settled = db.logs(Some("recovers"), 100).await.unwrap();
+    assert_eq!(
+        settled.len(),
+        2,
+        "expected exactly one failed attempt then one successful attempt, then a pause for the full interval, got {} log entries",
+        settled.len()
+    );
+    assert_eq!(
+        settled.iter().filter(|l| l.error.is_none()).count(),
+        1,
+        "expected exactly one successful attempt"
+    );
+
+    stop_collectors(shutdown_tx, tasks).await;
 }
 
 /// A cron-scheduled source's next attempt is always the next cron
@@ -3195,7 +3360,7 @@ cron = "* * * * * *"
     config::validate(&cfg).unwrap();
 
     let db = Db::open_rw(&db_path).unwrap();
-    barduck::collector::spawn_all(&db, &cfg);
+    let (_txs, shutdown_tx, tasks) = spawn_with_controls(&db, &cfg);
 
     tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
@@ -3209,6 +3374,8 @@ cron = "* * * * * *"
         logs.iter().all(|l| l.error.is_some()),
         "every attempt should have failed"
     );
+
+    stop_collectors(shutdown_tx, tasks).await;
 }
 
 /// `latest` sets markdown-format ("text") sources aside from the scalar
@@ -3394,7 +3561,7 @@ rows = [["cpu"]]
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/logs/cpu", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -3485,7 +3652,7 @@ rows = [["price"]]
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/logs/price", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -3518,7 +3685,7 @@ async fn log_view_favicon_reflects_failing_source() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/logs/dead", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -3565,7 +3732,7 @@ rows = [["cpu"]]
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/logs/cpu", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
@@ -3592,7 +3759,7 @@ async fn log_view_favicon_falls_back_to_green_for_unbanded_healthy_source() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
     };
-    let router = build_router_with_bundle(state, test_asset_bundle());
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/logs/echo", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });

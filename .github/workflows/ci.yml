@@ -31,15 +31,30 @@ jobs:
         with:
           tool: just,cargo-nextest
 
-      # The web-UI integration tests bundle their own Tailwind/font assets by
-      # shelling out to this CLI (see tests/integration.rs's
-      # `test_asset_bundle`); version pinned to match the `topcoat`
-      # dependency in Cargo.toml.
-      - name: Install topcoat CLI
-        run: cargo install topcoat-cli --version 0.6.2
-
       - name: just ci
         run: just ci
+
+  # Deliberately a separate job from `ci`: `--all-features` turns on
+  # `bundled`, which compiles DuckDB from source instead of downloading a
+  # prebuilt library (see `DUCKDB_DOWNLOAD_LIB` above). That is far too slow
+  # for the every-push path, but it is the only build that exercises the
+  # bundled feature at all, so it still runs on every PR.
+  all-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+      - name: Install just and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+
+      - name: just ci-all-features
+        run: just ci-all-features
 
   native-processes:
     strategy:
@@ -50,7 +65,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      # The `cfg(windows)`/`cfg(unix)` halves of the tree only exist on this
+      # matrix, so without clippy here they would ship with zero lint
+      # coverage — the `ci` job's clippy run never compiles them.
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
       # Existing dashboard fixtures use POSIX commands. This suite runs
       # native shell commands and observes both generations of a real tree.
       - name: Test native command execution and process cleanup
