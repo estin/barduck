@@ -1,0 +1,12 @@
+{
+    "schema_version": 2,
+    "commit": "d83830abf8c51a937343138dd712d59553c39860",
+    "indexed_at": "2026-09-28T10:52:37Z",
+    "project": "barduck",
+    "nodes": 3787,
+    "edges": 11479,
+    "original_size": 9109504,
+    "compressed_size": 1894110,
+    "compression_level": 9,
+    "reconcile_basis": "git-clean-head"
+}
