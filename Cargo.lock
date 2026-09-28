@@ -414,6 +414,7 @@ dependencies = [
  "croner",
  "crossterm 0.29.0",
  "duckdb",
+ "futures-core",
  "humantime",
  "humantime-serde",
  "process-wrap",

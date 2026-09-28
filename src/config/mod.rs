@@ -22,6 +22,7 @@ pub use source::{
 use defaults::{
     apply_env_overrides_from, default_config_dir, default_db_path, default_history_points,
     default_interval, default_listen, default_logs_per_page, default_threshold, default_tui_width,
+    default_web_refresh_interval,
 };
 use validation::{validate_cell, validate_source};
 
@@ -53,6 +54,12 @@ pub struct Config {
     /// view (`/logs/<source>`); overridable via `BARDUCK_LOGS_PER_PAGE`.
     #[serde(default = "default_logs_per_page")]
     pub logs_per_page: u32,
+    /// Fallback web UI refresh interval (humantime string, e.g. `"5s"`):
+    /// how often the browser re-renders panels when no refresh event
+    /// arrived over the SSE stream (spec: web-ui — immediate panel
+    /// refresh). Overridable via `BARDUCK_WEB_REFRESH_INTERVAL`.
+    #[serde(default = "default_web_refresh_interval", with = "humantime_serde")]
+    pub web_refresh_interval: Duration,
     /// How long to keep collected data before the daemon prunes it: a
     /// humantime string (e.g. `"30d"`). Unset (the default) keeps everything
     /// forever, matching prior behavior (spec: data-storage — retention).
@@ -83,6 +90,7 @@ impl Default for Config {
             failure_threshold: default_threshold(),
             history_points: default_history_points(),
             logs_per_page: default_logs_per_page(),
+            web_refresh_interval: default_web_refresh_interval(),
             retention: None,
             sources: Vec::new(),
             layouts: Vec::new(),
@@ -139,6 +147,9 @@ pub fn validate(cfg: &Config) -> Result<()> {
     }
     if cfg.logs_per_page == 0 {
         bail!("logs_per_page must be > 0");
+    }
+    if cfg.web_refresh_interval.is_zero() {
+        bail!("web_refresh_interval must be > 0");
     }
     // `failure_threshold` counts consecutive failures from the newest
     // `failure_threshold` log rows, but `db.logs`/`db.health_inputs` clamp

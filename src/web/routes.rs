@@ -242,6 +242,8 @@ pub(super) async fn page_chrome(
     let offset_f = offset as f64;
     let limit_f = f64::from(limit);
     let tick = signal(cx, || 0.0f64);
+    #[allow(clippy::cast_possible_truncation)] // interval is validated > 0; millis fit easily
+    let refresh_interval_ms = st.cfg.web_refresh_interval.as_millis() as u64;
     Ok(view! {
         <!DOCTYPE html>
         <html class=(theme)>
@@ -274,8 +276,15 @@ pub(super) async fn page_chrome(
             <body>
                 <span :data-bd-tick=$({
                     let t = tick;
-                    raw!("(globalThis.__bdTick ??= setInterval(() => ${t}.increment(), 5000), 'tick')", {
+                    let interval_ms = refresh_interval_ms;
+                    // SSE-driven immediate refresh (spec: web-ui — immediate
+                    // panel refresh): each `refresh` event bumps the tick so
+                    // shards re-render at once; the timer below is a fallback
+                    // that only fires when no event arrived within the
+                    // configured interval (each event resets it).
+                    raw!("(globalThis.__bdRefresh = (() => { const bump = () => ${t}.increment(); let timer = setTimeout(bump, ${interval_ms}); const es = new EventSource('/api/refresh-events'); es.addEventListener('refresh', () => { bump(); clearTimeout(timer); timer = setTimeout(bump, ${interval_ms}); }); return { bump }; })(), 'tick')", {
                         let _ = t.get();
+                        let _ = interval_ms;
                         "tick"
                     })
                 }) style="display:none"></span>

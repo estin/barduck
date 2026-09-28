@@ -163,6 +163,15 @@ pub enum Control {
 pub type ControlSender = tokio::sync::mpsc::UnboundedSender<Control>;
 pub type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<Control>;
 
+/// Process-local refresh generation for collector-task stores (spec: web-ui
+/// — immediate panel refresh): the `RefreshHub` in `AppState` owns the
+/// authoritative counter for HTTP-ingest stores, but collector tasks only
+/// hold the shared `Db`, so scheduled/stream stores bump this counter and
+/// publish alongside. Starts at 0 per process like the hub.
+pub(crate) fn next_refresh_generation() -> u64 {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
 /// Control wiring between the HTTP handlers and collector tasks: one
 /// channel per *pollable* source — every query source, interval- or
 /// cron-scheduled. Stream and ingest sources are excluded: neither has a
@@ -327,7 +336,7 @@ async fn loop_source(
             // reset interval schedules). `advance` is a no-op for cron.
             Work::ResetSchedule => schedule.advance(false),
             Work::Tick => {
-                attempt(
+                let outcome = attempt(
                     &db,
                     &cfg,
                     &src,
@@ -338,6 +347,9 @@ async fn loop_source(
                     src.name(),
                 )
                 .await;
+                if outcome.success {
+                    db.publish_refresh(next_refresh_generation());
+                }
             }
             // A forced poll runs here, on this source's own task, so it can
             // never overlap that source's scheduled fetch and its schedule
@@ -807,7 +819,7 @@ async fn ingest_stream_line(
             return;
         }
     };
-    let _ = store_parsed_value(
+    if store_parsed_value(
         db,
         cfg,
         src,
@@ -816,9 +828,12 @@ async fn ingest_stream_line(
         elapsed_ms(),
         Origin::Poll,
     )
-    .await;
+    .await
+    .is_ok()
+    {
+        db.publish_refresh(next_refresh_generation());
+    }
 }
-
 /// Converts, stores, and logs one already-parsed value (shared by
 /// [`fetch_once`] and [`ingest_stream_line`]); applies a valid threshold
 /// override and refreshes health. `Ok` means the whole round trip — reading

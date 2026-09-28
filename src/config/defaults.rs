@@ -28,6 +28,9 @@ pub(crate) fn default_history_points() -> u32 {
 pub(crate) fn default_logs_per_page() -> u32 {
     50
 }
+pub(crate) fn default_web_refresh_interval() -> Duration {
+    Duration::from_secs(5)
+}
 pub(crate) fn default_tui_width() -> TuiWidth {
     TuiWidth::Named("auto".into())
 }
@@ -65,6 +68,9 @@ pub(crate) fn apply_env_overrides_from(
     }
     if let Some(v) = lookup("BARDUCK_LOGS_PER_PAGE") {
         cfg.logs_per_page = parse_env_u32("BARDUCK_LOGS_PER_PAGE", &v)?;
+    }
+    if let Some(v) = lookup("BARDUCK_WEB_REFRESH_INTERVAL") {
+        cfg.web_refresh_interval = parse_env_duration("BARDUCK_WEB_REFRESH_INTERVAL", &v)?;
     }
     if let Some(v) = lookup("BARDUCK_TUI_WIDTH") {
         cfg.tui_width = parse_env_tui_width(&v)?;

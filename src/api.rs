@@ -193,8 +193,90 @@ pub async fn set_theme(cx: &Cx, Json(body): Json<ThemeBody>) -> Result<Response>
     cookies(cx).add(c);
     Ok(json_ok(&serde_json::json!({ "theme": body.theme })))
 }
+/// Streams refresh generations as Server-Sent Events (spec: web-ui —
+/// immediate panel refresh): one `refresh` event per stored value, `id:`
+/// carrying the generation so a reconnecting `EventSource` resumes via
+/// `Last-Event-ID`. `?from=` replays missed generations as catch-up events
+/// before subscribing to live ones; the stream otherwise ends only when the
+/// client disconnects.
+#[route(GET "/api/refresh-events")]
+pub async fn refresh_events(
+    cx: &Cx,
+) -> Result<
+    topcoat::router::content::sse::Sse<
+        impl futures_core::Stream<Item = Result<topcoat::router::content::sse::Event>> + use<>,
+    >,
+> {
+    use topcoat::router::content::sse::{KeepAlive, Sse, last_event_id};
+    let st = app_context::<AppState>(cx);
+    let hub_generation = st.refresh.generation();
+    let resume_from: u64 = last_event_id(cx)
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| {
+            uri(cx)
+                .query()
+                .and_then(|q| {
+                    serde_urlencoded::from_str::<std::collections::HashMap<String, String>>(q)
+                        .ok()
+                        .and_then(|m| m.get("from").cloned())
+                })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+    let start = resume_from
+        .saturating_add(1)
+        .min(hub_generation.saturating_add(1));
+    let stream = RefreshEventStream {
+        db: st.db.clone(),
+        rx: None,
+        pending: (start..=hub_generation).collect(),
+    };
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new()))
+}
 
-#[route(GET "/api/logs")]
+/// `Sse` event stream for [`refresh_events`]: first replays missed
+/// generations (resume gap), then forwards live subscriber events.
+struct RefreshEventStream {
+    db: crate::db::Db,
+    rx: Option<tokio::sync::mpsc::UnboundedReceiver<u64>>,
+    pending: std::collections::VecDeque<u64>,
+}
+
+impl futures_core::Stream for RefreshEventStream {
+    type Item = Result<topcoat::router::content::sse::Event>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        if let Some(generation) = self.pending.pop_front() {
+            let event = topcoat::router::content::sse::Event::new()
+                .event("refresh")
+                .id(generation.to_string())
+                .data(generation.to_string());
+            return Poll::Ready(Some(Ok(event)));
+        }
+        if self.rx.is_none() {
+            let db = self.db.clone();
+            self.rx = Some(db.subscribe_refresh());
+        }
+        let Some(rx) = self.rx.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        match rx.poll_recv(cx) {
+            Poll::Ready(Some(generation)) => {
+                let event = topcoat::router::content::sse::Event::new()
+                    .event("refresh")
+                    .id(generation.to_string())
+                    .data(generation.to_string());
+                Poll::Ready(Some(Ok(event)))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 pub async fn logs(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
     let q = LogsQuery::parse(uri(cx).query().unwrap_or(""))
@@ -255,7 +337,15 @@ pub async fn poll(cx: &Cx) -> Result<Response> {
         return Ok(gone());
     }
     match reply_rx.await {
-        Ok(outcome) => Ok(json_ok(&outcome)),
+        Ok(outcome) => {
+            // A forced poll that stored a value re-renders browsers the
+            // same way any other stored value does (spec: web-ui —
+            // immediate panel refresh).
+            if outcome.success {
+                let _ = st.refresh.notify_stored(&st.db);
+            }
+            Ok(json_ok(&outcome))
+        }
         Err(_) => Ok(gone()),
     }
 }
@@ -312,6 +402,9 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
             &anyhow::anyhow!("{msg}"),
         ));
     }
+    // A stored value re-renders connected browsers immediately over the SSE
+    // refresh stream (spec: web-ui — immediate panel refresh).
+    let _ = st.refresh.notify_stored(&st.db);
     // Move the source's interval wait to the success path; cron and stream
     // sources have no sender and are unaffected (spec: data-collection —
     // Ingested values reset interval schedules). A closed channel only

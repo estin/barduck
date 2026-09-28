@@ -147,6 +147,7 @@ async fn start_daemon(cfg: &config::Config, db: &Db) -> String {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -297,6 +298,7 @@ retry_interval = "2s"
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: txs,
+        refresh: barduck::RefreshHub::new(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -649,6 +651,7 @@ async fn start_daemon_with_collectors(
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: txs,
+        refresh: barduck::RefreshHub::new(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -896,6 +899,7 @@ async fn api_force_poll_reports_a_missing_collector() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls,
+        refresh: barduck::RefreshHub::new(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -958,6 +962,7 @@ rows = [["cpu", "ticks", "pushed"]]
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1034,6 +1039,7 @@ rows = [["cpu"]]
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: txs,
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1109,6 +1115,7 @@ rows = [["slow"]]
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: txs,
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1263,6 +1270,7 @@ async fn log_view_renders_push_and_poll_origins() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1318,6 +1326,7 @@ async fn log_view_shows_error_text_in_value_cell() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1383,6 +1392,7 @@ command = "echo 0"
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1441,6 +1451,7 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1613,6 +1624,7 @@ async fn web_ui_composite_root_renders_as_a_table_of_its_children() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1692,6 +1704,7 @@ async fn web_ui_composite_as_pane_main_renders_children_table() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1734,6 +1747,7 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1916,6 +1930,7 @@ async fn web_ui_history_bar_reflects_recent_readings() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1986,6 +2001,7 @@ async fn web_ui_unbanded_failing_source_colors_red_with_plain_label() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2066,6 +2082,7 @@ async fn web_ui_show_history_false_hides_bar_for_banded_source() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2137,6 +2154,7 @@ async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2212,6 +2230,7 @@ async fn web_ui_main_only_pane_renders_like_single_source_panel() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2320,6 +2339,7 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2451,6 +2471,7 @@ async fn web_ui_hides_a_tui_only_source_but_keeps_the_unrestricted_one() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2524,6 +2545,7 @@ async fn web_ui_omits_hidden_pane_member_and_collapses_all_hidden_pane() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2614,6 +2636,7 @@ async fn dashboard_includes_connection_indicator() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2653,6 +2676,7 @@ async fn dashboard_includes_offline_banner_and_dim_toggle() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2695,6 +2719,7 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2795,6 +2820,188 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
     assert_eq!(bad.status(), 400);
 }
 
+/// (spec: web-ui — immediate panel refresh) The refresh stream emits one
+/// event per stored value and supports resume: an ingest triggers an event,
+/// and reconnecting with `Last-Event-ID` replays only missed generations.
+#[tokio::test]
+async fn refresh_stream_emits_on_ingest_and_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    let url = start_daemon(&cfg, &db).await;
+
+    let client = reqwest::Client::new();
+    // Baseline: open the stream, read the initial keep-alive/comment bytes
+    // plus nothing else (no values stored since subscribe).
+    let resp = client
+        .get(format!("{url}/api/refresh-events"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .is_some_and(|v| v.to_str().unwrap_or("").contains("text/event-stream")),
+        "refresh endpoint should stream SSE"
+    );
+
+    // Store a value via push ingest, then open a fresh stream resumed past
+    // generation 0: it must replay exactly the missed generation as one
+    // `refresh` event.
+    let ingest = client
+        .post(format!("{url}/api/ingest"))
+        .json(&serde_json::json!({"source": "echo", "value": "43"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ingest.status(), 200);
+
+    let mut resumed = client
+        .get(format!("{url}/api/refresh-events?from=0"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let mut text = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !text.contains("event: refresh") && std::time::Instant::now() < deadline {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), resumed.chunk())
+            .await
+            .expect("resumed stream should yield the missed event promptly")
+            .unwrap();
+        match chunk {
+            Some(bytes) => text.push_str(&String::from_utf8_lossy(&bytes)),
+            None => break,
+        }
+    }
+    assert!(
+        text.contains("event: refresh") && text.contains("id: 1"),
+        "resumed stream should replay generation 1: {text:?}"
+    );
+
+    // A stream resumed past the latest generation replays nothing.
+    let mut caught_up = client
+        .get(format!("{url}/api/refresh-events?from=99"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let chunk = tokio::time::timeout(std::time::Duration::from_secs(18), caught_up.chunk())
+        .await
+        .expect("caught-up stream should yield at least the keep-alive")
+        .unwrap()
+        .unwrap();
+    let caught_text = String::from_utf8_lossy(&chunk);
+    assert!(
+        !caught_text.contains("event: refresh"),
+        "caught-up stream should replay nothing: {caught_text:?}"
+    );
+}
+
+/// (spec: web-ui — immediate panel refresh) The dashboard wires the
+/// stream-driven refresh: an `EventSource` on the refresh endpoint plus a
+/// fallback timer rendered from the configured interval.
+#[tokio::test]
+async fn dashboard_wires_stream_refresh_with_configured_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
+    };
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(
+        page.contains("new EventSource('/api/refresh-events')"),
+        "dashboard should subscribe to the refresh stream"
+    );
+    assert!(
+        page.contains("setTimeout(bump,"),
+        "fallback timer should render into the page"
+    );
+    assert!(
+        page.contains("clearTimeout(timer)"),
+        "SSE events should reset the fallback timer"
+    );
+    assert!(
+        !page.contains("setInterval(() =>"),
+        "unconditional interval tick should be gone (fallback-only)"
+    );
+
+    // A configured interval renders instead of the default.
+    let toml = format!(
+        r#"
+database_path = "{db}"
+failure_threshold = 1
+web_refresh_interval = "2s"
+
+[[sources]]
+name = "echo"
+type = "query"
+command = "echo 42"
+
+[[layouts]]
+title = "Overview"
+rows = [["echo"]]
+"#,
+        db = dir.path().join("other.duckdb").display(),
+    );
+    let cfg2: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg2).unwrap();
+    let db2 = Db::open_rw(&dir.path().join("other.duckdb")).unwrap();
+    let state2 = AppState {
+        db: db2.clone(),
+        cfg: Arc::new(cfg2.clone()),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
+    };
+    let router2 = build_router_with_bundle(state2, Some(test_asset_bundle()));
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url2 = format!("http://{}", listener2.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener2, router2).await });
+    let page2 = reqwest::get(&url2).await.unwrap().text().await.unwrap();
+    assert!(
+        page2.contains("setTimeout(bump,"),
+        "configured page should also wire the fallback timer"
+    );
+    assert!(
+        page2.contains("&quot;v&quot;:&quot;2000&quot;"),
+        "configured 2s interval should render into the page"
+    );
+    assert!(
+        !page2.contains("&quot;v&quot;:&quot;5000&quot;"),
+        "configured page should not carry the default 5s interval"
+    );
+}
+
+/// (spec: source-configuration) `web_refresh_interval` parses from TOML and
+/// env, defaults to 5s, and rejects zero.
+#[test]
+fn web_refresh_interval_config_sources_and_validation() {
+    let cfg: config::Config = toml::from_str("").unwrap();
+    assert_eq!(cfg.web_refresh_interval, std::time::Duration::from_secs(5));
+    let cfg: config::Config = toml::from_str("web_refresh_interval = \"12s\"").unwrap();
+    assert_eq!(cfg.web_refresh_interval, std::time::Duration::from_secs(12));
+    let cfg = config::Config {
+        web_refresh_interval: std::time::Duration::ZERO,
+        ..config::Config::default()
+    };
+    assert!(config::validate(&cfg).is_err());
+}
+
 /// (spec: web-ui — light/dark theme toggle) The toggle indicates the proposed
 /// action, not the current state: the light page offers the dark theme (moon
 /// icon), the dark page offers the light theme (sun icon).
@@ -2810,6 +3017,7 @@ async fn theme_toggle_indicates_proposed_action() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2894,6 +3102,7 @@ rows = [
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2935,6 +3144,7 @@ rows = [
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3014,6 +3224,7 @@ rows = [
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3045,6 +3256,7 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3097,6 +3309,7 @@ async fn web_ui_summary_chip_href_matches_panel_id() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3626,6 +3839,7 @@ rows = [["cpu"]]
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3717,6 +3931,7 @@ rows = [["price"]]
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3750,6 +3965,7 @@ async fn log_view_favicon_reflects_failing_source() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3797,6 +4013,7 @@ rows = [["cpu"]]
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3824,6 +4041,7 @@ async fn log_view_favicon_falls_back_to_green_for_unbanded_healthy_source() {
         db: db.clone(),
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

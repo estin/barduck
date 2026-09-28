@@ -18,10 +18,11 @@ ratatui = "0.30"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+futures-core = "0.3"
 serde_urlencoded = "0.7"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "signal", "net", "process", "io-util"] }
 toml = "1.1"
-topcoat = { version = "0.9", features = ["font-fontsource", "tailwind", "ui"] }
+topcoat = { version = "0.9", features = ["font-fontsource", "sse", "tailwind", "ui"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

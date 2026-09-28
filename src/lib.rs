@@ -33,6 +33,56 @@ pub struct AppState {
     /// schedule). Empty in tests and one-shot callers, which have no
     /// collector tasks to talk to.
     pub controls: std::collections::HashMap<String, collector::ControlSender>,
+    /// Publishes a monotonic generation per stored value so browsers can
+    /// re-render panels immediately over SSE instead of waiting for the
+    /// fallback tick (spec: web-ui — immediate panel refresh).
+    pub refresh: RefreshHub,
+}
+
+/// Monotonic refresh generation + fan-out for the SSE refresh stream.
+///
+/// `generation` counts every successfully stored value; each store
+/// publishes the new generation to the `Db`'s subscriber set (one sender
+/// per open SSE stream). A lagged or absent receiver just misses events —
+/// the browser's fallback tick covers the gap — so publishing never fails
+/// the store itself.
+#[derive(Debug, Clone)]
+pub struct RefreshHub {
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RefreshHub {
+    /// Creates a hub with generation 0.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Current generation (number of values stored so far).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Bumps the generation and publishes it to `db`'s refresh
+    /// subscribers; returns the new generation.
+    #[must_use]
+    pub fn notify_stored(&self, db: &crate::db::Db) -> u64 {
+        let next = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        db.publish_refresh(next);
+        next
+    }
+}
+
+impl Default for RefreshHub {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Daemon mode: collector + HTTP server (API and web UI) in one process.
@@ -61,6 +111,7 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
         db,
         cfg: Arc::new(cfg.clone()),
         controls: txs,
+        refresh: RefreshHub::new(),
     };
     println!(
         "barduck daemon listening on http://{} (web UI at /)",
