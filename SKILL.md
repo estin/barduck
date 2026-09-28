@@ -1,7 +1,7 @@
 # barduck Skill Reference
 
 > barduck is a single-binary home dashboard that collects values from config-defined shell sources, stores them in DuckDB, and displays them via a web UI, TUI, CLI, and JSON API.
-> Pass the TOML config with `--config` (default: `config.toml`). Each source command runs in the config file's directory, so script paths resolve relative to it without changing the application's working directory.
+> Pass the TOML config with `--config` (default: `$XDG_CONFIG_HOME/barduck/config.toml`, else `~/.config/barduck/config.toml`, else `./config.toml`; override with `BARDUCK_CONFIG`). Each source command runs in the config file's directory, so script paths resolve relative to it without changing the application's working directory.
 
 ## Creating Sources by User Query
 
@@ -285,7 +285,7 @@ Sources not visible in a surface render as empty space rather than failing.
 
 ## CLI Commands
 
-All commands support a `--config` flag (default: `config.toml`).
+All commands support a `--config` flag (default: XDG `barduck/config.toml`, else `./config.toml`; override with `BARDUCK_CONFIG`).
 
 | Command | Description | Key Flags |
 |---------|-------------|-----------|
@@ -350,7 +350,7 @@ duration of that one command.
 ## System Architecture
 
 - **Storage**: Embedded DuckDB (one file, plain SQL accessible)
-- **Config**: TOML (`sources`, `layouts`) selected with `--config` (default: `config.toml`) — adding a data point needs no code changes
+- **Config**: TOML (`sources`, `layouts`) selected with `--config` (default: XDG `barduck/config.toml`, else `./config.toml`; override with `BARDUCK_CONFIG`) — adding a data point needs no code changes
 - **Surfaces**: `daemon` (collector + API + web), `tui` (ratatui), CLI commands, all with direct-DB or daemon-backed modes
 - **Collection**: `query` sources run on schedule; `stream` sources run continuously
 - **Working directory**: each command runs in the config file's directory; the application's working directory is unchanged
