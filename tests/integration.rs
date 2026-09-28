@@ -2795,6 +2795,72 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
     assert_eq!(bad.status(), 400);
 }
 
+/// (spec: web-ui — light/dark theme toggle) The toggle indicates the proposed
+/// action, not the current state: the light page offers the dark theme (moon
+/// icon), the dark page offers the light theme (sun icon).
+#[tokio::test]
+async fn theme_toggle_indicates_proposed_action() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+    };
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let light = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    assert!(
+        light.contains(r#"aria-label="Switch to dark theme""#),
+        "light page toggle should offer switching to dark"
+    );
+    assert!(
+        light.contains(r#"<svg class="dark:hidden size-4""#),
+        "moon icon should be the light-mode-revealed one"
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}api/theme"))
+        .json(&serde_json::json!({ "theme": "dark" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+    let dark = client
+        .get(&url)
+        .header("Cookie", cookie_pair)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        dark.contains(r#"aria-label="Switch to light theme""#),
+        "dark page toggle should offer switching to light"
+    );
+    assert!(
+        dark.contains(r#"<svg class="hidden dark:inline-block size-4""#),
+        "sun icon should be the dark-mode-revealed one"
+    );
+}
+
 /// A generalized pane cell with no `title` and no `main` renders no title
 /// span at all (spec: web-ui — panel title rendered on the card border).
 #[tokio::test]
