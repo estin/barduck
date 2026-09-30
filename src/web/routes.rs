@@ -165,7 +165,7 @@ const THEME_TOGGLE_SCRIPT: &str = r"(function () {
     });
 })();";
 
-/// Drives every "poll now" control on the page (spec: web-ui — Panels can
+/// Drives every poll control on the page (spec: web-ui — Panels can
 /// force a poll). One delegated listener rather than per-button handlers:
 /// the panel shard replaces the grid's DOM on every tick, so anything bound
 /// to a particular button would stop working seconds later.
@@ -174,11 +174,14 @@ const THEME_TOGGLE_SCRIPT: &str = r"(function () {
 /// button's `disabled` attribute, for the same reason — a re-render would
 /// otherwise hand the user a fresh, enabled button for a poll that is still
 /// running. No separate progress/failure popup: the clicked button itself
-/// flips to "polling…" for the request's own duration (immediate, since the
-/// endpoint doesn't answer until the fetch is done), and the outcome —
-/// success or failure — shows up the same way it does for anyone else
-/// watching, through the shared `polling`/health state every viewer's next
-/// tick re-renders from (spec: web-ui — poll-in-progress is visible).
+/// enters a busy state for the request's own duration (immediate, since the
+/// endpoint doesn't answer until the fetch is done) — disabled with
+/// `aria-busy` and a spinning icon — and the outcome, success or failure,
+/// shows up the same way it does for anyone else watching, through the
+/// shared `polling`/health state every viewer's next tick re-renders from
+/// (spec: web-ui — poll-in-progress is visible). The busy state never
+/// rewrites the button's content: the control is icon markup, so a
+/// `textContent` swap would destroy the icon and restore it as escaped text.
 const POLL_SCRIPT: &str = r"(function () {
     var inFlight = new Set();
     document.addEventListener('click', function (ev) {
@@ -191,15 +194,17 @@ const POLL_SCRIPT: &str = r"(function () {
         var source = btn.dataset.bdPoll;
         if (inFlight.has(source)) return;
         inFlight.add(source);
-        var label = btn.textContent;
+        var icon = btn.querySelector('svg');
         btn.disabled = true;
-        btn.textContent = 'polling…';
+        btn.setAttribute('aria-busy', 'true');
+        if (icon) icon.classList.add('bd-spin');
         fetch('/api/sources/' + encodeURIComponent(source) + '/poll', { method: 'POST' })
             .catch(function () {})
             .finally(function () {
                 inFlight.delete(source);
                 btn.disabled = false;
-                btn.textContent = label;
+                btn.removeAttribute('aria-busy');
+                if (icon) icon.classList.remove('bd-spin');
             });
     });
 })();";
@@ -256,7 +261,7 @@ pub(super) async fn page_chrome(
                 topcoat::font::link(font: GEIST)
                 <link rel="stylesheet" href=(tailwind::stylesheet!())>
                 <style>
-                    "[id^='panel-']:target { outline: 3px solid #6366f1; outline-offset: 2px; }
+                    "[data-bd-poll] svg.bd-spin { animation: bd-spin 1s linear infinite; } @keyframes bd-spin { to { transform: rotate(360deg); } }
                     /* Below phone width, the grid's dynamic per-layout inline
                        styles (a fixed column count and each cell's explicit
                        grid-row/grid-column) can't vary by viewport on their
@@ -281,8 +286,17 @@ pub(super) async fn page_chrome(
                     // panel refresh): each `refresh` event bumps the tick so
                     // shards re-render at once; the timer below is a fallback
                     // that only fires when no event arrived within the
-                    // configured interval (each event resets it).
-                    raw!("(globalThis.__bdRefresh = (() => { const bump = () => ${t}.increment(); let timer = setTimeout(bump, ${interval_ms}); const es = new EventSource('/api/refresh-events'); es.addEventListener('refresh', () => { bump(); clearTimeout(timer); timer = setTimeout(bump, ${interval_ms}); }); return { bump }; })(), 'tick')", {
+                    // configured interval (each event resets it). Every bump
+                    // also dispatches `barduck:panels-updated` (spec: web-ui
+                    // — panels-updated event for user scripts) so
+                    // once-subscribed user scripts observe each refresh: the
+                    // source list is tick-invariant (layout config is static
+                    // per page load), so scanning the currently rendered
+                    // `#panel-<id>` anchors names exactly the sources this
+                    // refresh renders. Handlers needing post-morph DOM state
+                    // must defer (e.g. `requestAnimationFrame`); the tick
+                    // bump requests the re-render rather than awaiting it.
+                    raw!("(globalThis.__bdRefresh = (() => { const bump = () => { ${t}.increment(); try { var els = document.querySelectorAll('#bd-panel-wrapper [id^=\"panel-\"]'); var sources = []; for (var i = 0; i < els.length; i++) { var id = els[i].getAttribute('id'); if (id && id.indexOf('panel-') === 0) sources.push(id.slice(6)); } document.dispatchEvent(new CustomEvent('barduck:panels-updated', { detail: { sources: sources } })); } catch (e) {} }; let timer = setTimeout(bump, ${interval_ms}); const es = new EventSource('/api/refresh-events'); es.addEventListener('refresh', () => { bump(); clearTimeout(timer); timer = setTimeout(bump, ${interval_ms}); }); return { bump }; })(), 'tick')", {
                         let _ = t.get();
                         let _ = interval_ms;
                         "tick"
@@ -332,9 +346,9 @@ pub(super) async fn page_chrome(
                             // The heading (and the poll control it carries) is
                             // rendered by the `log_rows` shard, not here:
                             // `page_chrome` is fixed once per real request, so
-                            // a poll control placed here would keep claiming
-                            // "poll now" for the whole duration of a running
-                            // fetch and queue another one on every click,
+                            // a poll control placed here would keep showing
+                            // the idle control for the whole duration of a
+                            // running fetch and queue another one on every click,
                             // while the panels' own controls — inside the
                             // `panels_grid` shard — do reflect it (spec:
                             // web-ui — poll-in-progress is visible).
@@ -357,6 +371,15 @@ pub(super) async fn page_chrome(
                 <script>(Unescaped::new_unchecked(FAVICON_SCRIPT))</script>
                 <script>(Unescaped::new_unchecked(THEME_TOGGLE_SCRIPT))</script>
                 <script>(Unescaped::new_unchecked(POLL_SCRIPT))</script>
+                // User scripts live in the static shell, outside the shards'
+                // comment markers, so topcoat's `morph` never touches them:
+                // they run exactly once per page load (spec: web-ui —
+                // user-defined scripts injected into the web UI). Classic
+                // scripts in document order — no async/defer/module — so
+                // they execute in resolution order with globals shared.
+                for script in &st.user_scripts {
+                    <script src=(format!("/assets/user-js/{}", script.name))></script>
+                }
             </body>
         </html>
     })

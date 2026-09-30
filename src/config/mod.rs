@@ -22,7 +22,7 @@ pub use source::{
 use defaults::{
     apply_env_overrides_from, default_config_dir, default_db_path, default_history_points,
     default_interval, default_listen, default_logs_per_page, default_threshold, default_tui_width,
-    default_web_refresh_interval,
+    default_user_js, default_web_refresh_interval,
 };
 use validation::{validate_cell, validate_source};
 
@@ -65,6 +65,15 @@ pub struct Config {
     /// forever, matching prior behavior (spec: data-storage — retention).
     #[serde(default, with = "humantime_serde::option")]
     pub retention: Option<Duration>,
+    /// User JavaScript files injected at the end of the web UI `<body>`,
+    /// loaded in resolution order (spec: source-configuration — user-defined
+    /// web UI scripts configuration). Each entry is a `.js` file or a
+    /// directory of `.js` files. Like `sources`/`layouts`, never overridden
+    /// from the environment. Resolution (relative-to-`config_dir` join,
+    /// directory expansion, dedupe) happens in [`resolve_user_js`], called
+    /// by [`load_from`] after `config_dir` is set.
+    #[serde(default = "default_user_js")]
+    pub web_user_js: Vec<PathBuf>,
     #[serde(default)]
     pub sources: Vec<SourceCfg>,
     #[serde(default)]
@@ -92,6 +101,7 @@ impl Default for Config {
             logs_per_page: default_logs_per_page(),
             web_refresh_interval: default_web_refresh_interval(),
             retention: None,
+            web_user_js: default_user_js(),
             sources: Vec::new(),
             layouts: Vec::new(),
             tui_width: default_tui_width(),
@@ -134,6 +144,81 @@ fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Con
     source::expand_composites(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
+}
+
+/// One user JavaScript file resolved from [`Config::web_user_js`]: `name`
+/// is the opaque per-startup URL key served under `/assets/user-js/<name>`
+/// (never derived from the request — traversal impossible by construction);
+/// `path` is the resolved file the handler reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedUserScript {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// Resolves [`Config::web_user_js`] into the ordered, deduped file list the
+/// web UI injects and serves (spec: source-configuration — user-defined web
+/// UI scripts configuration): config-list order, then byte-wise filename
+/// order within each directory. Entries join `config_dir` when relative,
+/// exactly like `database_path`. Unresolvable entries (missing, unreadable,
+/// or neither file nor directory) warn naming the entry and are skipped, so
+/// a typo'd script path never takes the dashboard down. Dedupe is by
+/// canonical path, keeping the first occurrence.
+#[must_use]
+pub fn resolve_user_js(entries: &[PathBuf], config_dir: &Path) -> Vec<ResolvedUserScript> {
+    let mut out: Vec<ResolvedUserScript> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for entry in entries {
+        let joined = if entry.is_relative() {
+            config_dir.join(entry)
+        } else {
+            entry.clone()
+        };
+        match std::fs::metadata(&joined) {
+            Ok(md) if md.is_dir() => match std::fs::read_dir(&joined) {
+                Ok(dir) => {
+                    let mut files: Vec<PathBuf> = dir
+                        .filter_map(std::result::Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|ext| ext == "js") && p.is_file())
+                        .collect();
+                    files.sort();
+                    for file in &files {
+                        push_user_js_file(file, &mut seen, &mut out);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("web_user_js: skipping {}: {e:#}", joined.display());
+                }
+            },
+            Ok(_) => push_user_js_file(&joined, &mut seen, &mut out),
+            Err(e) => {
+                tracing::warn!("web_user_js: skipping {}: {e:#}", joined.display());
+            }
+        }
+    }
+    out
+}
+
+fn push_user_js_file(
+    file: &Path,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<ResolvedUserScript>,
+) {
+    match file.canonicalize() {
+        Ok(canonical) => {
+            if seen.insert(canonical.clone()) {
+                let name = format!("u{}.js", out.len());
+                out.push(ResolvedUserScript {
+                    name,
+                    path: canonical,
+                });
+            }
+        }
+        Err(e) => {
+            tracing::warn!("web_user_js: skipping {}: {e:#}", file.display());
+        }
+    }
 }
 pub fn validate(cfg: &Config) -> Result<()> {
     // `history_points` sizes a per-panel allocation in the web renderer,
@@ -1165,5 +1250,77 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.database_path, dir.path().join("override.duckdb"));
+    }
+
+    /// `web_user_js` resolves file-or-dir entries in config-list order with
+    /// alphabetic directory expansion, dedupes by canonical path keeping the
+    /// first occurrence, and skips missing paths without failing (spec:
+    /// source-configuration — user-defined web UI scripts configuration).
+    #[test]
+    fn user_js_resolution_orders_expands_and_dedupes() {
+        let dir = tempfile::tempdir().unwrap();
+        let extra = dir.path().join("extra");
+        std::fs::create_dir(&extra).unwrap();
+        // `b.js` sorts before `a.js` on disk creation order but after it
+        // alphabetically; `note.txt` must not be picked up.
+        std::fs::write(extra.join("b.js"), "b").unwrap();
+        std::fs::write(extra.join("a.js"), "a").unwrap();
+        std::fs::write(extra.join("note.txt"), "x").unwrap();
+        let lone = dir.path().join("lone.js");
+        std::fs::write(&lone, "lone").unwrap();
+
+        let resolved = resolve_user_js(
+            &[
+                lone.clone(),
+                extra.clone(),
+                extra.join("a.js"),
+                dir.path().join("missing.js"),
+            ],
+            dir.path(),
+        );
+
+        let names: Vec<&str> = resolved
+            .iter()
+            .map(|s| s.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["lone.js", "a.js", "b.js"]);
+        let urls: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(urls, ["u0.js", "u1.js", "u2.js"]);
+    }
+
+    /// Relative `web_user_js` entries resolve against the config file's own
+    /// directory, exactly like `database_path` (spec: source-configuration —
+    /// user-defined web UI scripts configuration).
+    #[test]
+    fn user_js_relative_entries_resolve_against_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "listen = \"127.0.0.1:0\"\nweb_user_js = [\"scripts/x.js\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts/x.js"), "x").unwrap();
+
+        let cfg = load_from(&config_path, lookup_from(&[])).unwrap();
+
+        assert_eq!(cfg.web_user_js, vec![PathBuf::from("scripts/x.js")]);
+        let resolved = resolve_user_js(&cfg.web_user_js, &cfg.config_dir);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, dir.path().join("scripts/x.js"));
+    }
+
+    /// Unknown top-level keys still fail even next to a valid `web_user_js`
+    /// (spec: source-configuration — user-defined web UI scripts
+    /// configuration).
+    #[test]
+    fn unknown_key_next_to_user_js_still_rejected() {
+        let err = toml::from_str::<Config>("web_user_js = [\"x.js\"]\nweb_user_jss = [\"y.js\"]\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("web_user_jss"),
+            "error should name the unknown key: {err}"
+        );
     }
 }

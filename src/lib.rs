@@ -37,6 +37,11 @@ pub struct AppState {
     /// re-render panels immediately over SSE instead of waiting for the
     /// fallback tick (spec: web-ui — immediate panel refresh).
     pub refresh: RefreshHub,
+    /// User JavaScript files resolved once at startup from
+    /// [`config::Config::web_user_js`], served at `/assets/user-js/<name>`
+    /// and injected at the end of the web UI `<body>` (spec: web-ui —
+    /// user-defined scripts injected into the web UI).
+    pub user_scripts: Vec<config::ResolvedUserScript>,
 }
 
 /// Monotonic refresh generation + fan-out for the SSE refresh stream.
@@ -112,6 +117,7 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
         cfg: Arc::new(cfg.clone()),
         controls: txs,
         refresh: RefreshHub::new(),
+        user_scripts: config::resolve_user_js(&cfg.web_user_js, &cfg.config_dir),
     };
     println!(
         "barduck daemon listening on http://{} (web UI at /)",

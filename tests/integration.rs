@@ -148,6 +148,7 @@ async fn start_daemon(cfg: &config::Config, db: &Db) -> String {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -299,6 +300,7 @@ retry_interval = "2s"
         cfg: Arc::new(cfg.clone()),
         controls: txs,
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -652,6 +654,7 @@ async fn start_daemon_with_collectors(
         cfg: Arc::new(cfg.clone()),
         controls: txs,
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -900,6 +903,7 @@ async fn api_force_poll_reports_a_missing_collector() {
         cfg: Arc::new(cfg.clone()),
         controls,
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = barduck::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -924,7 +928,175 @@ async fn api_force_poll_reports_a_missing_collector() {
     assert!(db.logs(None, 10).await.unwrap().is_empty());
 }
 
-/// The dashboard offers a "poll now" control for every source that can be
+/// User scripts configured in `web_user_js` are injected at the end of
+/// `<body>` in resolution order on both pages, served as JavaScript from the
+/// registry only, and survive a content refresh untouched (spec: web-ui —
+/// user-defined scripts injected into the web UI; spec: source-configuration
+/// — user-defined web UI scripts configuration).
+/// Writes `lone.js` plus a `js/` dir holding `a.js`, `b.js`, and a
+/// non-JS decoy, and returns the `web_user_js` entries covering them.
+fn write_user_js_fixture(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let js_dir = dir.join("js");
+    std::fs::create_dir(&js_dir).unwrap();
+    std::fs::write(js_dir.join("b.js"), "globalThis.__bdB = 1;").unwrap();
+    std::fs::write(js_dir.join("a.js"), "globalThis.__bdA = 1;").unwrap();
+    std::fs::write(js_dir.join("skip.txt"), "not js").unwrap();
+    std::fs::write(dir.join("lone.js"), "globalThis.__bdLone = 1;").unwrap();
+    vec![
+        std::path::PathBuf::from("lone.js"),
+        std::path::PathBuf::from("js"),
+    ]
+}
+
+/// Serves `state` on a loopback port and returns the base URL.
+async fn serve(state: AppState) -> String {
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+    base
+}
+
+/// GETs `path` under `base`, returning the body.
+async fn get_body(base: &str, path: &str) -> String {
+    reqwest::get(format!("{base}{path}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+/// Fetches every user-script URL variant the serving route must accept or
+/// reject: a registered file (bytes + JS content type), an unknown name, and
+/// a traversal attempt.
+async fn check_user_js_serving(base: &str) {
+    // The registry serves each file as JavaScript…
+    let js = reqwest::get(format!("{base}/assets/user-js/u1.js"))
+        .await
+        .unwrap();
+    assert_eq!(js.status(), 200);
+    assert_eq!(
+        js.headers().get("content-type").unwrap(),
+        "application/javascript"
+    );
+    assert_eq!(js.text().await.unwrap(), "globalThis.__bdA = 1;");
+    // …and nothing outside it: unknown names 404, and configured files are
+    // not reachable by filesystem path.
+    let missing = reqwest::get(format!("{base}/assets/user-js/u9.js"))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    let traversal = reqwest::get(format!("{base}/assets/user-js/..%2F..%2Flone.js"))
+        .await
+        .unwrap();
+    assert_eq!(traversal.status(), 404);
+}
+
+#[tokio::test]
+async fn web_ui_injects_configured_user_scripts_after_shard_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let entries = write_user_js_fixture(dir.path());
+    assert_eq!(
+        entries,
+        vec![
+            std::path::PathBuf::from("lone.js"),
+            std::path::PathBuf::from("js"),
+        ]
+    );
+    let toml = format!(
+        r#"
+database_path = "{db}"
+web_user_js = ["lone.js", "js"]
+[[sources]]
+name = "cpu"
+type = "query"
+command = "echo 42"
+interval = "1h"
+[[layouts]]
+title = "Overview"
+rows = [["cpu"]]
+"#,
+        db = db_path.display(),
+    );
+    std::fs::write(dir.path().join("config.toml"), &toml).unwrap();
+    let cfg = config::load(&dir.path().join("config.toml")).unwrap();
+    // Entries stay as-declared; resolution expands the directory.
+    assert_eq!(cfg.web_user_js, entries);
+    let db = Db::open_rw(&db_path).unwrap();
+    db.insert_log("cpu", 1, None, Some("seed"), Origin::Poll)
+        .await
+        .unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
+        user_scripts: config::resolve_user_js(&cfg.web_user_js, &cfg.config_dir),
+    };
+    let base = serve(state).await;
+    let html = get_body(&base, "/").await;
+    // Resolution order: lone file first, then the directory alphabetically.
+    let lone = html
+        .find(r#"<script src="/assets/user-js/u0.js">"#)
+        .expect("lone tag");
+    let a = html
+        .find(r#"<script src="/assets/user-js/u1.js">"#)
+        .expect("a.js tag");
+    let b = html
+        .find(r#"<script src="/assets/user-js/u2.js">"#)
+        .expect("b.js tag");
+    assert!(
+        lone < a && a < b,
+        "tags must follow resolution order:\n{html}"
+    );
+    assert!(
+        !html.contains("u3.js"),
+        "skip.txt must not be injected:\n{html}"
+    );
+    // Tags sit after the daemon's own inline scripts, at the end of <body>:
+    // after POLL_SCRIPT's marker text and before </body>, outside the shard.
+    let poll_tail = html.find("inFlight").expect("daemon poll script");
+    let body_end = html.find("</body>").expect("body close");
+    assert!(
+        poll_tail < lone && b < body_end,
+        "tags must close the body:\n{html}"
+    );
+
+    // The log view carries the same tags in the same order.
+    let logs = get_body(&base, "/logs/cpu").await;
+    let logs_lone = logs
+        .find(r#"<script src="/assets/user-js/u0.js">"#)
+        .expect("log lone tag");
+    let logs_b = logs
+        .find(r#"<script src="/assets/user-js/u2.js">"#)
+        .expect("log b.js tag");
+    assert!(logs_lone < logs_b);
+
+    check_user_js_serving(&base).await;
+
+    // A shard refresh re-renders content without a full reload while the
+    // injected tags stay byte-identical: fetch the page, store a new value,
+    // fetch again — panels change, tags do not.
+    // The template emits each `<script>` on its own line (verified above
+    // via three ordered `find`s), so count occurrences rather than lines.
+    let tags_before = html.matches("/assets/user-js/").count();
+    assert_eq!(tags_before, 3);
+    db.insert_log("cpu", 1, None, Some("fresh"), Origin::Poll)
+        .await
+        .unwrap();
+    let refreshed = get_body(&base, "/").await;
+    let tags_after = refreshed.matches("/assets/user-js/").count();
+    assert_eq!(tags_before, tags_after, "shard refresh must not touch tags");
+    assert!(
+        refreshed.contains(">fresh<") || refreshed.contains("fresh"),
+        "the refresh must have picked up the new value"
+    );
+}
+
+/// The dashboard offers a poll control for every source that can be
 /// fetched, and none for the ones that cannot (spec: web-ui — Panels can
 /// force a poll).
 #[tokio::test]
@@ -963,6 +1135,7 @@ rows = [["cpu", "ticks", "pushed"]]
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -992,7 +1165,23 @@ rows = [["cpu", "ticks", "pushed"]]
         .text()
         .await
         .unwrap();
-    assert!(logs.contains(r#"data-bd-poll="cpu""#));
+    // The control is icon-only: a refresh icon and no visible text, with an
+    // accessible name naming the source (spec: web-ui — Panels can force a
+    // poll). The `aria-hidden` on the icon keeps it out of the accessible
+    // name computation; the bare string would also match the delegated
+    // script's, so the check anchors on the button's attributes.
+    assert!(
+        logs.contains("<svg") && logs.contains(r#"aria-hidden="true""#),
+        "the control should render a decorative icon:\n{logs}"
+    );
+    assert!(
+        logs.contains(r#"aria-label="Fetch cpu now""#),
+        "the control should name its source accessibly:\n{logs}"
+    );
+    assert!(
+        !logs.contains(">poll now<"),
+        "the control should carry no visible text label:\n{logs}"
+    );
     let stream_logs = reqwest::get(format!("{base}/logs/ticks"))
         .await
         .unwrap()
@@ -1004,6 +1193,141 @@ rows = [["cpu", "ticks", "pushed"]]
     assert!(!stream_logs.contains(r#"data-bd-poll="ticks""#));
 }
 
+/// Pages render with no injected tags when `web_user_js` is empty (spec:
+/// web-ui — user-defined scripts injected into the web UI): the default-off
+/// cutover keeps existing pages byte-identical in the script region.
+#[tokio::test]
+async fn web_ui_renders_no_user_script_tags_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+[[sources]]
+name = "cpu"
+type = "query"
+command = "echo 42"
+interval = "1h"
+[[layouts]]
+title = "Overview"
+rows = [["cpu"]]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    assert!(cfg.web_user_js.is_empty());
+    let db = Db::open_rw(&db_path).unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
+    };
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    for path in ["/", "/logs/cpu"] {
+        let html = reqwest::get(format!("{base}{path}"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            !html.contains("/assets/user-js/"),
+            "{path} must carry no user script tags:\n{html}"
+        );
+    }
+}
+
+/// Every tick-driven refresh dispatches `barduck:panels-updated` with the
+/// rendered source names — on the dashboard and the log view, with or
+/// without configured user scripts (spec: web-ui — panels-updated event for
+/// user scripts). A headless HTTP test cannot run the page's own JS, so this
+/// asserts the dispatch contract where it is observable server-side: the
+/// bump function carries the dispatch, and the page renders the anchors the
+/// payload is scanned from. Live listener behavior (subscribe-once, repeat
+/// delivery) is pinned by the dispatch living in the shared tick funnel
+/// every refresh flows through (SSE event and fallback timer alike).
+#[tokio::test]
+async fn web_ui_dispatches_panels_updated_on_every_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let toml = format!(
+        r#"
+database_path = "{db}"
+[[sources]]
+name = "cpu"
+type = "query"
+command = "echo 42"
+interval = "1h"
+[[layouts]]
+title = "Overview"
+rows = [["cpu"]]
+"#,
+        db = db_path.display(),
+    );
+    let cfg: config::Config = toml::from_str(&toml).unwrap();
+    config::validate(&cfg).unwrap();
+    let db = Db::open_rw(&db_path).unwrap();
+    db.insert_log("cpu", 1, None, Some("seed"), Origin::Poll)
+        .await
+        .unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
+    };
+    let base = serve(state).await;
+
+    for path in ["/", "/logs/cpu"] {
+        let html = get_body(&base, path).await;
+        // The shared tick funnel dispatches the event on every bump — the
+        // same `bump()` both SSE refresh events and the fallback timer
+        // call — with the payload scanned from the rendered panel anchors.
+        assert!(
+            html.contains("barduck:panels-updated"),
+            "{path} must dispatch the event on refresh:\n{html}"
+        );
+        assert!(
+            html.contains("new CustomEvent('barduck:panels-updated'"),
+            "{path} must construct the event with a detail payload:\n{html}"
+        );
+        assert!(
+            html.contains("detail: { sources: sources }"),
+            "{path} must carry the rendered source names:\n{html}"
+        );
+        // The dashboard renders per-source `#panel-<id>` cards; the log
+        // view renders that source's own log rows instead (no panel card),
+        // so the payload scan finds the anchor on the dashboard while the
+        // log view dispatches with its single viewed source.
+        if path == "/" {
+            assert!(
+                html.contains(r#"id="panel-cpu""#),
+                "{path} must render the anchor the payload is scanned from:\n{html}"
+            );
+        }
+    }
+    // The dispatch survives a content refresh untouched: it lives in the
+    // static tick-span script, outside the shard region the refresh
+    // re-renders.
+    db.insert_log("cpu", 1, None, Some("fresh"), Origin::Poll)
+        .await
+        .unwrap();
+    let refreshed = get_body(&base, "/").await;
+    assert!(
+        refreshed.contains("barduck:panels-updated"),
+        "the dispatch must survive a shard refresh:\n{refreshed}"
+    );
+}
 /// A completed poll reaches the panel on the dashboard's own refresh tick:
 /// the grid is a shard that re-reads the database, so no page reload and no
 /// extra plumbing is involved (spec: web-ui — Panels can force a poll).
@@ -1040,6 +1364,7 @@ rows = [["cpu"]]
         cfg: Arc::new(cfg.clone()),
         controls: txs,
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1116,6 +1441,7 @@ rows = [["slow"]]
         cfg: Arc::new(cfg.clone()),
         controls: txs,
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1271,6 +1597,7 @@ async fn log_view_renders_push_and_poll_origins() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1327,6 +1654,7 @@ async fn log_view_shows_error_text_in_value_cell() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1393,6 +1721,7 @@ command = "echo 0"
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1452,6 +1781,7 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1625,6 +1955,7 @@ async fn web_ui_composite_root_renders_as_a_table_of_its_children() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1705,6 +2036,7 @@ async fn web_ui_composite_as_pane_main_renders_children_table() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1748,6 +2080,7 @@ async fn web_ui_group_pane_renders_labeled_independently_colored_values() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1931,6 +2264,7 @@ async fn web_ui_history_bar_reflects_recent_readings() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2002,6 +2336,7 @@ async fn web_ui_unbanded_failing_source_colors_red_with_plain_label() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2083,6 +2418,7 @@ async fn web_ui_show_history_false_hides_bar_for_banded_source() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2155,6 +2491,7 @@ async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2231,6 +2568,7 @@ async fn web_ui_main_only_pane_renders_like_single_source_panel() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2340,6 +2678,7 @@ async fn web_ui_combined_pane_renders_all_three_sections() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2472,6 +2811,7 @@ async fn web_ui_hides_a_tui_only_source_but_keeps_the_unrestricted_one() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2546,6 +2886,7 @@ async fn web_ui_omits_hidden_pane_member_and_collapses_all_hidden_pane() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2637,6 +2978,7 @@ async fn dashboard_includes_connection_indicator() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2677,6 +3019,7 @@ async fn dashboard_includes_offline_banner_and_dim_toggle() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2720,6 +3063,7 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2917,6 +3261,7 @@ async fn dashboard_wires_stream_refresh_with_configured_fallback() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2967,6 +3312,7 @@ rows = [["echo"]]
         cfg: Arc::new(cfg2.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router2 = build_router_with_bundle(state2, Some(test_asset_bundle()));
     let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3018,6 +3364,7 @@ async fn theme_toggle_indicates_proposed_action() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3103,6 +3450,7 @@ rows = [
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3145,6 +3493,7 @@ rows = [
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3225,6 +3574,7 @@ rows = [
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3257,6 +3607,7 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3310,6 +3661,7 @@ async fn web_ui_summary_chip_href_matches_panel_id() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3840,6 +4192,7 @@ rows = [["cpu"]]
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3932,6 +4285,7 @@ rows = [["price"]]
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3966,6 +4320,7 @@ async fn log_view_favicon_reflects_failing_source() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4014,6 +4369,7 @@ rows = [["cpu"]]
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4042,6 +4398,7 @@ async fn log_view_favicon_falls_back_to_green_for_unbanded_healthy_source() {
         cfg: Arc::new(cfg.clone()),
         controls: std::collections::HashMap::default(),
         refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
     };
     let router = build_router_with_bundle(state, Some(test_asset_bundle()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

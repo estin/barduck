@@ -28,6 +28,9 @@ pub(crate) fn default_history_points() -> u32 {
 pub(crate) fn default_logs_per_page() -> u32 {
     50
 }
+pub(crate) fn default_user_js() -> Vec<PathBuf> {
+    Vec::new()
+}
 pub(crate) fn default_web_refresh_interval() -> Duration {
     Duration::from_secs(5)
 }

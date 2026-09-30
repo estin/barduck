@@ -63,6 +63,35 @@ pub async fn runtime_script(_cx: &Cx) -> Result<Response> {
     );
     Ok(resp)
 }
+path_param!(user_js_name: String, error = not_found);
+
+/// A configured user JavaScript file (spec: web-ui — user-defined scripts
+/// injected into the web UI). `name` is only ever looked up in the
+/// startup-resolved registry — never joined to the filesystem — so only
+/// configured files are reachable and `../` traversal is impossible by
+/// construction. Unknown names are 404, like unknown sources.
+#[route(GET "/assets/user-js/{user_js_name}")]
+pub async fn user_script(cx: &Cx) -> Result<Response> {
+    let st = app_context::<AppState>(cx);
+    let name = path_param::<UserJsName>(cx)?.clone();
+    let Some(script) = st.user_scripts.iter().find(|s| s.name == name) else {
+        return Ok(json_err(
+            StatusCode::NOT_FOUND,
+            &format!("unknown user script `{name}`"),
+        ));
+    };
+    match std::fs::read(&script.path) {
+        Ok(js) => {
+            let mut resp = Response::new(Body::from(js));
+            resp.headers_mut().insert(
+                topcoat::router::header::CONTENT_TYPE,
+                topcoat::router::HeaderValue::from_static("application/javascript"),
+            );
+            Ok(resp)
+        }
+        Err(e) => Ok(internal_error("GET /assets/user-js/{name}", &e.into())),
+    }
+}
 
 /// Frontend-initiated ping/pong health check (spec: http-api — ping/pong
 /// health endpoint). Cheap by design: no DB access.

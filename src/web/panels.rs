@@ -475,10 +475,12 @@ fn build_panel(
 }
 
 /// The per-source "fetch now" control (spec: web-ui — Panels can force a
-/// poll). Deliberately plain markup styled like the adjacent time-ago link
-/// rather than the `button` component, whose smallest size would tower over
-/// a footer built from `text-xs` text.
-///
+/// poll). An icon-only button — a refresh glyph with no visible text — in
+/// plain markup sized like the adjacent time-ago caption rather than the
+/// `button` component, whose smallest size would tower over a footer built
+/// from `text-xs` text. The icon is decorative (`aria-hidden`): the
+/// `aria-label`/`title` name the action, and an explicit `focus-visible`
+/// ring marks the control for keyboard users.
 /// It carries no click handler of its own: one delegated listener on the
 /// document (`POLL_SCRIPT`) drives every one of these, which is what keeps
 /// them working after the panel shard replaces the grid's DOM on its next
@@ -504,16 +506,25 @@ pub(super) async fn poll_button(source: String, polling: bool) -> Result<impl Vi
         .boxed())
     } else {
         Ok(view! {
-            <button
-                type="button"
-                data-bd-poll=(source.clone())
-                title=(format!("Fetch {source} now"))
-                aria-label=(format!("Fetch {source} now"))
-                class="normal-case opacity-60 hover:opacity-100 hover:underline cursor-pointer disabled:opacity-30 disabled:cursor-default bg-transparent border-0 p-0 font-inherit text-inherit"
-            >
-                "poll now"
-            </button>
-        }.boxed())
+             <button
+                 type="button"
+                 data-bd-poll=(source.clone())
+                 title=(format!("Fetch {source} now"))
+                 aria-label=(format!("Fetch {source} now"))
+                 class="normal-case opacity-60 hover:opacity-100 hover:underline cursor-pointer disabled:opacity-30 disabled:cursor-default bg-transparent border-0 p-0 font-inherit text-inherit focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current"
+             >
+                // Refresh glyph in the header theme toggle's icon language
+                // (`viewBox="0 0 24 24"`, `stroke="currentColor"`); sized to
+                // the caption text instead of the `button` component's icon
+                // size, which would tower over it.
+                <svg class="size-3.5 align-[-0.125em]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+                    <path d="M21 3v5h-5"></path>
+                    <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+                    <path d="M8 16H3v5"></path>
+                </svg>
+             </button>
+         }.boxed())
     }
 }
 

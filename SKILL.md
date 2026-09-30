@@ -124,6 +124,7 @@ config file, and every one is optional. Durations use humantime format
 | `logs_per_page` | `50` | `BARDUCK_LOGS_PER_PAGE` | Rows per page in the web log view (`/logs/<source>`). |
 | `retention` | unset — keep everything forever | — | How long collected data is kept before the daemon prunes it, e.g. `"30d"`. |
 | `tui_width` | `"auto"` | `BARDUCK_TUI_WIDTH` | TUI content width: `"auto"` or a fixed column count. |
+| `web_user_js` | `[]` (no scripts) | — | User JavaScript files injected at the end of the web UI `<body>`: a list of `.js` file or directory paths, e.g. `["extra.js", "scripts/"]`. Directory entries expand to their `*.js` files in alphabetic order (non-recursive); overall order is config-list order, then alphabetic within each directory. Relative paths resolve against the config file's directory. Served by the daemon at `/assets/user-js/<name>`; missing paths warn and are skipped. See [Custom Web UI Scripts](#custom-web-ui-scripts). |
 
 An environment override wins over both the config file's value and the
 built-in default, and its value is taken verbatim. The structural keys
@@ -282,6 +283,57 @@ Sources not visible in a surface render as empty space rather than failing.
 2. **Define a layout** with `[[layouts]]`, `title`, and `rows` using source `name` values
 3. **Use `Cell` objects** (`main`, `table`, `secondary`) to arrange sources in panels
 4. **Set `show_in`** to control which surfaces see the source
+
+## Custom Web UI Scripts
+
+The dashboard can load user JavaScript: set the top-level `web_user_js` list
+to `.js` files or directories of `.js` files. Directory entries expand to
+their `*.js` files in alphabetic order (non-recursive); overall load order is
+config-list order, then alphabetic within each directory. Relative paths
+resolve against the config file's directory, like `database_path`. The daemon
+serves the resolved files at `/assets/user-js/<name>` and injects one
+`<script src>` per file at the end of the web UI `<body>` on every page;
+missing or unreadable paths warn at startup and are skipped.
+
+```toml
+web_user_js = ["extra.js", "scripts/"]
+```
+
+After every panel refresh the page dispatches a `barduck:panels-updated`
+`CustomEvent` on `document`, with the rendered source names in
+`event.detail.sources`. Subscribe once — the listener observes every
+subsequent refresh without re-subscribing, since the tags live outside the
+shard region the refresh re-renders. The event fires on the tick bump (which
+requests the re-render), so a handler that reads freshly rendered panel DOM
+should defer a frame; handlers that only need the source list can act
+immediately. Wrap handler bodies in try/catch so one script's error cannot
+break other listeners.
+
+```js
+document.addEventListener("barduck:panels-updated", (event) => {
+  try {
+    for (const name of event.detail.sources) {
+      const panel = document.getElementById(`panel-${name}`);
+      if (!panel) continue;
+      requestAnimationFrame(() => {
+        // Per-source customization here, e.g. annotate the panel.
+      });
+    }
+  } catch (e) {
+    console.error("panel hook failed:", e);
+  }
+});
+```
+
+### Agent Workflow
+
+1. **Configure scripts** with `web_user_js` using file or directory paths;
+   confirm ordering expectations (config order, then alphabetic per directory)
+2. **Hook refreshes** with a `barduck:panels-updated` listener that queries
+   `#panel-<source>` inside the handler, deferring DOM reads a frame when
+   they must see the just-rendered state
+3. **Validate** by loading the dashboard and checking the browser console
+   for errors after a refresh tick
 
 ## CLI Commands
 
