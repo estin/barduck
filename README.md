@@ -133,3 +133,4 @@ nixpkgs' `duckdb` with the web UI's Tailwind assets pre-bundled) and
 - [sampler](https://sampler.dev/)
 - [glances](https://nicolargo.github.io/glances/)
 - [homepage](https://gethomepage.dev/)
+- [vesta](https://github.com/Veirt/vesta)
