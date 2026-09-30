@@ -28,6 +28,22 @@ The daemon SHALL serve the web dashboard from the configured listen address, ren
 - **WHEN** the refresh stream drops and a value is stored while it is down
 - **THEN** the next fallback refresh still picks up the stored value, as before
 
+#### Scenario: Fallback keeps firing while the stream stays down
+- **WHEN** the refresh stream stays down (or silently stops delivering) for several fallback intervals
+- **THEN** the fallback refresh fires once per interval for as long as no stream update arrives, and a stream the browser has given up on is reopened
+
+#### Scenario: Forced poll refreshes the clicking page without the stream
+- **WHEN** a forced poll started from a panel's poll control finishes while the refresh stream is down
+- **THEN** that page re-renders immediately anyway
+
+#### Scenario: Refresh stream resumes with one catch-up event
+- **WHEN** a browser reconnects to the refresh stream with a last-seen generation that differs from the current one
+- **THEN** it receives a single catch-up refresh event, and a fresh connection without one receives none
+
+#### Scenario: Refresh streams end on daemon shutdown
+- **WHEN** the daemon begins a graceful shutdown with refresh streams open
+- **THEN** those streams end promptly instead of holding shutdown for its timeout
+
 #### Scenario: Fallback interval is configurable
 - **WHEN** the operator sets the web refresh interval to a non-default value
 - **THEN** the browser's fallback refresh uses that interval instead of the default

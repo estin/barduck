@@ -179,7 +179,8 @@ const THEME_TOGGLE_SCRIPT: &str = r"(function () {
 /// `aria-busy` and a spinning icon — and the outcome, success or failure,
 /// shows up the same way it does for anyone else watching, through the
 /// shared `polling`/health state every viewer's next tick re-renders from
-/// (spec: web-ui — poll-in-progress is visible). The busy state never
+/// (spec: web-ui — poll-in-progress is visible); the clicking page bumps
+/// its own tick as soon as the request settles. The busy state never
 /// rewrites the button's content: the control is icon markup, so a
 /// `textContent` swap would destroy the icon and restore it as escaped text.
 const POLL_SCRIPT: &str = r"(function () {
@@ -202,6 +203,9 @@ const POLL_SCRIPT: &str = r"(function () {
             .catch(function () {})
             .finally(function () {
                 inFlight.delete(source);
+                // Re-render now rather than waiting for the SSE event, which
+                // a dead stream would never deliver.
+                if (globalThis.__bdRefresh) globalThis.__bdRefresh.bump();
                 btn.disabled = false;
                 btn.removeAttribute('aria-busy');
                 if (icon) icon.classList.remove('bd-spin');
@@ -285,8 +289,11 @@ pub(super) async fn page_chrome(
                     // SSE-driven immediate refresh (spec: web-ui — immediate
                     // panel refresh): each `refresh` event bumps the tick so
                     // shards re-render at once; the timer below is a fallback
-                    // that only fires when no event arrived within the
-                    // configured interval (each event resets it). Every bump
+                    // that fires every configured interval in which no event
+                    // arrived (each event pushes it back), so panels keep
+                    // refreshing while the stream is down or silently dead. A
+                    // stream the browser gave up on (`CLOSED`, e.g. an error
+                    // status during a daemon restart) is reopened. Every bump
                     // also dispatches `barduck:panels-updated` (spec: web-ui
                     // — panels-updated event for user scripts) so
                     // once-subscribed user scripts observe each refresh: the
@@ -296,7 +303,7 @@ pub(super) async fn page_chrome(
                     // refresh renders. Handlers needing post-morph DOM state
                     // must defer (e.g. `requestAnimationFrame`); the tick
                     // bump requests the re-render rather than awaiting it.
-                    raw!("(globalThis.__bdRefresh = (() => { const bump = () => { ${t}.increment(); try { var els = document.querySelectorAll('#bd-panel-wrapper [id^=\"panel-\"]'); var sources = []; for (var i = 0; i < els.length; i++) { var id = els[i].getAttribute('id'); if (id && id.indexOf('panel-') === 0) sources.push(id.slice(6)); } document.dispatchEvent(new CustomEvent('barduck:panels-updated', { detail: { sources: sources } })); } catch (e) {} }; let timer = setTimeout(bump, ${interval_ms}); const es = new EventSource('/api/refresh-events'); es.addEventListener('refresh', () => { bump(); clearTimeout(timer); timer = setTimeout(bump, ${interval_ms}); }); return { bump }; })(), 'tick')", {
+                    raw!("(globalThis.__bdRefresh ??= (() => { const bump = () => { ${t}.increment(); try { var els = document.querySelectorAll('#bd-panel-wrapper [id^=\"panel-\"]'); var sources = []; for (var i = 0; i < els.length; i++) { var id = els[i].getAttribute('id'); if (id && id.indexOf('panel-') === 0) sources.push(id.slice(6)); } document.dispatchEvent(new CustomEvent('barduck:panels-updated', { detail: { sources: sources } })); } catch (e) {} }; let timer = null; const arm = () => { clearTimeout(timer); timer = setTimeout(() => { bump(); arm(); }, ${interval_ms}); }; const connect = () => { const es = new EventSource('/api/refresh-events'); es.addEventListener('refresh', () => { bump(); arm(); }); es.onerror = () => { if (es.readyState === EventSource.CLOSED) setTimeout(connect, ${interval_ms}); }; }; arm(); connect(); return { bump }; })(), 'tick')", {
                         let _ = t.get();
                         let _ = interval_ms;
                         "tick"

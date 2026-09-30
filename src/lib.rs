@@ -33,9 +33,8 @@ pub struct AppState {
     /// schedule). Empty in tests and one-shot callers, which have no
     /// collector tasks to talk to.
     pub controls: std::collections::HashMap<String, collector::ControlSender>,
-    /// Publishes a monotonic generation per stored value so browsers can
-    /// re-render panels immediately over SSE instead of waiting for the
-    /// fallback tick (spec: web-ui — immediate panel refresh).
+    /// Lets open SSE refresh streams end when the daemon shuts down (spec:
+    /// web-ui — immediate panel refresh).
     pub refresh: RefreshHub,
     /// User JavaScript files resolved once at startup from
     /// [`config::Config::web_user_js`], served at `/assets/user-js/<name>`
@@ -44,49 +43,40 @@ pub struct AppState {
     pub user_scripts: Vec<config::ResolvedUserScript>,
 }
 
-/// Monotonic refresh generation + fan-out for the SSE refresh stream.
-///
-/// `generation` counts every successfully stored value; each store
-/// publishes the new generation to the `Db`'s subscriber set (one sender
-/// per open SSE stream). A lagged or absent receiver just misses events —
-/// the browser's fallback tick covers the gap — so publishing never fails
-/// the store itself.
-#[derive(Debug, Clone)]
+/// Shutdown wiring for the SSE refresh stream. The refresh generation itself
+/// lives on [`Db`] (every store path, collector or HTTP, bumps the same one);
+/// this only carries the daemon's shutdown signal, so open streams end
+/// instead of holding graceful shutdown for its full timeout. `new()` (tests,
+/// one-shot callers) never closes streams.
+#[derive(Debug, Clone, Default)]
 pub struct RefreshHub {
-    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    closing: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl RefreshHub {
-    /// Creates a hub with generation 0.
     #[must_use]
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ends open refresh streams once `shutdown` reports `true`.
+    #[must_use]
+    pub fn with_shutdown(shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
         Self {
-            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            closing: Some(shutdown),
         }
     }
 
-    /// Current generation (number of values stored so far).
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.generation.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Bumps the generation and publishes it to `db`'s refresh
-    /// subscribers; returns the new generation.
-    #[must_use]
-    pub fn notify_stored(&self, db: &crate::db::Db) -> u64 {
-        let next = self
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        db.publish_refresh(next);
-        next
-    }
-}
-
-impl Default for RefreshHub {
-    fn default() -> Self {
-        Self::new()
+    /// Resolves once the daemon starts shutting down; never, without a
+    /// shutdown signal (or if its sender is gone).
+    pub async fn closed(mut self) {
+        let stopped = match self.closing.as_mut() {
+            Some(rx) => rx.wait_for(|stop| *stop).await.is_ok(),
+            None => false,
+        };
+        if !stopped {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -109,6 +99,7 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
     let mut hub = collector::control_channels(&cfg)?;
     let txs = std::mem::take(&mut hub.txs);
     let mut tasks = collector::spawn_graceful(&db, &cfg, &shutdown_rx, hub);
+    let refresh = RefreshHub::with_shutdown(shutdown_rx.clone());
     if let Some(retention) = cfg.retention {
         tasks.push(spawn_retention(db.clone(), retention, shutdown_rx));
     }
@@ -116,7 +107,7 @@ pub async fn run_daemon(cfg: Config) -> Result<()> {
         db,
         cfg: Arc::new(cfg.clone()),
         controls: txs,
-        refresh: RefreshHub::new(),
+        refresh,
         user_scripts: config::resolve_user_js(&cfg.web_user_js, &cfg.config_dir),
     };
     println!(

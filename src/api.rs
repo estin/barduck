@@ -223,11 +223,14 @@ pub async fn set_theme(cx: &Cx, Json(body): Json<ThemeBody>) -> Result<Response>
     Ok(json_ok(&serde_json::json!({ "theme": body.theme })))
 }
 /// Streams refresh generations as Server-Sent Events (spec: web-ui —
-/// immediate panel refresh): one `refresh` event per stored value, `id:`
-/// carrying the generation so a reconnecting `EventSource` resumes via
-/// `Last-Event-ID`. `?from=` replays missed generations as catch-up events
-/// before subscribing to live ones; the stream otherwise ends only when the
-/// client disconnects.
+/// immediate panel refresh): a `refresh` event whenever the generation moves,
+/// `id:` carrying it so a reconnecting `EventSource` resumes via
+/// `Last-Event-ID` (or `?from=`). A resume whose id differs from the current
+/// generation — values were stored while disconnected, or the daemon
+/// restarted — gets one catch-up event; a fresh connection gets none, since
+/// the page it belongs to was just rendered. Several stores between polls of
+/// the stream coalesce into one event. The stream ends when the client
+/// disconnects or the daemon shuts down.
 #[route(GET "/api/refresh-events")]
 pub async fn refresh_events(
     cx: &Cx,
@@ -238,10 +241,11 @@ pub async fn refresh_events(
 > {
     use topcoat::router::content::sse::{KeepAlive, Sse, last_event_id};
     let st = app_context::<AppState>(cx);
-    let hub_generation = st.refresh.generation();
-    let resume_from: u64 = last_event_id(cx)
+    let mut rx = st.db.subscribe_refresh();
+    let current = *rx.borrow_and_update();
+    let resume_from: Option<u64> = last_event_id(cx)
         .and_then(|id| id.parse().ok())
-        .unwrap_or_else(|| {
+        .or_else(|| {
             uri(cx)
                 .query()
                 .and_then(|q| {
@@ -250,25 +254,49 @@ pub async fn refresh_events(
                         .and_then(|m| m.get("from").cloned())
                 })
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0)
         });
-    let start = resume_from
-        .saturating_add(1)
-        .min(hub_generation.saturating_add(1));
     let stream = RefreshEventStream {
-        db: st.db.clone(),
-        rx: None,
-        pending: (start..=hub_generation).collect(),
+        catch_up: resume_from
+            .is_some_and(|seen| seen != current)
+            .then_some(current),
+        hub: st.refresh.clone(),
+        next: Some(next_refresh(rx, st.refresh.clone())),
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::new()))
 }
 
-/// `Sse` event stream for [`refresh_events`]: first replays missed
-/// generations (resume gap), then forwards live subscriber events.
+type NextRefresh = std::pin::Pin<
+    Box<dyn Future<Output = Option<(u64, tokio::sync::watch::Receiver<u64>)>> + Send>,
+>;
+
+/// Waits for the next refresh generation, handing the receiver back so the
+/// stream can wait again; `None` once the daemon shuts down.
+fn next_refresh(mut rx: tokio::sync::watch::Receiver<u64>, hub: crate::RefreshHub) -> NextRefresh {
+    Box::pin(async move {
+        tokio::select! {
+            changed = rx.changed() => {
+                changed.ok()?;
+                let generation = *rx.borrow_and_update();
+                Some((generation, rx))
+            }
+            () = hub.closed() => None,
+        }
+    })
+}
+
+fn refresh_event(generation: u64) -> topcoat::router::content::sse::Event {
+    topcoat::router::content::sse::Event::new()
+        .event("refresh")
+        .id(generation.to_string())
+        .data(generation.to_string())
+}
+
+/// `Sse` event stream for [`refresh_events`]: an optional catch-up event,
+/// then one event per observed generation change.
 struct RefreshEventStream {
-    db: crate::db::Db,
-    rx: Option<tokio::sync::mpsc::UnboundedReceiver<u64>>,
-    pending: std::collections::VecDeque<u64>,
+    catch_up: Option<u64>,
+    hub: crate::RefreshHub,
+    next: Option<NextRefresh>,
 }
 
 impl futures_core::Stream for RefreshEventStream {
@@ -278,34 +306,27 @@ impl futures_core::Stream for RefreshEventStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::task::Poll;
-        if let Some(generation) = self.pending.pop_front() {
-            let event = topcoat::router::content::sse::Event::new()
-                .event("refresh")
-                .id(generation.to_string())
-                .data(generation.to_string());
-            return Poll::Ready(Some(Ok(event)));
+        if let Some(generation) = self.catch_up.take() {
+            return Poll::Ready(Some(Ok(refresh_event(generation))));
         }
-        if self.rx.is_none() {
-            let db = self.db.clone();
-            self.rx = Some(db.subscribe_refresh());
-        }
-        let Some(rx) = self.rx.as_mut() else {
-            return std::task::Poll::Ready(None);
+        let Some(next) = self.next.as_mut() else {
+            return Poll::Ready(None);
         };
-        match rx.poll_recv(cx) {
-            Poll::Ready(Some(generation)) => {
-                let event = topcoat::router::content::sse::Event::new()
-                    .event("refresh")
-                    .id(generation.to_string())
-                    .data(generation.to_string());
-                Poll::Ready(Some(Ok(event)))
+        match next.as_mut().poll(cx) {
+            Poll::Ready(Some((generation, rx))) => {
+                self.next = Some(next_refresh(rx, self.hub.clone()));
+                Poll::Ready(Some(Ok(refresh_event(generation))))
             }
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                self.next = None;
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
+#[route(GET "/api/logs")]
 pub async fn logs(cx: &Cx) -> Result<Response> {
     let st = app_context::<AppState>(cx);
     let q = LogsQuery::parse(uri(cx).query().unwrap_or(""))
@@ -366,15 +387,9 @@ pub async fn poll(cx: &Cx) -> Result<Response> {
         return Ok(gone());
     }
     match reply_rx.await {
-        Ok(outcome) => {
-            // A forced poll that stored a value re-renders browsers the
-            // same way any other stored value does (spec: web-ui —
-            // immediate panel refresh).
-            if outcome.success {
-                let _ = st.refresh.notify_stored(&st.db);
-            }
-            Ok(json_ok(&outcome))
-        }
+        // The collector task publishes the refresh for a successful forced
+        // poll itself (spec: web-ui — immediate panel refresh).
+        Ok(outcome) => Ok(json_ok(&outcome)),
         Err(_) => Ok(gone()),
     }
 }
@@ -433,7 +448,7 @@ pub async fn ingest(cx: &Cx, body: Bytes) -> Result<Response> {
     }
     // A stored value re-renders connected browsers immediately over the SSE
     // refresh stream (spec: web-ui — immediate panel refresh).
-    let _ = st.refresh.notify_stored(&st.db);
+    st.db.publish_refresh();
     // Move the source's interval wait to the success path; cron and stream
     // sources have no sender and are unaffected (spec: data-collection —
     // Ingested values reset interval schedules). A closed channel only

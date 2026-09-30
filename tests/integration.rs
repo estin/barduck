@@ -713,6 +713,8 @@ async fn api_force_poll_stores_a_reading_and_reports_it() {
             .unwrap();
     }
     let (base, shutdown_tx, tasks) = start_daemon_with_collectors(&cfg, &db).await;
+    let refresh = db.subscribe_refresh();
+    let before = *refresh.borrow();
 
     let resp = reqwest::Client::new()
         .post(format!("{base}/api/sources/ok/poll"))
@@ -725,6 +727,12 @@ async fn api_force_poll_stores_a_reading_and_reports_it() {
     assert_eq!(body["success"], true);
     assert_eq!(body["value"], "42");
     assert!(body["error"].is_null());
+    // (spec: web-ui — immediate panel refresh) the stored value bumps the
+    // refresh generation browsers re-render on.
+    assert!(
+        *refresh.borrow() > before,
+        "a successful forced poll should publish a refresh"
+    );
 
     let rows = db.logs(Some("ok"), 10).await.unwrap();
     assert_eq!(rows.len(), 2, "expected the seed plus the forced poll");
@@ -3164,9 +3172,39 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
     assert_eq!(bad.status(), 400);
 }
 
-/// (spec: web-ui — immediate panel refresh) The refresh stream emits one
-/// event per stored value and supports resume: an ingest triggers an event,
-/// and reconnecting with `Last-Event-ID` replays only missed generations.
+/// Reads SSE text from `resp` until it contains `needle` or `wait` elapses;
+/// returns everything read. A stream that ends early just returns.
+async fn read_sse_until(
+    resp: &mut reqwest::Response,
+    needle: &str,
+    wait: std::time::Duration,
+) -> String {
+    let mut text = String::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    while !text.contains(needle) {
+        match tokio::time::timeout_at(deadline, resp.chunk()).await {
+            Ok(Ok(Some(bytes))) => text.push_str(&String::from_utf8_lossy(&bytes)),
+            _ => break,
+        }
+    }
+    text
+}
+
+async fn open_refresh_stream(url: &str, query: &str) -> reqwest::Response {
+    let resp = reqwest::Client::new()
+        .get(format!("{url}/api/refresh-events{query}"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp
+}
+
+/// (spec: web-ui — immediate panel refresh) An open stream gets a live
+/// `refresh` event per store; a fresh connection replays nothing; a resume
+/// whose id differs from the current generation gets exactly one catch-up
+/// event, and a caught-up resume gets none.
 #[tokio::test]
 async fn refresh_stream_emits_on_ingest_and_resumes() {
     let dir = tempfile::tempdir().unwrap();
@@ -3176,74 +3214,117 @@ async fn refresh_stream_emits_on_ingest_and_resumes() {
     collect_once(&db, &cfg).await;
     let url = start_daemon(&cfg, &db).await;
 
-    let client = reqwest::Client::new();
-    // Baseline: open the stream, read the initial keep-alive/comment bytes
-    // plus nothing else (no values stored since subscribe).
-    let resp = client
-        .get(format!("{url}/api/refresh-events"))
-        .header("Accept", "text/event-stream")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let mut live = open_refresh_stream(&url, "").await;
     assert!(
-        resp.headers()
+        live.headers()
             .get("content-type")
             .is_some_and(|v| v.to_str().unwrap_or("").contains("text/event-stream")),
         "refresh endpoint should stream SSE"
     );
-
-    // Store a value via push ingest, then open a fresh stream resumed past
-    // generation 0: it must replay exactly the missed generation as one
-    // `refresh` event.
-    let ingest = client
-        .post(format!("{url}/api/ingest"))
-        .json(&serde_json::json!({"source": "echo", "value": "43"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ingest.status(), 200);
-
-    let mut resumed = client
-        .get(format!("{url}/api/refresh-events?from=0"))
-        .header("Accept", "text/event-stream")
-        .send()
-        .await
-        .unwrap();
-    let mut text = String::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !text.contains("event: refresh") && std::time::Instant::now() < deadline {
-        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), resumed.chunk())
+    let client = reqwest::Client::new();
+    for value in ["43", "44"] {
+        let ingest = client
+            .post(format!("{url}/api/ingest"))
+            .json(&serde_json::json!({"source": "echo", "value": value}))
+            .send()
             .await
-            .expect("resumed stream should yield the missed event promptly")
             .unwrap();
-        match chunk {
-            Some(bytes) => text.push_str(&String::from_utf8_lossy(&bytes)),
-            None => break,
-        }
+        assert_eq!(ingest.status(), 200);
     }
+    let text = read_sse_until(&mut live, "id: 2", std::time::Duration::from_secs(10)).await;
     assert!(
-        text.contains("event: refresh") && text.contains("id: 1"),
-        "resumed stream should replay generation 1: {text:?}"
+        text.contains("event: refresh") && text.contains("id: 2"),
+        "open stream should see live refresh events: {text:?}"
     );
 
-    // A stream resumed past the latest generation replays nothing.
-    let mut caught_up = client
-        .get(format!("{url}/api/refresh-events?from=99"))
-        .header("Accept", "text/event-stream")
-        .send()
-        .await
-        .unwrap();
-    let chunk = tokio::time::timeout(std::time::Duration::from_secs(18), caught_up.chunk())
-        .await
-        .expect("caught-up stream should yield at least the keep-alive")
-        .unwrap()
-        .unwrap();
-    let caught_text = String::from_utf8_lossy(&chunk);
+    // A fresh connection (no resume id) replays nothing, even though values
+    // were stored before it opened.
+    let mut fresh = open_refresh_stream(&url, "").await;
+    let text = read_sse_until(
+        &mut fresh,
+        "event: refresh",
+        std::time::Duration::from_secs(2),
+    )
+    .await;
     assert!(
-        !caught_text.contains("event: refresh"),
-        "caught-up stream should replay nothing: {caught_text:?}"
+        !text.contains("event: refresh"),
+        "fresh stream should replay nothing: {text:?}"
     );
+
+    // Behind (0 < 2) or from another process (99 != 2): one catch-up event
+    // carrying the current generation, not one per missed store.
+    for from in [0, 99] {
+        let mut resumed = open_refresh_stream(&url, &format!("?from={from}")).await;
+        let text = read_sse_until(&mut resumed, "id: 2", std::time::Duration::from_secs(10)).await;
+        assert_eq!(
+            text.matches("event: refresh").count(),
+            1,
+            "resume from {from} should catch up once: {text:?}"
+        );
+        assert!(
+            text.contains("id: 2"),
+            "catch-up carries the generation: {text:?}"
+        );
+    }
+
+    // Caught up: nothing to replay.
+    let mut caught_up = open_refresh_stream(&url, "?from=2").await;
+    let text = read_sse_until(
+        &mut caught_up,
+        "event: refresh",
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        !text.contains("event: refresh"),
+        "caught-up stream should replay nothing: {text:?}"
+    );
+}
+
+/// (spec: web-ui — immediate panel refresh) Open refresh streams end when
+/// the daemon shuts down, so graceful shutdown isn't held for its timeout.
+#[tokio::test]
+async fn refresh_stream_ends_on_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::with_shutdown(shutdown_rx),
+        user_scripts: Vec::new(),
+    };
+    let router = barduck::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let mut stream = open_refresh_stream(&url, "").await;
+    shutdown_tx.send(true).unwrap();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Ok(Some(_)) = stream.chunk().await {}
+    })
+    .await;
+    assert!(ended.is_ok(), "refresh stream should end on shutdown");
+}
+
+/// `GET /api/logs` stays routed (regression: its `#[route]` attribute was
+/// once dropped while adding the refresh stream).
+#[tokio::test]
+async fn api_logs_is_routed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    let url = start_daemon(&cfg, &db).await;
+    let resp = reqwest::get(format!("{url}/api/logs?source=echo"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
 }
 
 /// (spec: web-ui — immediate panel refresh) The dashboard wires the
@@ -3274,12 +3355,16 @@ async fn dashboard_wires_stream_refresh_with_configured_fallback() {
         "dashboard should subscribe to the refresh stream"
     );
     assert!(
-        page.contains("setTimeout(bump,"),
-        "fallback timer should render into the page"
+        page.contains("timer = setTimeout(() => { bump(); arm(); },"),
+        "fallback timer should render into the page and re-arm itself"
     );
     assert!(
-        page.contains("clearTimeout(timer)"),
+        page.contains("es.addEventListener('refresh', () => { bump(); arm(); })"),
         "SSE events should reset the fallback timer"
+    );
+    assert!(
+        page.contains("globalThis.__bdRefresh.bump()"),
+        "a finished forced poll should re-render without waiting for SSE"
     );
     assert!(
         !page.contains("setInterval(() =>"),
@@ -3320,7 +3405,7 @@ rows = [["echo"]]
     tokio::spawn(async move { topcoat::serve(listener2, router2).await });
     let page2 = reqwest::get(&url2).await.unwrap().text().await.unwrap();
     assert!(
-        page2.contains("setTimeout(bump,"),
+        page2.contains("timer = setTimeout(() => { bump(); arm(); },"),
         "configured page should also wire the fallback timer"
     );
     assert!(

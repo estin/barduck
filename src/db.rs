@@ -64,20 +64,25 @@ pub struct Db {
     /// Sources currently mid-fetch, for the current process only (spec:
     /// data-collection — Poll-in-progress is visible).
     polling: PollingSet,
-    /// Fired once per successfully stored reading so connected browsers can
-    /// re-render immediately (spec: web-ui — immediate panel refresh).
-    /// Process-local like `session_bands`: a fresh handle starts quiet.
-    /// `std` lock: holders only clone the small sender set, never hold
-    /// across `.await`.
-    refresh_notify: RefreshNotify,
+    /// Refresh generation, bumped once per successfully stored reading so
+    /// connected browsers can re-render immediately (spec: web-ui —
+    /// immediate panel refresh). Process-local like `session_bands`: a fresh
+    /// handle starts at 0.
+    refresh: RefreshSignal,
 }
 
-/// Refresh-generation subscribers: one `UnboundedSender` per open SSE
-/// stream. A `Vec`, not a set — `UnboundedSender` has no `Hash`/`Eq` —
-/// pruned of closed entries on every publish. `std` (not Tokio) lock for
-/// the same reason as [`SessionBands`].
-pub type RefreshNotify =
-    std::sync::Arc<std::sync::RwLock<Vec<tokio::sync::mpsc::UnboundedSender<u64>>>>;
+/// The one refresh-generation counter every store path bumps, as a `watch`
+/// channel: subscribers see only the latest generation, so a slow or stalled
+/// SSE stream never queues events, and subscribing reads the current
+/// generation atomically with starting to watch for the next one.
+#[derive(Clone)]
+pub struct RefreshSignal(std::sync::Arc<tokio::sync::watch::Sender<u64>>);
+
+impl Default for RefreshSignal {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::watch::channel(0).0))
+    }
+}
 
 /// In-memory threshold overrides keyed by source name. `std` (not Tokio)
 /// lock: holders only clone a small `Vec`, never hold across `.await`.
@@ -713,7 +718,7 @@ fn spawn_writer(path: PathBuf) -> mpsc::UnboundedSender<WriteCmd> {
             reader: None,
             session_bands: SessionBands::default(),
             polling: PollingSet::default(),
-            refresh_notify: RefreshNotify::default(),
+            refresh: RefreshSignal::default(),
         };
         let mut conn = match open_daemon_conn(&db) {
             Ok(conn) => conn,
@@ -808,7 +813,7 @@ fn spawn_reader(
             reader: None,
             session_bands: SessionBands::default(),
             polling: PollingSet::default(),
-            refresh_notify: RefreshNotify::default(),
+            refresh: RefreshSignal::default(),
         };
         let mut conn = match clone_writer_conn(&handle, &writer) {
             Ok(conn) => conn,
@@ -1138,7 +1143,7 @@ impl Db {
             reader: None,
             session_bands: SessionBands::default(),
             polling: PollingSet::default(),
-            refresh_notify: RefreshNotify::default(),
+            refresh: RefreshSignal::default(),
         };
         db.with_conn(create_schema)?;
         Ok(db)
@@ -1168,7 +1173,7 @@ impl Db {
             reader: None,
             session_bands: SessionBands::default(),
             polling: PollingSet::default(),
-            refresh_notify: RefreshNotify::default(),
+            refresh: RefreshSignal::default(),
         })
     }
 
@@ -1500,39 +1505,18 @@ impl Db {
         self.polling.read().is_ok_and(|set| set.contains(source))
     }
 
-    /// Subscribes to refresh generations: the returned receiver gets the
-    /// next generation on every successfully stored reading (spec: web-ui
-    /// — immediate panel refresh). Dropping it unsubscribes (pruned on the
-    /// next publish).
+    /// Subscribes to refresh generations (spec: web-ui — immediate panel
+    /// refresh): the receiver's current value is the latest generation and
+    /// `changed()` wakes on the next stored reading.
     #[must_use]
-    pub fn subscribe_refresh(&self) -> tokio::sync::mpsc::UnboundedReceiver<u64> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        if let Ok(mut subs) = self.refresh_notify.write() {
-            subs.push(tx);
-        }
-        rx
+    pub fn subscribe_refresh(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.refresh.0.subscribe()
     }
 
-    /// Publishes `generation` to every refresh subscriber, pruning dead
-    /// ones. Never fails: a missing/slow reader just misses the event and
-    /// the browser's fallback tick covers the gap.
-    pub fn publish_refresh(&self, generation: u64) {
-        let live: Vec<_> = self
-            .refresh_notify
-            .read()
-            .map(|subs| subs.clone())
-            .unwrap_or_default();
-        let mut dead = 0;
-        for tx in &live {
-            if tx.send(generation).is_err() {
-                dead += 1;
-            }
-        }
-        if dead > 0
-            && let Ok(mut subs) = self.refresh_notify.write()
-        {
-            subs.retain(|tx| !tx.is_closed());
-        }
+    /// Bumps the refresh generation after a successfully stored reading.
+    /// Never fails, with or without subscribers.
+    pub fn publish_refresh(&self) {
+        self.refresh.0.send_modify(|g| *g += 1);
     }
 
     pub async fn last_health(&self, source: &str) -> Result<Option<String>> {

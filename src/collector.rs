@@ -163,15 +163,6 @@ pub enum Control {
 pub type ControlSender = tokio::sync::mpsc::UnboundedSender<Control>;
 pub type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<Control>;
 
-/// Process-local refresh generation for collector-task stores (spec: web-ui
-/// — immediate panel refresh): the `RefreshHub` in `AppState` owns the
-/// authoritative counter for HTTP-ingest stores, but collector tasks only
-/// hold the shared `Db`, so scheduled/stream stores bump this counter and
-/// publish alongside. Starts at 0 per process like the hub.
-pub(crate) fn next_refresh_generation() -> u64 {
-    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
-}
 /// Control wiring between the HTTP handlers and collector tasks: one
 /// channel per *pollable* source — every query source, interval- or
 /// cron-scheduled. Stream and ingest sources are excluded: neither has a
@@ -348,7 +339,7 @@ async fn loop_source(
                 )
                 .await;
                 if outcome.success {
-                    db.publish_refresh(next_refresh_generation());
+                    db.publish_refresh();
                 }
             }
             // A forced poll runs here, on this source's own task, so it can
@@ -372,6 +363,11 @@ async fn loop_source(
                     &requested,
                 )
                 .await;
+                // Published here, like a scheduled tick, so every store path
+                // bumps the one refresh generation the same way.
+                if outcome.success {
+                    db.publish_refresh();
+                }
                 let _ = reply.send(outcome);
             }
         }
@@ -831,7 +827,7 @@ async fn ingest_stream_line(
     .await
     .is_ok()
     {
-        db.publish_refresh(next_refresh_generation());
+        db.publish_refresh();
     }
 }
 /// Converts, stores, and logs one already-parsed value (shared by
