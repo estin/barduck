@@ -1,18 +1,10 @@
 name: CI
 
+# Version tags are handled by release.yml, not here.
 on:
   push:
     branches: [master]
-    # Version tags (`just release`) must trigger the workflow too, or the
-    # `release` job below never runs: a `branches`-only filter excludes
-    # tag pushes.
-    tags: ['v*']
   pull_request:
-  # "Run workflow" button (or `gh workflow run ci.yml --ref v<version>`):
-  # dispatched on a `v*` tag it also runs the `release` job, e.g. to retry a
-  # release whose tag push didn't run or failed. The tagged commit must
-  # already contain this trigger.
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,6 +15,9 @@ env:
 
 jobs:
   ci:
+    # The `chore(release):` commit from `just release` only bumps the
+    # version and changelog; its tag push runs release.yml instead.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +44,9 @@ jobs:
   # for the every-push path, but it is the only build that exercises the
   # bundled feature at all, so it still runs on every PR.
   all-features:
+    # The `chore(release):` commit from `just release` only bumps the
+    # version and changelog; its tag push runs release.yml instead.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +64,9 @@ jobs:
         run: just ci-all-features
 
   native-processes:
+    # The `chore(release):` commit from `just release` only bumps the
+    # version and changelog; its tag push runs release.yml instead.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
     strategy:
       fail-fast: false
       matrix:
@@ -86,60 +87,3 @@ jobs:
       # native shell commands and observes both generations of a real tree.
       - name: Test native command execution and process cleanup
         run: cargo test --test process_lifecycle
-
-  # Ships the release artifact on version tags: one static musl binary
-  # (DuckDB compiled in via `--features bundled`, no system dependency)
-  # plus its matching asset bundle, verified by `release-check` before
-  # upload. The tag must equal the package version (checked below), and
-  # nothing ships unless the regular test jobs pass on the same commit.
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [ci, all-features]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # git-cliff needs the full history and tags for the release notes.
-          fetch-depth: 0
-
-      - name: Install Rust and musl target
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install musl tools, just, git-cliff and topcoat CLI
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just,git-cliff
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      # Pinned to the topcoat version in Cargo.lock: a skew here produces
-      # a bundle whose asset ids don't match the binary (see `just run`).
-      - run: cargo install topcoat --version 0.9.0 --locked
-
-      - name: Check tag matches package version
-        run: test "v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "barduck") | .version')" = "${{ github.ref_name }}"
-
-      - name: Release smoke test (musl, bundled)
-        run: just release-check
-        env:
-          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
-          BUNDLE_TARGET_DIR: target/x86_64-unknown-linux-musl
-          RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=yes
-
-      - name: Package artifact
-        run: |
-          DIR="target/x86_64-unknown-linux-musl/release"
-          tar -czf "barduck-${{ github.ref_name }}-linux-x86_64.tar.gz" -C "$DIR" barduck assets
-
-      - name: Generate release notes
-        run: git cliff --latest --strip header -o RELEASE_NOTES.md
-
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: RELEASE_NOTES.md
-          files: barduck-${{ github.ref_name }}-linux-x86_64.tar.gz
