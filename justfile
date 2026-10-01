@@ -72,8 +72,9 @@ demo:
 release VERSION:
     #!/usr/bin/env bash
     set -euo pipefail
-    VER="${1#v}"
-    [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "not a version: $1 (want X.Y.Z)" >&2; exit 1; }
+    VER="{{VERSION}}"
+    VER="${VER#v}"
+    [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "not a version: {{VERSION}} (want X.Y.Z)" >&2; exit 1; }
     test -z "$(git status --porcelain)" || { echo "dirty tree — commit or stash first" >&2; exit 1; }
     CUR="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "barduck") | .version')"
     printf '%s\n%s\n' "$CUR" "$VER" | sort -VC || { echo "version $VER not newer than $CUR" >&2; exit 1; }
