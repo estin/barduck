@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.1 (2026-10-01)
+
+### CI
+
+- Allow rerun pipeline
+
 ## v0.1.0 (2026-10-01)
 
 ### Features
