@@ -28,9 +28,63 @@ run *ARGS:
     topcoat asset bundle --release
     ./target/release/barduck {{ARGS}}
 
+# Release smoke test: build the shippable artifact (release binary +
+# matching asset bundle), boot the daemon on the demo config, and prove
+# the dashboard renders. The bundle must come from the same build as the
+# binary (see `run`); `BUNDLE_TARGET_DIR` selects the cross target dir
+# for musl release builds, defaulting to the native one.
+release-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TARGET_DIR="${BUNDLE_TARGET_DIR:-target}"
+    cargo build --locked --release --features bundled
+    topcoat asset bundle --release
+    BIN="$PWD/$TARGET_DIR/release/barduck"
+    test -x "$BIN"
+    # Fully static when built for musl; native glibc builds stay dynamic.
+    if ldd "$BIN" 2>&1 | grep -q "statically linked"; then
+        echo "static binary confirmed"
+    elif [[ "$TARGET_DIR" != "target" ]]; then
+        echo "expected a statically linked binary in $TARGET_DIR" >&2
+        exit 1
+    fi
+    TMPDIR="$(mktemp -d)"
+    trap 'kill $DAEMON_PID 2>/dev/null; rm -rf "$TMPDIR"' EXIT
+    cp demo/config.toml "$TMPDIR/smoke.toml"
+    (cd "$TMPDIR" && "$BIN" daemon -c smoke.toml >daemon.log 2>&1) &
+    DAEMON_PID=$!
+    for _ in $(seq 1 60); do
+        curl -sf http://127.0.0.1:18420/ -o "$TMPDIR/page.html" && break
+        sleep 1
+    done
+    grep -q 'id="bd-panel-wrapper"' "$TMPDIR/page.html"
+    grep -q 'bd-width-toggle' "$TMPDIR/page.html"
+    echo "release smoke test passed"
 
 demo:
     just run daemon --config demo/config.toml
+
+# Cut a release: bump the package version, commit it, tag `v<version>`,
+# and push both so the CI `release` job builds and publishes the static
+# musl artifact. Usage: `just release 0.2.0`. Refuses to run with a
+# dirty tree, an existing tag, or a version older than the current one;
+# pass a `v`-prefixed or bare version, both work.
+release VERSION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VER="${1#v}"
+    [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "not a version: $1 (want X.Y.Z)" >&2; exit 1; }
+    test -z "$(git status --porcelain)" || { echo "dirty tree — commit or stash first" >&2; exit 1; }
+    CUR="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "barduck") | .version')"
+    printf '%s\n%s\n' "$CUR" "$VER" | sort -VC || { echo "version $VER not newer than $CUR" >&2; exit 1; }
+    test ! -e Cargo.toml.bak
+    sed -i.bak -E "s/^(version = \").*(\")/\\1$VER\\2/" Cargo.toml
+    rm Cargo.toml.bak
+    cargo check --locked --offline >/dev/null 2>&1 || cargo check --locked >/dev/null
+    git add Cargo.toml Cargo.lock
+    git commit -m "release v$VER"
+    git tag "v$VER"
+    git push origin HEAD "v$VER"
 
 # Update Cargo.lock, holding back any dependency version published more
 # recently than cooldown.toml's window allows (see
