@@ -8,6 +8,11 @@ on:
     # tag pushes.
     tags: ['v*']
   pull_request:
+  # "Run workflow" button (or `gh workflow run ci.yml --ref v<version>`):
+  # dispatched on a `v*` tag it also runs the `release` job, e.g. to retry a
+  # release whose tag push didn't run or failed. The tagged commit must
+  # already contain this trigger.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
