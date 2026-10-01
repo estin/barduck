@@ -64,26 +64,37 @@ release-check:
 demo:
     just run daemon --config demo/config.toml
 
-# Cut a release: bump the package version, commit it, tag `v<version>`,
-# and push both so the CI `release` job builds and publishes the static
-# musl artifact. Usage: `just release 0.2.0`. Refuses to run with a
-# dirty tree, an existing tag, or a version older than the current one;
-# pass a `v`-prefixed or bare version, both work.
-release VERSION:
+# Cut a release: bump the package version, regenerate CHANGELOG.md with
+# git-cliff (see cliff.toml), commit both, tag `v<version>`, and push so
+# the CI `release` job builds and publishes the static musl artifact.
+# Usage: `just release` picks the next version from the conventional
+# commits since the last tag (`git cliff --bumped-version`); `just release
+# 0.2.0` (or `v0.2.0`) sets it explicitly. Refuses to run with a dirty
+# tree, an existing tag, or a version older than the current one.
+release VERSION="":
     #!/usr/bin/env bash
     set -euo pipefail
-    VER="{{VERSION}}"
-    VER="${VER#v}"
-    [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "not a version: {{VERSION}} (want X.Y.Z)" >&2; exit 1; }
     test -z "$(git status --porcelain)" || { echo "dirty tree — commit or stash first" >&2; exit 1; }
+    git fetch --tags --quiet origin
+    VER="{{VERSION}}"
+    [[ -n "$VER" ]] || VER="$(git cliff --bumped-version 2>/dev/null)"
+    VER="${VER#v}"
+    [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "not a version: '$VER' (want X.Y.Z)" >&2; exit 1; }
     CUR="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "barduck") | .version')"
-    printf '%s\n%s\n' "$CUR" "$VER" | sort -VC || { echo "version $VER not newer than $CUR" >&2; exit 1; }
+    # Equal is allowed: the current version may never have been tagged (the
+    # tag check below is what stops re-releasing it).
+    printf '%s\n%s\n' "$CUR" "$VER" | sort -VC || { echo "version $VER older than $CUR" >&2; exit 1; }
+    ! git rev-parse -q --verify "refs/tags/v$VER" >/dev/null || { echo "tag v$VER already exists" >&2; exit 1; }
     test ! -e Cargo.toml.bak
     sed -i.bak -E "s/^(version = \").*(\")/\\1$VER\\2/" Cargo.toml
     rm Cargo.toml.bak
+    # Cargo.lock records the package's own version too; refresh just that
+    # entry (no dependency changes) so the `--locked` builds still pass.
+    cargo update --workspace --offline --quiet
     cargo check --locked --offline >/dev/null 2>&1 || cargo check --locked >/dev/null
-    git add Cargo.toml Cargo.lock
-    git commit -m "release v$VER"
+    git cliff --tag "v$VER" -o CHANGELOG.md
+    git add Cargo.toml Cargo.lock CHANGELOG.md
+    git commit -m "chore(release): v$VER"
     git tag "v$VER"
     git push origin HEAD "v$VER"
 

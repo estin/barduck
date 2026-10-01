@@ -1,0 +1,52 @@
+# git-cliff config: `just release` writes CHANGELOG.md from it, and the CI
+# `release` job uses it for the GitHub release notes (`--latest`).
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented here.
+"""
+body = """
+{% if version %}
+## {{ version }} ({{ timestamp | date(format="%Y-%m-%d") }})
+{% else %}
+## Unreleased
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = true
+tag_pattern = "v[0-9].*"
+# The `<!-- N -->` prefixes only fix the section order; `striptags` hides them.
+commit_parsers = [
+    { message = "^feat", group = "<!-- 0 -->Features" },
+    { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+    { message = "^perf", group = "<!-- 2 -->Performance" },
+    { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+    { message = "^docs", group = "<!-- 4 -->Documentation" },
+    { message = "^test", group = "<!-- 5 -->Testing" },
+    { message = "^ci", group = "<!-- 6 -->CI" },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^chore\\(deps", skip = true },
+    { message = "^chore", group = "<!-- 7 -->Maintenance" },
+    { message = "^revert", group = "<!-- 8 -->Reverts" },
+    { message = ".*", group = "<!-- 9 -->Other" },
+]
+
+# `git cliff --bumped-version` (used by `just release` with no version):
+# fix → patch, feat → minor, breaking → minor while still on 0.x.
+[bump]
+initial_tag = "v0.1.0"
+features_always_bump_minor = true
+breaking_always_bump_major = false

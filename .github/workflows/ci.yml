@@ -85,14 +85,19 @@ jobs:
   # Ships the release artifact on version tags: one static musl binary
   # (DuckDB compiled in via `--features bundled`, no system dependency)
   # plus its matching asset bundle, verified by `release-check` before
-  # upload. The tag must equal the package version (checked below).
+  # upload. The tag must equal the package version (checked below), and
+  # nothing ships unless the regular test jobs pass on the same commit.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ci, all-features]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the full history and tags for the release notes.
+          fetch-depth: 0
 
       - name: Install Rust and musl target
         uses: dtolnay/rust-toolchain@stable
@@ -101,17 +106,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install musl tools, just and topcoat CLI
+      - name: Install musl tools, just, git-cliff and topcoat CLI
         uses: taiki-e/install-action@v2
         with:
-          tool: just
+          tool: just,git-cliff
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       # Pinned to the topcoat version in Cargo.lock: a skew here produces
       # a bundle whose asset ids don't match the binary (see `just run`).
       - run: cargo install topcoat --version 0.9.0 --locked
 
       - name: Check tag matches package version
-        run: test "v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" = "${{ github.ref_name }}"
+        run: test "v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "barduck") | .version')" = "${{ github.ref_name }}"
 
       - name: Release smoke test (musl, bundled)
         run: just release-check
@@ -125,7 +130,11 @@ jobs:
           DIR="target/x86_64-unknown-linux-musl/release"
           tar -czf "barduck-${{ github.ref_name }}-linux-x86_64.tar.gz" -C "$DIR" barduck assets
 
+      - name: Generate release notes
+        run: git cliff --latest --strip header -o RELEASE_NOTES.md
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: barduck-${{ github.ref_name }}-linux-x86_64.tar.gz
