@@ -222,6 +222,36 @@ pub async fn set_theme(cx: &Cx, Json(body): Json<ThemeBody>) -> Result<Response>
     cookies(cx).add(c);
     Ok(json_ok(&serde_json::json!({ "theme": body.theme })))
 }
+
+#[derive(Debug, Deserialize)]
+struct WidthBody {
+    width: String,
+}
+
+/// Persists the browser's chosen content width in a cookie so the server
+/// can render the matching `max-w-5xl`/full-width wrappers on every
+/// subsequent page load — the width twin of [`set_theme`] (spec: web-ui —
+/// width preference endpoint). Same contract: the client sends the width
+/// it just switched to (computed from its own current DOM state), and an
+/// unknown token is a 400 that sets no cookie.
+#[route(POST "/api/width")]
+pub async fn set_width(cx: &Cx, Json(body): Json<WidthBody>) -> Result<Response> {
+    if body.width != "wide" && body.width != "narrow" {
+        return Ok(json_err(
+            StatusCode::BAD_REQUEST,
+            "width must be \"wide\" or \"narrow\"",
+        ));
+    }
+    let name = crate::web::WIDTH_COOKIE;
+    let c: Cookie = cookie! {
+        name = body.width.clone();
+        Path = "/";
+        MaxAge = Duration::days(365)
+    };
+    cookies(cx).add(c);
+    Ok(json_ok(&serde_json::json!({ "width": body.width })))
+}
+
 /// Streams refresh generations as Server-Sent Events (spec: web-ui —
 /// immediate panel refresh): a `refresh` event whenever the generation moves,
 /// `id:` carrying it so a reconnecting `EventSource` resumes via

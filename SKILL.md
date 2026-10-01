@@ -124,7 +124,7 @@ config file, and every one is optional. Durations use humantime format
 | `logs_per_page` | `50` | `BARDUCK_LOGS_PER_PAGE` | Rows per page in the web log view (`/logs/<source>`). |
 | `retention` | unset — keep everything forever | — | How long collected data is kept before the daemon prunes it, e.g. `"30d"`. |
 | `tui_width` | `"auto"` | `BARDUCK_TUI_WIDTH` | TUI content width: `"auto"` or a fixed column count. |
-| `web_user_js` | `[]` (no scripts) | — | User JavaScript files injected at the end of the web UI `<body>`: a list of `.js` file or directory paths, e.g. `["extra.js", "scripts/"]`. Directory entries expand to their `*.js` files in alphabetic order (non-recursive); overall order is config-list order, then alphabetic within each directory. Relative paths resolve against the config file's directory. Served by the daemon at `/assets/user-js/<name>`; missing paths warn and are skipped. See [Custom Web UI Scripts](#custom-web-ui-scripts). |
+| `web_content_width` | `"narrow"` | — | Default web UI content width: `"narrow"` (centered capped column) or `"wide"` (panels span the full viewport). Each browser can override it with the header width toggle (persisted in a cookie). |
 
 An environment override wins over both the config file's value and the
 built-in default, and its value is taken verbatim. The structural keys

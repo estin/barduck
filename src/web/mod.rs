@@ -17,4 +17,4 @@ mod routes;
 mod theme;
 
 pub use routes::{dashboard, source_logs};
-pub(crate) use theme::THEME_COOKIE;
+pub(crate) use theme::{THEME_COOKIE, WIDTH_COOKIE};

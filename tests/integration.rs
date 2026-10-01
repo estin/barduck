@@ -3172,6 +3172,142 @@ async fn dashboard_includes_theme_toggle_viewport_and_responsive_grid_classes() 
     assert_eq!(bad.status(), 400);
 }
 
+/// (spec: web-ui — server-wide default content width; per-browser width
+/// override; header width toggle)
+#[tokio::test]
+async fn dashboard_content_width_default_and_cookie_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    // Default config (narrow): both wrappers carry the cap, and the
+    // toggle names the full-width layout as its target. (Assert on the
+    // wrapper class strings, not page-wide presence: the toggle script
+    // itself mentions the `max-w-5xl` literal it detects.)
+    let page = serve_width_page(&db, cfg.clone(), None).await;
+    for wrapper in ["max-w-5xl mx-auto px-6 pt-6", "max-w-5xl mx-auto px-6 pb-6"] {
+        assert!(
+            page.contains(wrapper),
+            "default narrow shell must cap the wrapper: {wrapper}"
+        );
+    }
+    assert!(
+        page.contains(r#"id="bd-width-toggle""#),
+        "width toggle button expected"
+    );
+    assert!(
+        page.contains(r#"data-bd-width-icon="wide""#),
+        "narrow page toggle should show the full-width icon"
+    );
+    assert!(
+        !page.contains(r#"data-bd-width-icon="narrow""#),
+        "narrow page must not show the narrow-column icon"
+    );
+    assert!(
+        page.contains("Switch to full-width layout"),
+        "narrow page toggle should name the full-width layout"
+    );
+    // Wide server default: a cookie-less visitor gets the uncapped shell.
+    let mut wide_cfg = cfg.clone();
+    wide_cfg.web_content_width = "wide".to_string();
+    let wide_default_page = serve_width_page(&db, wide_cfg.clone(), None).await;
+    assert!(
+        !wide_default_page.contains("max-w-5xl mx-auto px-6"),
+        "wide default must not cap the content width"
+    );
+    assert!(
+        wide_default_page.contains(r#"data-bd-width-icon="narrow""#),
+        "wide page toggle should show the narrow-column icon"
+    );
+    // Cookie overrides the wide default: this browser stays narrow.
+    let narrow_page = serve_width_page(&db, wide_cfg.clone(), Some("bd_width=narrow")).await;
+    for wrapper in ["max-w-5xl mx-auto px-6 pt-6", "max-w-5xl mx-auto px-6 pb-6"] {
+        assert!(
+            narrow_page.contains(wrapper),
+            "bd_width=narrow must override the wide server default: {wrapper}"
+        );
+    }
+    // Unknown cookie value falls back to the server default (wide here).
+    let fallback_page = serve_width_page(&db, wide_cfg, Some("bd_width=sideways")).await;
+    assert!(
+        !fallback_page.contains("max-w-5xl mx-auto px-6"),
+        "unknown cookie value must fall back to the server default"
+    );
+}
+
+/// Serves one dashboard page from `cfg`, optionally with a `Cookie` header.
+async fn serve_width_page(db: &Db, cfg: config::Config, cookie: Option<&str>) -> String {
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
+    };
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(pair) = cookie {
+        req = req.header("Cookie", pair);
+    }
+    req.send().await.unwrap().text().await.unwrap()
+}
+
+/// (spec: web-ui — width preference endpoint)
+#[tokio::test]
+async fn width_endpoint_persists_valid_value_and_rejects_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
+    };
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}api/width"))
+        .json(&serde_json::json!({ "width": "narrow" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        set_cookie.starts_with("bd_width=narrow"),
+        "endpoint should set the width cookie, got: {set_cookie}"
+    );
+    let bad = client
+        .post(format!("{url}api/width"))
+        .json(&serde_json::json!({ "width": "medium" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    assert!(
+        bad.headers().get("set-cookie").is_none(),
+        "rejected width must not set a cookie"
+    );
+}
+
 /// Reads SSE text from `resp` until it contains `needle` or `wait` elapses;
 /// returns everything read. A stream that ends early just returns.
 async fn read_sse_until(

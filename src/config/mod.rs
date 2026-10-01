@@ -22,7 +22,7 @@ pub use source::{
 use defaults::{
     apply_env_overrides_from, default_config_dir, default_db_path, default_history_points,
     default_interval, default_listen, default_logs_per_page, default_threshold, default_tui_width,
-    default_user_js, default_web_refresh_interval,
+    default_user_js, default_web_content_width, default_web_refresh_interval,
 };
 use validation::{validate_cell, validate_source};
 
@@ -60,6 +60,12 @@ pub struct Config {
     /// refresh). Overridable via `BARDUCK_WEB_REFRESH_INTERVAL`.
     #[serde(default = "default_web_refresh_interval", with = "humantime_serde")]
     pub web_refresh_interval: Duration,
+    /// Default web UI content width: `"narrow"` (centered capped column)
+    /// or `"wide"` (panels span the full viewport). A per-browser cookie
+    /// override wins over this default (spec: web-ui — per-browser width
+    /// override).
+    #[serde(default = "default_web_content_width")]
+    pub web_content_width: String,
     /// How long to keep collected data before the daemon prunes it: a
     /// humantime string (e.g. `"30d"`). Unset (the default) keeps everything
     /// forever, matching prior behavior (spec: data-storage — retention).
@@ -100,6 +106,7 @@ impl Default for Config {
             history_points: default_history_points(),
             logs_per_page: default_logs_per_page(),
             web_refresh_interval: default_web_refresh_interval(),
+            web_content_width: default_web_content_width(),
             retention: None,
             web_user_js: default_user_js(),
             sources: Vec::new(),
@@ -235,6 +242,12 @@ pub fn validate(cfg: &Config) -> Result<()> {
     }
     if cfg.web_refresh_interval.is_zero() {
         bail!("web_refresh_interval must be > 0");
+    }
+    if cfg.web_content_width != "wide" && cfg.web_content_width != "narrow" {
+        bail!(
+            "web_content_width must be \"wide\" or \"narrow\", got `{}`",
+            cfg.web_content_width
+        );
     }
     // `failure_threshold` counts consecutive failures from the newest
     // `failure_threshold` log rows, but `db.logs`/`db.health_inputs` clamp
@@ -846,6 +859,30 @@ mod tests {
         let cfg: Config = toml::from_str("logs_per_page = 0").unwrap();
         let err = validate(&cfg).unwrap_err();
         assert!(err.to_string().contains("logs_per_page"));
+    }
+    #[test]
+    fn web_content_width_defaults_to_narrow() {
+        assert_eq!(Config::default().web_content_width, "narrow");
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.web_content_width, "narrow");
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn web_content_width_wide_is_accepted() {
+        let cfg: Config = toml::from_str("web_content_width = \"wide\"").unwrap();
+        assert_eq!(cfg.web_content_width, "wide");
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn invalid_web_content_width_is_rejected() {
+        let cfg: Config = toml::from_str("web_content_width = \"medium\"").unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("web_content_width"),
+            "error should name the key: {err}"
+        );
     }
 
     #[test]

@@ -34,6 +34,9 @@ pub(crate) fn default_user_js() -> Vec<PathBuf> {
 pub(crate) fn default_web_refresh_interval() -> Duration {
     Duration::from_secs(5)
 }
+pub(crate) fn default_web_content_width() -> String {
+    "narrow".into()
+}
 pub(crate) fn default_tui_width() -> TuiWidth {
     TuiWidth::Named("auto".into())
 }

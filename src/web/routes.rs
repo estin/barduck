@@ -15,7 +15,7 @@
 
 use super::{
     panels::{panels_grid, poll_button, text_style_for_color},
-    theme::theme_class,
+    theme::{theme_class, width_class},
 };
 use crate::{
     AppState, age,
@@ -165,6 +165,40 @@ const THEME_TOGGLE_SCRIPT: &str = r"(function () {
     });
 })();";
 
+/// Wires the content-width toggle button: persists the chosen width via
+/// `POST /api/width`, then reloads so the server renders both wrappers
+/// with the new cap class from the first byte (spec: web-ui — header width
+/// toggle). Same reload-instead-of-live-swap rationale as the theme
+/// toggle: the server-rendered shell is the single source of truth, so a
+/// client-side class swap could drift from what a fresh load renders.
+const WIDTH_TOGGLE_SCRIPT: &str = r"(function () {
+    var btn = document.getElementById('bd-width-toggle');
+    if (!btn) return;
+    // The wrappers carry the narrow cap iff any one of them does — both
+    // are always rendered together by the server, so reading one is
+    // enough and the toggle posts the width the page is about to switch
+    // *to*, letting the server treat the request as authoritative.
+    function isNarrow() {
+        var wrap = document.querySelector('#bd-panel-wrapper');
+        if (!wrap || !wrap.parentElement) return false;
+        return wrap.parentElement.classList.contains('max-w-5xl');
+    }
+    function labelFor(narrow) {
+        return narrow ? 'Switch to full-width layout' : 'Switch to narrow centered layout';
+    }
+    btn.addEventListener('click', function () {
+        var next = isNarrow() ? 'wide' : 'narrow';
+        fetch('/api/width', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ width: next })
+        }).then(function () {
+            location.reload();
+        }).catch(function () {});
+    });
+    btn.setAttribute('aria-label', labelFor(isNarrow()));
+})();";
+
 /// Drives every poll control on the page (spec: web-ui — Panels can
 /// force a poll). One delegated listener rather than per-button handlers:
 /// the panel shard replaces the grid's DOM on every tick, so anything bound
@@ -229,6 +263,10 @@ pub(super) async fn page_chrome(
 ) -> Result<impl View> {
     let theme = theme_class(cx);
     let st = app_context::<AppState>(cx);
+    // Cookie wins over the server default; both wrappers below share this
+    // one value so header and content can never disagree (spec: web-ui —
+    // per-browser width override).
+    let width_cap = width_class(cx, &st.cfg.web_content_width);
     // Read once per log-view request and pass as fixed shard args (design
     // D7): the runtime re-invokes `log_rows` on every tick with the same
     // values, preserving page/filter state across the 5 s refresh. Topcoat
@@ -319,7 +357,7 @@ pub(super) async fn page_chrome(
                     <div id="bd-offline-banner" hidden="" class="px-4 py-2 text-sm font-medium text-center" style="border-bottom:1px solid var(--status-red-border);background-color:var(--status-red-bg);color:var(--status-red-fg)">
                         "Connection lost — retrying…"
                     </div>
-                    <div class="max-w-5xl mx-auto px-6 pt-6">
+                    <div class=(format!("{width_cap} mx-auto px-6 pt-6"))>
                         <h1 class="text-xl font-bold mb-4 text-foreground flex flex-wrap items-center gap-2">
                             <a href="/" class="text-foreground no-underline hover:underline">"barduck v"(config::VERSION)</a>
                             badge(
@@ -343,10 +381,33 @@ pub(super) async fn page_chrome(
                                     <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"></path>
                                 </svg>
                             )
+                            button(
+                                variant: ButtonVariant::Ghost,
+                                size: ButtonSize::Icon,
+                                // Action-indicating icons (spec: web-ui —
+                                // header width toggle): each icon depicts the
+                                // width clicking switches *to* — a centered
+                                // narrow column on a wide page, a full-width
+                                // frame on a narrow page — the same pattern
+                                // as the theme toggle's moon/sun swap. The
+                                // server renders the right one per request
+                                // (the toggle reloads the page), so no
+                                // client-side swap is needed.
+                                attrs: attributes! { id="bd-width-toggle" type="button" aria-label=(if width_cap.is_empty() { "Switch to narrow centered layout" } else { "Switch to full-width layout" }) title=(if width_cap.is_empty() { "Switch to narrow centered layout" } else { "Switch to full-width layout" }) },
+                                if width_cap.is_empty() {
+                                    <svg class="size-4" data-bd-width-icon="narrow" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <rect x="8" y="3" width="8" height="18" rx="2"></rect>
+                                    </svg>
+                                } else {
+                                    <svg class="size-4" data-bd-width-icon="wide" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <rect x="2" y="6" width="20" height="12" rx="2"></rect>
+                                    </svg>
+                                }
+                            )
                         </h1>
                     </div>
                 </div>
-                <div class="max-w-5xl mx-auto px-6 pb-6">
+                <div class=(format!("{width_cap} mx-auto px-6 pb-6"))>
                     <div id="bd-panel-wrapper">
                         if let Some(source) = &view_source {
                             <a href="/" class="text-xs opacity-60 hover:opacity-100 hover:underline">"← Back to dashboard"</a>
@@ -377,6 +438,7 @@ pub(super) async fn page_chrome(
                 <script>(Unescaped::new_unchecked(CONNECTION_SCRIPT))</script>
                 <script>(Unescaped::new_unchecked(FAVICON_SCRIPT))</script>
                 <script>(Unescaped::new_unchecked(THEME_TOGGLE_SCRIPT))</script>
+                <script>(Unescaped::new_unchecked(WIDTH_TOGGLE_SCRIPT))</script>
                 <script>(Unescaped::new_unchecked(POLL_SCRIPT))</script>
                 // User scripts live in the static shell, outside the shards'
                 // comment markers, so topcoat's `morph` never touches them:
