@@ -98,3 +98,27 @@ jobs:
         with:
           body_path: RELEASE_NOTES.md
           files: barduck-${{ github.ref_name }}-linux-x86_64.tar.gz
+
+  # Re-pins the flake's `barduck-bin` package (nix/release.json) to the
+  # tarball just published, on master. Separate from `release` so a failed
+  # pin never blocks or rolls back a published release; rerun it alone
+  # via "Re-run failed jobs".
+  update-nix:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - uses: extractions/setup-just@v2
+      - run: just release-pin "${{ github.ref_name }}"
+      - name: Commit nix/release.json
+        run: |
+          git diff --quiet -- nix/release.json && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(nix): pin barduck-bin to ${{ github.ref_name }}" -- nix/release.json
+          git pull --rebase origin master
+          git push origin HEAD:master

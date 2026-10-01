@@ -98,6 +98,26 @@ release VERSION="":
     git tag "v$VER"
     git push origin HEAD "v$VER"
 
+# Pin the flake's `barduck-bin` package (nix/release.json) to a published
+# release's x86_64 tarball: download it and record its URL and SRI hash.
+# The release workflow runs this after publishing; run it by hand to
+# re-pin. `VERSION` defaults to Cargo.toml's (with or without the `v`).
+# Needs only curl, openssl and jq — no Nix.
+release-pin VERSION="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VER="{{VERSION}}"
+    [[ -n "$VER" ]] || VER="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "barduck") | .version')"
+    VER="${VER#v}"
+    URL="https://github.com/estin/barduck/releases/download/v$VER/barduck-v$VER-linux-x86_64.tar.gz"
+    TMP="$(mktemp)"
+    trap 'rm -f "$TMP"' EXIT
+    curl -fsSL --retry 3 -o "$TMP" "$URL"
+    HASH="sha256-$(openssl dgst -sha256 -binary "$TMP" | openssl base64 -A)"
+    jq -n --arg version "$VER" --arg url "$URL" --arg hash "$HASH" \
+        '{version: $version, url: $url, hash: $hash}' > nix/release.json
+    echo "pinned barduck-bin to v$VER ($HASH)"
+
 # Update Cargo.lock, holding back any dependency version published more
 # recently than cooldown.toml's window allows (see
 # https://crates.io/crates/cargo-cooldown) so a compromised just-published

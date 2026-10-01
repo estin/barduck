@@ -103,9 +103,16 @@ on Windows and macOS, alongside the existing Ubuntu suite.
 
 ## Nix / home-manager
 
-`flake.nix` exposes `packages.<system>.default` (the binary, built against
-nixpkgs' `duckdb` with the web UI's Tailwind assets pre-bundled) and
-`homeManagerModules.default`, a systemd user service:
+`flake.nix` exposes:
+
+- `packages.<system>.default` (alias `barduck`) — built from source against
+  nixpkgs' `duckdb`, with the web UI's Tailwind assets pre-bundled. Use it
+  to run an unreleased commit or a local checkout (`path:./barduck`).
+- `packages.x86_64-linux.barduck-bin` — the latest GitHub release's static
+  musl binary and asset bundle, no Rust build. Pinned in `nix/release.json`,
+  which the release workflow updates after each release (`just
+  release-pin` re-pins by hand).
+- `homeManagerModules.default` — a systemd user service:
 
 ```nix
 {
@@ -115,6 +122,8 @@ nixpkgs' `duckdb` with the web UI's Tailwind assets pre-bundled) and
   imports = [ inputs.barduck.homeManagerModules.default ];
   services.barduck = {
     enable = true;
+    # prebuilt release binary instead of the default source build:
+    # package = inputs.barduck.packages.${pkgs.stdenv.hostPlatform.system}.barduck-bin;
     port = 8420; # -> listen = "127.0.0.1:8420"
     settings.sources = [ /* see demo/config.toml for the schema */ ];
   };

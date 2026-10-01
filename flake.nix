@@ -35,7 +35,7 @@
       packages = forAllSystems (
         pkgs:
         let
-          system = pkgs.system;
+          system = pkgs.stdenv.hostPlatform.system;
           tw = tailwindPlatforms.${system};
           tailwindBin = pkgs.fetchurl {
             url = "https://github.com/tailwindlabs/tailwindcss/releases/download/v${tailwindVersion}/${tw.asset}";
@@ -56,9 +56,38 @@
             cargoHash = "sha256-o/QffbjjkHqM+mxZwjxARm2mx4ylqxWrRw4UJ4Q0R+Q=";
             doCheck = false;
           };
-        in
-        {
-          default = pkgs.rustPlatform.buildRustPackage {
+
+          # The static musl binary + asset bundle published by the release
+          # workflow (x86_64 only), for installs that skip the Rust build.
+          # Pinned by nix/release.json, which CI rewrites after every
+          # release (`just release-pin`) — so it tracks the latest published
+          # release, not this checkout's Cargo.toml version. The binary
+          # loads `assets/` from next to its own executable, so the
+          # tarball's layout is kept under bin/.
+          release = builtins.fromJSON (builtins.readFile ./nix/release.json);
+          barduck-bin = pkgs.stdenvNoCC.mkDerivation {
+            pname = "barduck-bin";
+            inherit (release) version;
+            src = pkgs.fetchurl { inherit (release) url hash; };
+            sourceRoot = ".";
+            dontBuild = true;
+            dontStrip = true;
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/bin
+              cp -r barduck assets $out/bin/
+              runHook postInstall
+            '';
+            meta = {
+              description = "barduck home dashboard (prebuilt release binary)";
+              homepage = "https://github.com/estin/barduck";
+              platforms = [ "x86_64-linux" ];
+              sourceProvenance = [ nixpkgs.lib.sourceTypes.binaryNativeCode ];
+              mainProgram = "barduck";
+            };
+          };
+
+          barduck = pkgs.rustPlatform.buildRustPackage {
             pname = "barduck";
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = self;
@@ -141,7 +170,12 @@
 
             meta.mainProgram = "barduck";
           };
+        in
+        {
+          default = barduck;
+          inherit barduck;
         }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") { inherit barduck-bin; }
       );
 
       homeManagerModules.default =
@@ -170,8 +204,13 @@
 
             package = lib.mkOption {
               type = lib.types.package;
-              default = self.packages.${pkgs.system}.default;
-              description = "The barduck package to run.";
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              defaultText = lib.literalExpression "barduck.packages.\${pkgs.stdenv.hostPlatform.system}.default";
+              example = lib.literalExpression "barduck.packages.\${pkgs.stdenv.hostPlatform.system}.barduck-bin";
+              description = ''
+                The barduck package to run: `default` builds from source,
+                `barduck-bin` (x86_64-linux) is the prebuilt release binary.
+              '';
             };
 
             port = lib.mkOption {
