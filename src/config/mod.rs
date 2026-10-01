@@ -154,9 +154,11 @@ fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Con
 }
 
 /// One user JavaScript file resolved from [`Config::web_user_js`]: `name`
-/// is the opaque per-startup URL key served under `/assets/user-js/<name>`
-/// (never derived from the request — traversal impossible by construction);
-/// `path` is the resolved file the handler reads.
+/// is the URL key served under `/assets/user-js/<name>` — the file's own
+/// name, so devtools and stack traces show it (see [`user_js_name`]); only
+/// names in the startup-resolved set are served, never a request-derived
+/// path, so traversal is impossible by construction. `path` is the resolved
+/// file the handler reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedUserScript {
     pub name: String,
@@ -215,7 +217,7 @@ fn push_user_js_file(
     match file.canonicalize() {
         Ok(canonical) => {
             if seen.insert(canonical.clone()) {
-                let name = format!("u{}.js", out.len());
+                let name = user_js_name(&canonical, out);
                 out.push(ResolvedUserScript {
                     name,
                     path: canonical,
@@ -227,6 +229,44 @@ fn push_user_js_file(
         }
     }
 }
+/// Served name for a user script (spec: web-ui — user-defined scripts
+/// injected into the web UI): the file name with every character outside
+/// `[A-Za-z0-9._-]` replaced by `_`, so it is always a safe single URL path
+/// segment. A name already taken by an earlier script gets `-2`, `-3`, …
+/// before its extension, with a warning naming the file.
+fn user_js_name(file: &Path, taken: &[ResolvedUserScript]) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let stem = sanitize(&file.file_stem().unwrap_or_default().to_string_lossy());
+    let ext = sanitize(&file.extension().unwrap_or_default().to_string_lossy());
+    let is_taken = |name: &str| taken.iter().any(|s| s.name == name);
+    let name = format!("{stem}.{ext}");
+    if !is_taken(&name) {
+        return name;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{stem}-{n}.{ext}");
+        if !is_taken(&candidate) {
+            tracing::warn!(
+                "web_user_js: {} shares its name with an earlier script; serving it as {candidate}",
+                file.display()
+            );
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 pub fn validate(cfg: &Config) -> Result<()> {
     // `history_points` sizes a per-panel allocation in the web renderer,
     // while the DB read behind it is capped at `MAX_HISTORY_LIMIT` — a
@@ -1322,7 +1362,46 @@ mod tests {
             .collect();
         assert_eq!(names, ["lone.js", "a.js", "b.js"]);
         let urls: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(urls, ["u0.js", "u1.js", "u2.js"]);
+        assert_eq!(urls, ["lone.js", "a.js", "b.js"]);
+    }
+
+    /// Served names are the file's own name, sanitized for a URL segment,
+    /// with same-named files from different directories kept distinct
+    /// (spec: web-ui — user-defined scripts injected into the web UI).
+    #[test]
+    fn user_js_served_names_keep_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["one", "two", "three"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+            std::fs::write(dir.path().join(sub).join("util.js"), sub).unwrap();
+        }
+        std::fs::write(dir.path().join("my links#1.js"), "x").unwrap();
+        // A real file named like a generated suffix still keeps its name
+        // when it comes first, and the generated one skips past it.
+        std::fs::write(dir.path().join("util-2.js"), "y").unwrap();
+
+        let resolved = resolve_user_js(
+            &[
+                PathBuf::from("util-2.js"),
+                PathBuf::from("one"),
+                PathBuf::from("two"),
+                PathBuf::from("three"),
+                PathBuf::from("my links#1.js"),
+            ],
+            dir.path(),
+        );
+
+        let urls: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "util-2.js",
+                "util.js",
+                "util-3.js",
+                "util-4.js",
+                "my_links_1.js"
+            ]
+        );
     }
 
     /// Relative `web_user_js` entries resolve against the config file's own

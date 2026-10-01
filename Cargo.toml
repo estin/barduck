@@ -26,6 +26,14 @@ topcoat = { version = "0.9", features = ["font-fontsource", "sse", "tailwind", "
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# There is no system libduckdb to link on musl, so every musl build compiles
+# DuckDB in. Needed beyond `--features bundled` because `topcoat asset
+# bundle` rebuilds the binary itself with no feature flags (see the
+# `release` CI workflow). `json` is compiled in too: the schema uses the JSON
+# type, and a static musl binary cannot autoload extensions at runtime.
+[target.'cfg(target_env = "musl")'.dependencies]
+duckdb = { version = "1.10505", features = ["bundled", "json"] }
+
 [build-dependencies]
 topcoat = { version = "0.9", default-features = false, features = ["tailwind"] }
 

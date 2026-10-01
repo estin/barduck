@@ -420,7 +420,7 @@ fn build_tui_cell_parts(
             } else {
                 main.as_ref()
                     .filter(|item| crate::config::source_visible_in(cfg, item.id(), View::Tui))
-                    .map(&panel)
+                    .map(panel)
             };
             let secondary_panels = crate::config::visible_items(cfg, secondary, View::Tui)
                 .into_iter()

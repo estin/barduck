@@ -5,6 +5,7 @@
 Serves a browser dashboard from the daemon, rendering configured layouts with Tailwind-styled components so users can check status from any device.
 
 ## Requirements
+
 ### Requirement: Web UI served by daemon
 The daemon SHALL serve the web dashboard from the configured listen address, rendering the configured layout with each referenced source's latest value and health. The panel grid SHALL re-render immediately whenever a new value is stored for any source shown on the page — whether the value arrived via a scheduled poll, a forced poll, or HTTP-ingested push — delivered over a server-sent refresh-event stream, without waiting for any timer and without a full page reload. A periodic fallback refresh SHALL also exist and fire only when no stream update arrived within its interval, so nothing goes stale on a dropped stream, and so age text and health states still update. The fallback interval SHALL be configurable (default 5 seconds).
 
@@ -47,6 +48,7 @@ The daemon SHALL serve the web dashboard from the configured listen address, ren
 #### Scenario: Fallback interval is configurable
 - **WHEN** the operator sets the web refresh interval to a non-default value
 - **THEN** the browser's fallback refresh uses that interval instead of the default
+
 ### Requirement: Layout-driven rendering
 Panels shown in the web UI MUST come from the same config-declared grid layouts used by the TUI, rendered with CSS grid columns and spans; sources not placed in a layout MUST NOT appear on the dashboard by default.
 
@@ -57,6 +59,7 @@ Panels shown in the web UI MUST come from the same config-declared grid layouts 
 #### Scenario: Grid arrangement honored
 - **WHEN** a layout defines two rows — three sources in the first, `{ id = "weekly-report", title = "This week" }` plus a 2-column spacer in the second
 - **THEN** the web UI shows the first row as three equal columns and the second with the report panel in column 1 spanning one column and nothing in columns 2–3, under the pane title "This week"
+
 ### Requirement: Health visible at a glance
 The web UI SHALL visually distinguish healthy, failing, and stale sources, using a health-first coloring priority. While a source is failing or stale, its panel's border, background, and value text render in health's color (`failing`→red, `stale`→yellow) regardless of any threshold band — a banded source's own band reading does not override an active health problem, since a stale or failing fetch means that reading is no longer trustworthy. Only when a source is healthy does its threshold band's color apply; a healthy source with no threshold bands gets no accent color at all — its panel renders in the plain neutral style, not a default green. Whenever a source is failing or stale it SHALL also show a plain, uncolored status label next to its panel, alongside whatever color that status contributes.
 
@@ -79,6 +82,7 @@ The web UI SHALL visually distinguish healthy, failing, and stale sources, using
 #### Scenario: Health overrides a stale threshold-band reading
 - **WHEN** a threshold-banded source's last known value fell in a band, but the source is now failing or stale
 - **THEN** its panel renders in health's color (red or yellow), not the band's color, alongside the plain status label
+
 ### Requirement: Panels show last update time
 Each panel SHALL show when its latest value was collected, formatted as a single coarse time unit — seconds, minutes, hours, or days — rounded down to that unit's boundary (e.g. "updated 12s ago", "updated 10m ago", "updated 3h ago", "updated 2d ago").
 
@@ -97,18 +101,21 @@ Each panel SHALL show when its latest value was collected, formatted as a single
 #### Scenario: Age rounds down to days
 - **WHEN** the dashboard renders a source whose latest reading is over a day old
 - **THEN** its panel shows the age in whole days (e.g. "updated 2d ago")
+
 ### Requirement: App version visible
 The web dashboard SHALL display the application version.
 
 #### Scenario: Version rendered
 - **WHEN** the dashboard loads
 - **THEN** the page shows `barduck v<version>`
+
 ### Requirement: Threshold band coloring
 When a source declares threshold bands and its latest value falls in a band, the panel SHALL use that band's color instead of the health-derived color.
 
 #### Scenario: Band color wins
 - **WHEN** a healthy source has bands 60→green, 85→yellow, 100→red and reports `92`
 - **THEN** its panel renders with the red style
+
 ### Requirement: Per-source log view linked from panels
 Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHALL open in the current tab, not a new tab. The daemon SHALL serve that page showing the source's recent fetch log entries as a table with columns, in this order: TIME, DURATION, SOURCE, VALUE. The SOURCE column SHALL show the attempt's origin (`push` for HTTP-ingested values, `poll` for scheduled fetches; spec: data-collection — Fetch attempts logged). The VALUE column SHALL show the gathered value rendered together with the source's unit (when the source declares one); for an entry that recorded an error, the VALUE cell SHALL instead show that error's text, wrapped, in place of a value — there is no separate error column. The page SHALL include a link back to the dashboard. Requests for unknown sources MUST return a client error naming the unknown source.
 
@@ -139,6 +146,7 @@ Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHA
 #### Scenario: Unknown source log view rejected
 - **WHEN** `/logs/nope` is requested
 - **THEN** the response is a client error naming the unknown source
+
 ### Requirement: Log view relative timestamps and threshold coloring
 The log view SHALL show each entry's timestamp as relative time, at up to two units of precision, coarser unit first (e.g. `1d 6h`, `1h 12m`, `12m 3s`, `45s`). The second (finer) unit SHALL be omitted when it would be zero — e.g. an age of exactly one hour shows `1h`, not `1h 0m`. An age under one minute SHALL show seconds alone, since there is no finer unit. This is more precise than the single-unit format panels use for their own "updated X ago" text, and is otherwise unrelated to it. It SHALL NOT show a raw date and time string. Each entry's TIME cell SHALL carry the full stored timestamp as a native hover tooltip, so the exact time stays available on demand.
 
@@ -185,12 +193,14 @@ The log view's table SHALL use narrow row spacing so more entries fit on screen 
 #### Scenario: Narrow rows fit more history on screen
 - **WHEN** the log view renders many entries
 - **THEN** its rows use narrower spacing than a standard table. More entries fit without scrolling
+
 ### Requirement: Log view live-refreshes without a full page reload
 The log view SHALL re-render its table of fetch log entries through the same stream-driven immediate-refresh mechanism the dashboard's panel grid uses, plus the same fallback-only periodic timer. It needs no full page reload.
 
 #### Scenario: New fetch attempt appears without reloading
 - **WHEN** a source's fetch completes while its log view is open in a browser tab
 - **THEN** the new entry appears in the table without the user reloading the page and without waiting for the next fallback refresh
+
 ### Requirement: Header and footer stay pinned across pages
 The dashboard and the log view SHALL share one header (title, version, connection indicator, and theme toggle) and one footer. The header SHALL stay visible at the top of the viewport on both pages. It stays there as the page's own content scrolls beneath it. The footer SHALL stay visible at the bottom of the viewport the same way, on both pages. Neither SHALL permanently cover any content: each page SHALL have enough top and bottom spacing to clear both.
 
@@ -209,6 +219,7 @@ The dashboard and the log view SHALL share one header (title, version, connectio
 #### Scenario: Log view shares the same pinned header and footer
 - **WHEN** a source's log view is open
 - **THEN** the same header and footer as the dashboard are visible, pinned the same way
+
 ### Requirement: Panel retrospective history bar
 A web UI panel for a source that declares threshold bands SHALL render a horizontal history bar at the bottom of the panel, unless that source declares `show_history = false` (spec: source-configuration — per-source history bar visibility), made of one colored segment per recent reading for that source, ordered oldest (left) to newest (right). Each segment's color SHALL be the threshold band level (`green`, `yellow`, or `red`) that reading falls into, computed the same way as the panel's own band coloring. A panel for a source with no threshold bands MUST NOT render a history bar. A reading with a non-numeric value (no band) SHALL render as a neutral/empty segment rather than being omitted, so the bar's segment count and left-to-right order stay stable.
 
@@ -227,6 +238,7 @@ A web UI panel for a source that declares threshold bands SHALL render a horizon
 #### Scenario: Source opts out of its history bar
 - **WHEN** a threshold-banded source declares `show_history = false`
 - **THEN** its panel renders with no history bar, even though it declares bands
+
 ### Requirement: Global connection health indicator
 The web dashboard SHALL show a single, always-visible connection health indicator near the app title and version at the top of the page, reflecting whether the browser can currently reach the daemon. The browser SHALL be the initiator: on an interval, the page itself sends a ping request to the daemon and reacts to whether a timely response arrives, independent of the panel-data refresh mechanism, so the indicator keeps working even if panel refresh stalls. Before the first ping resolves, the indicator MUST show a neutral "checking" state rather than claiming online or offline.
 
@@ -285,6 +297,7 @@ On the dashboard, the favicon's health-derived color SHALL reflect the worst sta
 #### Scenario: Log view favicon still turns red when offline
 - **WHEN** a source's log view is open and the connection goes offline
 - **THEN** the browser-tab favicon renders in its red status color, overriding the source's own status color
+
 ### Requirement: Group panes show multiple labeled, independently colored values
 A layout cell using the generalized pane shape (`{ title, main?, secondary?, table? }`, spec: source-configuration — UI layouts are config-declared like sources) SHALL render as a single card titled with the cell's configured title, combining up to three sections in this order: `main`, then `secondary`, then `table`.
 
@@ -371,6 +384,7 @@ The card's own border — not its background — SHALL be colored by the worst c
 #### Scenario: Unbanded failing member counts toward the worst color across sections
 - **WHEN** a cell's main section is healthy (green) and a secondary member has no threshold bands but is currently `failing`
 - **THEN** the card's own border renders in the red style, matching the failing member
+
 ### Requirement: Hidden sources render as space in the web dashboard
 When a layout cell (a bare source reference or `{ id, title }` cell) names a source whose `show_in` (spec: source-configuration — Per-source view visibility) excludes `"web"`, the web UI SHALL render that grid position as an empty cell of the same column span instead of the source's card, rather than failing startup. When a generalized pane cell's `main`, `secondary`, or `table` member names a source excluded from `"web"`, the web UI SHALL omit that member from the pane's rendering; if omitting excluded members leaves the cell with none of `main`, `secondary`, or `table` populated for the web UI, the whole cell SHALL render as an empty grid position. This does not change the layout's column count or row geometry, and the hidden source's chip MUST NOT appear in the source summary strip for this view.
 
@@ -393,6 +407,7 @@ When a layout cell (a bare source reference or `{ id, title }` cell) names a sou
 #### Scenario: Same layout renders differently per view
 - **WHEN** a layout cell references a source declaring `show_in = "tui"`
 - **THEN** the web dashboard shows that grid position empty while the TUI shows the source's panel, from the same layout config
+
 ### Requirement: Static-text panel rendering
 A layout cell that is a static-text panel (`{ title?, format?, text }`, spec: source-configuration — UI layouts are config-declared like sources) SHALL render as its own card, titled on the card's own top border the same way any other panel is (spec: web-ui — panel title rendered on the card border), or with no title text when `title` is omitted. The card's content SHALL render `text` the same way a source's value renders for that `format` — markdown as HTML, otherwise as plain text (spec: web-ui — health visible at a glance covers the same format handling for a source's value). Since there is no backing source, the card MUST NOT show an "updated X ago" footer, a per-source log link, a history bar, or any health/threshold-derived styling.
 
@@ -411,6 +426,7 @@ A layout cell that is a static-text panel (`{ title?, format?, text }`, spec: so
 #### Scenario: Static-text panel is never colored
 - **WHEN** a static-text panel cell is rendered
 - **THEN** its card's border and background render in the plain neutral style, never a health or threshold color
+
 ### Requirement: Source summary strip
 The web dashboard SHALL show a single summary strip directly under the page title, containing one chip per source that appears in a configured layout, ordered the same way panels are laid out — layouts in declaration order, then each layout's rows top-to-bottom and cells left-to-right. Each chip's color SHALL match the color its panel currently renders with: threshold band color when the source is healthy and declares threshold bands, health-derived color (`failing`→red, `stale`→yellow) when the source is failing or stale, and — since a chip is always a filled pill and needs some visible color even when its panel renders with no accent at all — a neutral gray when the source is healthy and declares no threshold bands. Clicking a chip SHALL navigate to and visually highlight that source's panel. The strip SHALL update on the same refresh cycle as the panel grid, so its colors never lag behind the panels'.
 
@@ -437,6 +453,7 @@ The web dashboard SHALL show a single summary strip directly under the page titl
 #### Scenario: Strip stays in sync with panel refresh
 - **WHEN** a source's health or value changes and the panel grid refreshes to reflect it
 - **THEN** that source's chip color updates in the same refresh, without a manual page reload
+
 ### Requirement: Consistent token-based visual theme
 The web dashboard SHALL present a single, consistent design-token-driven visual theme across the page — title, connection indicator, source summary strip, panels (including the history bar), and the per-source log view — instead of one-off, unrelated utility classes per element. Existing health/threshold status colors (green/yellow/red, per the "Threshold band coloring" and "Health visible at a glance" requirements) MUST render identically to before this change.
 
@@ -447,6 +464,7 @@ The web dashboard SHALL present a single, consistent design-token-driven visual 
 #### Scenario: Log view matches the themed page
 - **WHEN** the per-source log view is opened
 - **THEN** it uses the same design tokens (borders, text, background) as the rest of the themed dashboard, not the previous unrelated slate-color classes
+
 ### Requirement: Light/dark theme toggle
 The web dashboard SHALL provide a toggle control that switches the page between its existing light and dark design-token themes. On first visit, with no stored preference, the page SHALL apply the theme matching the browser's `prefers-color-scheme`. Toggling SHALL set an explicit preference, persisted across visits, that overrides `prefers-color-scheme` from then on. The chosen theme MUST be applied before the page's first paint, so no flash of the other theme is visible. The toggle control SHALL indicate the proposed action, not the current state: its icon SHALL depict the theme the page will switch to when activated, and its accessible label SHALL name that target theme.
 
@@ -477,6 +495,7 @@ The web dashboard SHALL provide a toggle control that switches the page between 
 #### Scenario: No flash of the wrong theme
 - **WHEN** the stored (or OS-derived) theme is dark
 - **THEN** the page's first rendered frame is already dark, not a light flash that then switches to dark
+
 ### Requirement: Dark theme uses moderated contrast and desaturated status colors
 The dark theme SHALL use a moderated background/foreground contrast — a dark gray background rather than a near-black one, and an off-white foreground rather than stark white — instead of the widest possible light/dark contrast range. Every `--status-{red,yellow,green}-*` token used by panels, the history bar, and summary-strip chips SHALL have a dark-mode value at least as desaturated as its light-mode counterpart; none SHALL fall through unoverridden to the light theme's saturated value. Health and threshold-band level selection (which of red/yellow/green applies) is unaffected — only the color values those levels render as in dark mode change.
 
@@ -499,6 +518,7 @@ The dark theme SHALL use a moderated background/foreground contrast — a dark g
 #### Scenario: History bar and connection indicator follow the same theme tokens
 - **WHEN** the dark theme is active
 - **THEN** the panel history bar's segment colors and the connection-status indicator/favicon colors are the same desaturated dark-theme colors as the rest of the page, not fixed at their light-theme values
+
 ### Requirement: Panel title rendered on the card border
 Each panel/pane card SHALL render its configured title embedded in the card's own top border, aligned to the top-left with padding on either side of the title text — the same convention the TUI already uses for a bordered panel's title — instead of as a separate header row above the panel's content. The border line SHALL pass through the vertical center of the title text (the way the TUI's own bordered-box title sits on its border line), not above or below it.
 
@@ -517,6 +537,7 @@ Each panel/pane card SHALL render its configured title embedded in the card's ow
 #### Scenario: Title vertically centered on the border line
 - **WHEN** any panel/pane card renders its title on the border
 - **THEN** the border line bisects the title text vertically, through its center, rather than sitting above or below it
+
 ### Requirement: Compact panel density
 The panel grid's cards and rows, and the source summary strip's chips, SHALL use denser spacing and a smaller type scale than before this change, so more panels and chips fit on screen without scrolling, while every piece of information a panel showed before this change (value, unit, status label, "updated X ago" text, history bar) remains visible — this change reduces spacing only, it does not hide or remove any previously shown information.
 
@@ -531,6 +552,7 @@ The panel grid's cards and rows, and the source summary strip's chips, SHALL use
 #### Scenario: More panels fit per screen
 - **WHEN** the same layout is rendered before and after this change at the same viewport size
 - **THEN** the panel grid after this change occupies less vertical space per panel than before
+
 ### Requirement: Responsive layout for small viewports
 The web dashboard SHALL render usably on small (phone-width) viewports. The page SHALL declare a viewport meta tag so mobile browsers render it at device width instead of a zoomed-out desktop layout. The panel grid's column count SHALL reduce as the viewport narrows — down to a single column at phone widths — instead of forcing the layout's configured column count regardless of viewport width. No element SHALL force the page to scroll horizontally at any viewport width down to a small phone width (360px).
 
@@ -549,6 +571,7 @@ The web dashboard SHALL render usably on small (phone-width) viewports. The page
 #### Scenario: No horizontal overflow at phone width
 - **WHEN** the dashboard is viewed at a 360px-wide viewport
 - **THEN** no element (grid, card, summary strip, header) causes the page to scroll horizontally
+
 ### Requirement: Panels can force a poll
 Each single-source web panel for a pollable source SHALL offer a control that fetches that source immediately, without waiting for its schedule. So SHALL a group pane's primary (`main`) row, and every source's log view at `/logs/<source>`. A group pane's compact secondary and table rows SHALL NOT carry an inline control — those rows are deliberately dense, and each already links to its source's log view, where the control is one click away. Panels for sources that have no fetch to force — `ingest` and `stream` sources — MUST NOT offer the control anywhere.
 
@@ -581,6 +604,7 @@ The control MUST NOT navigate away from the dashboard, and MUST NOT trigger the 
 #### Scenario: Control does not open the log view
 - **WHEN** the user activates a panel's poll control
 - **THEN** the browser stays on the dashboard
+
 ### Requirement: Poll-in-progress is visible
 Whenever a source's fetch is running — whether started by its own schedule, by this browser tab's poll control, or by any other client — every dashboard panel and log view for that source SHALL show it as currently polling, independent of the source's last known health status, in place of its poll control. This is a live shared state: it SHALL be visible to any viewer's page, not only the one that triggered it, once that viewer's next refresh reads it. The indication SHALL disappear once the fetch finishes, whatever its outcome, on the same refresh path panels already use — not held open by a separate timer.
 
@@ -599,6 +623,7 @@ Whenever a source's fetch is running — whether started by its own schedule, by
 #### Scenario: Indicator clears on completion
 - **WHEN** a source's in-flight fetch finishes, successfully or not
 - **THEN** the polling indication is gone from the dashboard on the next refresh
+
 ### Requirement: A composite root renders as a table of its children
 A layout cell that names a composite source directly (a bare source reference, `{ id, title }`, or a generalized pane's `main` member — any single-source position previously expecting one value) SHALL render as a table pane listing every declared child's current value, in declared order — the same visual shape the generalized pane's `table` section already renders for a manually-listed group of sources (spec: source-configuration — UI layouts are config-declared like sources). The pane's title is the composite source's own `title`, or its name when none is declared. Each row's label, health coloring, and threshold-band coloring follow that child's own declared fields exactly as an individually-referenced child source would. A composite source's children remain individually referenceable in any existing layout cell position, unaffected by this auto-rendering.
 
@@ -617,6 +642,7 @@ A layout cell that names a composite source directly (a bare source reference, `
 #### Scenario: Pane title falls back to the root's name
 - **WHEN** a composite source declares no `title`
 - **THEN** its auto-rendered table pane's title is the source's name
+
 ### Requirement: Log view error-only filter
 
 The `/logs/<source>` view SHALL offer an "Errors only" filter. When the `error`
@@ -673,11 +699,19 @@ params, returning cleanly to the dashboard.
 - **THEN** the next page URL retains `error=1`
 
 ### Requirement: Panels-updated event for user scripts
-After each panel-grid shard re-render — whether triggered by a stream-driven refresh event or the fallback timer — the page SHALL dispatch a `barduck:panels-updated` `CustomEvent` on `document`. The event's `detail` SHALL carry the names of the sources rendered in that refresh, so a listener can tell which panels changed without querying anything else first. The event SHALL fire on both the dashboard and per-source log views. Listeners subscribed once (e.g. from an end-of-body user script) SHALL observe every subsequent refresh without re-subscribing. Pages with no user scripts configured SHALL still dispatch the event.
+After each panel-grid shard re-render — whether triggered by a stream-driven refresh event or the fallback timer — the page SHALL dispatch a `barduck:panels-updated` `CustomEvent` on `document`. The event SHALL be dispatched only once the re-rendered content has been applied to the DOM, so a handler can read and modify the fresh panel elements synchronously, without deferring; changes a handler makes SHALL persist until the next re-render. DOM changes made by handlers SHALL NOT themselves cause the event to fire. The event's `detail` SHALL carry the names of the sources rendered in that refresh, so a listener can tell which panels changed without querying anything else first. The event SHALL fire on both the dashboard and per-source log views. Listeners subscribed once (e.g. from an end-of-body user script) SHALL observe every subsequent refresh without re-subscribing. Pages with no user scripts configured SHALL still dispatch the event.
 
 #### Scenario: Stored value triggers the event
 - **WHEN** a new value is stored for a shown source and the panels re-render
 - **THEN** the page dispatches one `barduck:panels-updated` event whose detail names that source
+
+#### Scenario: Handler sees the re-rendered DOM
+- **WHEN** a listener sets an attribute on a panel link inside its `barduck:panels-updated` handler, without deferring
+- **THEN** the attribute is set on the newly rendered element and stays until the next re-render
+
+#### Scenario: Handler changes do not re-fire the event
+- **WHEN** a handler modifies panel DOM
+- **THEN** no additional `barduck:panels-updated` event is dispatched until the next re-render
 
 #### Scenario: Listener survives refreshes
 - **WHEN** a user script subscribes to `barduck:panels-updated` on page load and two refreshes occur
@@ -690,11 +724,21 @@ After each panel-grid shard re-render — whether triggered by a stream-driven r
 ### Requirement: User-defined scripts injected into the web UI
 The daemon SHALL inject one `<script>` tag per configured user JavaScript file at the end of the web UI `<body>`, after the daemon's own inline scripts, in the configured resolution order. Tags SHALL appear on every web UI page (the dashboard and per-source log views). Each tag SHALL reference a daemon-served URL for its file with `Content-Type: application/javascript`; the daemon SHALL serve user scripts only from the startup-resolved configured file set and MUST NOT expose arbitrary filesystem paths. When no user scripts are configured, or none resolve, pages SHALL render with no injected tags — unchanged from before.
 
+Each script SHALL be served at `/assets/user-js/<name>`, where `<name>` is the file's own name, so devtools and stack traces show it. Characters outside `A-Z`, `a-z`, `0-9`, `.`, `_`, `-` SHALL be replaced with `_`. When two resolved files would get the same name, the first in resolution order SHALL keep it and each later one SHALL get a `-<n>` suffix before its extension (`n` starting at 2), with a startup warning naming the file.
+
 Injected `<script>` tags SHALL live outside the topcoat shard render region. A shard refresh (stream-driven tick or fallback timer) SHALL NOT add, remove, re-create, or re-execute them; each injected script runs exactly once per page load. A full page load (navigation, reload) SHALL re-run them normally.
 
 #### Scenario: Configured file is injected and loadable
 - **WHEN** `web_user_js` lists one existing `.js` file and the dashboard is loaded
 - **THEN** the page ends its `<body>` with exactly one `<script>` tag for that file, and fetching its URL returns the file's bytes as `application/javascript`
+
+#### Scenario: Served under the file's own name
+- **WHEN** `web_user_js` resolves `~/.config/barduck/user-js/links-new-tab.js`
+- **THEN** its tag is `<script src="/assets/user-js/links-new-tab.js">`
+
+#### Scenario: Same-named files stay distinct
+- **WHEN** two directories each contain `util.js` and both are configured
+- **THEN** the first resolves to `/assets/user-js/util.js`, the second to `/assets/user-js/util-2.js`, and startup logs a warning for the second
 
 #### Scenario: Log views get the same scripts
 - **WHEN** user scripts are configured and a per-source log view is loaded

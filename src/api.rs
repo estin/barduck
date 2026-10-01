@@ -520,7 +520,7 @@ mod tests {
     fn logs_query_defaults_and_ignores_unknown_parameters() {
         let q = LogsQuery::parse("").unwrap();
         assert_eq!(q.limit, None);
-        assert!(q.source.is_empty());
+        assert_eq!(q.source, Vec::<String>::new());
 
         let q = LogsQuery::parse("unknown=1&source=a").unwrap();
         assert_eq!(q.source, vec!["a".to_string()]);

@@ -142,6 +142,34 @@ const FAVICON_SCRIPT: &str = r#"(function () {
     setInterval(refresh, 5000);
 })();"#;
 
+/// Dispatches `barduck:panels-updated` after each shard re-render (spec:
+/// web-ui — panels-updated event for user scripts). Topcoat has no
+/// post-render hook and a tick bump only *requests* the render (a network
+/// round trip later the morph lands), so this watches the shard's own
+/// output instead: every render stamps `#bd-status[data-tick]` with a new
+/// value. The observer runs after the morph's synchronous DOM writes, so
+/// handlers see the fresh panels directly. Only a changed stamp dispatches,
+/// so DOM edits made by handlers never re-fire the event. The payload is
+/// the rendered `#panel-<id>` anchors.
+const PANELS_UPDATED_SCRIPT: &str = r#"(function () {
+    var wrap = document.getElementById('bd-panel-wrapper');
+    if (!wrap) return;
+    function stamp() {
+        var el = document.getElementById('bd-status');
+        return el ? el.getAttribute('data-tick') : null;
+    }
+    var last = stamp();
+    new MutationObserver(function () {
+        var now = stamp();
+        if (now === last) return;
+        last = now;
+        var els = wrap.querySelectorAll('[id^="panel-"]');
+        var sources = [];
+        for (var i = 0; i < els.length; i++) sources.push(els[i].id.slice(6));
+        document.dispatchEvent(new CustomEvent('barduck:panels-updated', { detail: { sources: sources } }));
+    }).observe(wrap, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-tick'] });
+})();"#;
+
 /// Wires the theme toggle button: persists the chosen theme via `POST
 /// /api/theme`, then reloads the page so the server renders it with the new
 /// `dark`/`light` class from the very first byte (spec: web-ui — light/dark
@@ -331,17 +359,10 @@ pub(super) async fn page_chrome(
                     // arrived (each event pushes it back), so panels keep
                     // refreshing while the stream is down or silently dead. A
                     // stream the browser gave up on (`CLOSED`, e.g. an error
-                    // status during a daemon restart) is reopened. Every bump
-                    // also dispatches `barduck:panels-updated` (spec: web-ui
-                    // — panels-updated event for user scripts) so
-                    // once-subscribed user scripts observe each refresh: the
-                    // source list is tick-invariant (layout config is static
-                    // per page load), so scanning the currently rendered
-                    // `#panel-<id>` anchors names exactly the sources this
-                    // refresh renders. Handlers needing post-morph DOM state
-                    // must defer (e.g. `requestAnimationFrame`); the tick
-                    // bump requests the re-render rather than awaiting it.
-                    raw!("(globalThis.__bdRefresh ??= (() => { const bump = () => { ${t}.increment(); try { var els = document.querySelectorAll('#bd-panel-wrapper [id^=\"panel-\"]'); var sources = []; for (var i = 0; i < els.length; i++) { var id = els[i].getAttribute('id'); if (id && id.indexOf('panel-') === 0) sources.push(id.slice(6)); } document.dispatchEvent(new CustomEvent('barduck:panels-updated', { detail: { sources: sources } })); } catch (e) {} }; let timer = null; const arm = () => { clearTimeout(timer); timer = setTimeout(() => { bump(); arm(); }, ${interval_ms}); }; const connect = () => { const es = new EventSource('/api/refresh-events'); es.addEventListener('refresh', () => { bump(); arm(); }); es.onerror = () => { if (es.readyState === EventSource.CLOSED) setTimeout(connect, ${interval_ms}); }; }; arm(); connect(); return { bump }; })(), 'tick')", {
+                    // status during a daemon restart) is reopened. A bump
+                    // only requests the re-render; `PANELS_UPDATED_SCRIPT`
+                    // announces it once the new DOM has landed.
+                    raw!("(globalThis.__bdRefresh ??= (() => { const bump = () => { ${t}.increment(); }; let timer = null; const arm = () => { clearTimeout(timer); timer = setTimeout(() => { bump(); arm(); }, ${interval_ms}); }; const connect = () => { const es = new EventSource('/api/refresh-events'); es.addEventListener('refresh', () => { bump(); arm(); }); es.onerror = () => { if (es.readyState === EventSource.CLOSED) setTimeout(connect, ${interval_ms}); }; }; arm(); connect(); return { bump }; })(), 'tick')", {
                         let _ = t.get();
                         let _ = interval_ms;
                         "tick"
@@ -440,6 +461,7 @@ pub(super) async fn page_chrome(
                 <script>(Unescaped::new_unchecked(THEME_TOGGLE_SCRIPT))</script>
                 <script>(Unescaped::new_unchecked(WIDTH_TOGGLE_SCRIPT))</script>
                 <script>(Unescaped::new_unchecked(POLL_SCRIPT))</script>
+                <script>(Unescaped::new_unchecked(PANELS_UPDATED_SCRIPT))</script>
                 // User scripts live in the static shell, outside the shards'
                 // comment markers, so topcoat's `morph` never touches them:
                 // they run exactly once per page load (spec: web-ui —
@@ -520,7 +542,8 @@ pub(super) async fn log_rows(
     offset: f64,
     errors_only: bool,
 ) -> Result<impl View> {
-    let _ = tick; // refresh trigger only; data always re-read from the DB
+    // Refresh trigger; data is always re-read from the DB. Also stamped on
+    // `#bd-status` (see `panels_grid`).
     let st = app_context::<AppState>(cx);
     let Some(src) = st.cfg.sources.iter().find(|s| s.name() == source) else {
         return Err(topcoat::Error::from(topcoat::router::error::bad_request(
@@ -603,7 +626,7 @@ pub(super) async fn log_rows(
     let source_unit = src.unit().unwrap_or("").to_string();
 
     Ok(view! {
-        <span id="bd-status" data-status=(favicon_status.as_str()) style="display:none"></span>
+        <span id="bd-status" data-status=(favicon_status.as_str()) data-tick=(tick.to_string()) style="display:none"></span>
         // Every panel links here, so a source with no control of its own on a
         // compact group card still has one a click away (spec: web-ui —
         // panels can force a poll). Rendered here rather than in

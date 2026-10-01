@@ -608,7 +608,7 @@ fn build_cell_parts(st: &AppState, data: &RenderData, cell: &config::Cell) -> Ce
             } else {
                 main.as_ref()
                     .filter(|item| config::source_visible_in(&st.cfg, item.id(), config::View::Web))
-                    .map(&panel)
+                    .map(panel)
             };
             let secondary_panels = config::visible_items(&st.cfg, secondary, config::View::Web)
                 .into_iter()
@@ -731,7 +731,8 @@ async fn collect_grids(st: &AppState) -> anyhow::Result<Vec<Grid>> {
 /// (spec: web-ui — current values without manual reload).
 #[shard]
 pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
-    let _ = tick; // refresh trigger only; data always re-read from the DB
+    // Refresh trigger; data is always re-read from the DB. Also stamped on
+    // the `#bd-status` marker so the page can tell a re-render has landed.
     let st = app_context::<AppState>(cx);
     // Logged here, rendered as its own message: a database this daemon can't
     // read is not a config with no panels, and the old silent fall-through
@@ -768,10 +769,12 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
     // Worst color across every source currently on the dashboard (spec:
     // web-ui — health visible at a glance); read by the browser-tab favicon
     // script via this hidden marker's `data-status`, refreshed each tick.
+    // `data-tick` changes on every re-render; `PANELS_UPDATED_SCRIPT` watches
+    // it to dispatch `barduck:panels-updated` once the new DOM is in place.
     let grids_empty = grids.is_empty();
     let worst = config::worst_color(chips.iter().map(|(level, _, _, _)| *level));
     Ok(view! {
-        <span id="bd-status" data-status=(worst.as_str().to_owned()) style="display:none"></span>
+        <span id="bd-status" data-status=(worst.as_str().to_owned()) data-tick=(tick.to_string()) style="display:none"></span>
         if !chips.is_empty() {
             <div class="flex flex-wrap gap-1.5 mb-4">
                 for (_, name, anchor, style) in chips {

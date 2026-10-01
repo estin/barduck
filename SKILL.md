@@ -291,7 +291,10 @@ to `.js` files or directories of `.js` files. Directory entries expand to
 their `*.js` files in alphabetic order (non-recursive); overall load order is
 config-list order, then alphabetic within each directory. Relative paths
 resolve against the config file's directory, like `database_path`. The daemon
-serves the resolved files at `/assets/user-js/<name>` and injects one
+serves each resolved file under its own name at `/assets/user-js/<file name>`
+(e.g. `/assets/user-js/links-new-tab.js`; characters outside
+`[A-Za-z0-9._-]` become `_`, and a later file with an already-used name gets
+`-2`, `-3`, … before `.js`, with a startup warning) and injects one
 `<script src>` per file at the end of the web UI `<body>` on every page;
 missing or unreadable paths warn at startup and are skipped.
 
@@ -303,11 +306,13 @@ After every panel refresh the page dispatches a `barduck:panels-updated`
 `CustomEvent` on `document`, with the rendered source names in
 `event.detail.sources`. Subscribe once — the listener observes every
 subsequent refresh without re-subscribing, since the tags live outside the
-shard region the refresh re-renders. The event fires on the tick bump (which
-requests the re-render), so a handler that reads freshly rendered panel DOM
-should defer a frame; handlers that only need the source list can act
-immediately. Wrap handler bodies in try/catch so one script's error cannot
-break other listeners.
+shard region the refresh re-renders. The event fires once the re-rendered
+panels are in the DOM, so a handler can read and modify them directly — no
+deferral needed. Each re-render replaces the panel DOM, which undoes earlier
+modifications, so re-apply them in every handler (and once at script load,
+for the initial render). Changes a handler makes never re-fire the event.
+Wrap handler bodies in try/catch so one script's error cannot break other
+listeners.
 
 ```js
 document.addEventListener("barduck:panels-updated", (event) => {
@@ -315,9 +320,7 @@ document.addEventListener("barduck:panels-updated", (event) => {
     for (const name of event.detail.sources) {
       const panel = document.getElementById(`panel-${name}`);
       if (!panel) continue;
-      requestAnimationFrame(() => {
-        // Per-source customization here, e.g. annotate the panel.
-      });
+      // Per-source customization here, e.g. annotate the panel.
     }
   } catch (e) {
     console.error("panel hook failed:", e);
@@ -330,8 +333,8 @@ document.addEventListener("barduck:panels-updated", (event) => {
 1. **Configure scripts** with `web_user_js` using file or directory paths;
    confirm ordering expectations (config order, then alphabetic per directory)
 2. **Hook refreshes** with a `barduck:panels-updated` listener that queries
-   `#panel-<source>` inside the handler, deferring DOM reads a frame when
-   they must see the just-rendered state
+   `#panel-<source>` inside the handler and modifies it directly; re-apply
+   on every event, since each refresh re-renders the panels
 3. **Validate** by loading the dashboard and checking the browser console
    for errors after a refresh tick
 

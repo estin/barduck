@@ -980,7 +980,7 @@ async fn get_body(base: &str, path: &str) -> String {
 /// a traversal attempt.
 async fn check_user_js_serving(base: &str) {
     // The registry serves each file as JavaScript…
-    let js = reqwest::get(format!("{base}/assets/user-js/u1.js"))
+    let js = reqwest::get(format!("{base}/assets/user-js/a.js"))
         .await
         .unwrap();
     assert_eq!(js.status(), 200);
@@ -991,7 +991,7 @@ async fn check_user_js_serving(base: &str) {
     assert_eq!(js.text().await.unwrap(), "globalThis.__bdA = 1;");
     // …and nothing outside it: unknown names 404, and configured files are
     // not reachable by filesystem path.
-    let missing = reqwest::get(format!("{base}/assets/user-js/u9.js"))
+    let missing = reqwest::get(format!("{base}/assets/user-js/missing.js"))
         .await
         .unwrap();
     assert_eq!(missing.status(), 404);
@@ -1048,20 +1048,20 @@ rows = [["cpu"]]
     let html = get_body(&base, "/").await;
     // Resolution order: lone file first, then the directory alphabetically.
     let lone = html
-        .find(r#"<script src="/assets/user-js/u0.js">"#)
+        .find(r#"<script src="/assets/user-js/lone.js">"#)
         .expect("lone tag");
     let a = html
-        .find(r#"<script src="/assets/user-js/u1.js">"#)
+        .find(r#"<script src="/assets/user-js/a.js">"#)
         .expect("a.js tag");
     let b = html
-        .find(r#"<script src="/assets/user-js/u2.js">"#)
+        .find(r#"<script src="/assets/user-js/b.js">"#)
         .expect("b.js tag");
     assert!(
         lone < a && a < b,
         "tags must follow resolution order:\n{html}"
     );
     assert!(
-        !html.contains("u3.js"),
+        !html.contains("skip.txt"),
         "skip.txt must not be injected:\n{html}"
     );
     // Tags sit after the daemon's own inline scripts, at the end of <body>:
@@ -1076,10 +1076,10 @@ rows = [["cpu"]]
     // The log view carries the same tags in the same order.
     let logs = get_body(&base, "/logs/cpu").await;
     let logs_lone = logs
-        .find(r#"<script src="/assets/user-js/u0.js">"#)
+        .find(r#"<script src="/assets/user-js/lone.js">"#)
         .expect("log lone tag");
     let logs_b = logs
-        .find(r#"<script src="/assets/user-js/u2.js">"#)
+        .find(r#"<script src="/assets/user-js/b.js">"#)
         .expect("log b.js tag");
     assert!(logs_lone < logs_b);
 
@@ -1224,7 +1224,7 @@ rows = [["cpu"]]
     );
     let cfg: config::Config = toml::from_str(&toml).unwrap();
     config::validate(&cfg).unwrap();
-    assert!(cfg.web_user_js.is_empty());
+    assert_eq!(cfg.web_user_js, Vec::<std::path::PathBuf>::new());
     let db = Db::open_rw(&db_path).unwrap();
 
     let state = AppState {
@@ -1258,10 +1258,10 @@ rows = [["cpu"]]
 /// without configured user scripts (spec: web-ui — panels-updated event for
 /// user scripts). A headless HTTP test cannot run the page's own JS, so this
 /// asserts the dispatch contract where it is observable server-side: the
-/// bump function carries the dispatch, and the page renders the anchors the
-/// payload is scanned from. Live listener behavior (subscribe-once, repeat
-/// delivery) is pinned by the dispatch living in the shared tick funnel
-/// every refresh flows through (SSE event and fallback timer alike).
+/// dispatch is driven by the shard's own `#bd-status[data-tick]` stamp —
+/// i.e. it fires once a re-render has landed in the DOM, not when the tick
+/// bump merely requests one — and the page renders the anchors the payload
+/// is scanned from.
 #[tokio::test]
 async fn web_ui_dispatches_panels_updated_on_every_refresh() {
     let dir = tempfile::tempdir().unwrap();
@@ -1298,9 +1298,20 @@ rows = [["cpu"]]
 
     for path in ["/", "/logs/cpu"] {
         let html = get_body(&base, path).await;
-        // The shared tick funnel dispatches the event on every bump — the
-        // same `bump()` both SSE refresh events and the fallback timer
-        // call — with the payload scanned from the rendered panel anchors.
+        // Every shard render stamps the marker the observer watches…
+        assert!(
+            html.contains(r#"id="bd-status""#) && html.contains(r#"data-tick="0""#),
+            "{path} must stamp the render marker with the tick:\n{html}"
+        );
+        assert!(
+            html.contains("attributeFilter: ['data-tick']"),
+            "{path} must dispatch from the render stamp, not the tick bump:\n{html}"
+        );
+        assert!(
+            !html.contains("increment(); try"),
+            "{path} must not dispatch from the tick bump (before the re-render):\n{html}"
+        );
+        // …and dispatches with the payload scanned from the rendered anchors.
         assert!(
             html.contains("barduck:panels-updated"),
             "{path} must dispatch the event on refresh:\n{html}"
@@ -1835,7 +1846,7 @@ async fn web_ui_renders_layout_panels_with_status_styles() {
         .await
         .unwrap();
     assert_eq!(js.status(), 200);
-    assert!(!js.text().await.unwrap().trim().is_empty());
+    assert_ne!(js.text().await.unwrap().trim(), "");
     // Grid arrangement: two rows, two columns; second row starts with a spacer.
     let base = url.trim_end_matches('/');
     let page = reqwest::get(base).await.unwrap().text().await.unwrap();
