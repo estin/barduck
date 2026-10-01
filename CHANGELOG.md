@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.2 (2026-10-01)
+
+### CI
+
+- Release pipeline fixes
+
 ## v0.1.1 (2026-10-01)
 
 ### CI
