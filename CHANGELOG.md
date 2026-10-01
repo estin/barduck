@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.4 (2026-10-01)
+
+### CI
+
+- Allow install barduck as static binary via nix
+
 ## v0.1.3 (2026-10-01)
 
 ### Bug Fixes
