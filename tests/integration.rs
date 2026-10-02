@@ -279,14 +279,24 @@ name = "flaky"
 type = "query"
 command = "echo hi"
 interval = "1h"
-retry_interval = "2s"
+retry_interval = "10s"
 "#,
         db = db_path.display(),
     );
     let cfg: config::Config = toml::from_str(&toml).unwrap();
     config::validate(&cfg).unwrap();
     let db = Db::open_rw(&db_path).unwrap();
-    // A fresh failure defers the first tick to retry_interval (~2s).
+    // A fresh failure defers the first tick to retry_interval (~10s). That
+    // window is long on purpose: the deadline runs from the seeded row's
+    // timestamp, so it was already ticking before the collector task, the
+    // router and the server below existed, and every millisecond of that
+    // setup is spent out of it. At 2s the ingest beat the retry by ~100ms
+    // locally and lost by ~500ms on a loaded CI runner, which then saw the
+    // retry's own log row. The spec only promises the *next* fetch waits the
+    // full interval, so losing that race is not a product bug — but the
+    // scenario under test ("was retrying") needs the retry still pending.
+    // The sleep below still outlasts the deadline, so an unreset retry would
+    // still be caught.
     db.insert_log("flaky", 1, Some("boom"), None, Origin::Poll)
         .await
         .unwrap();
@@ -307,9 +317,9 @@ retry_interval = "2s"
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
     // Ingest a second into the window (letting startup settle), resetting
-    // the wait to the full hour; two seconds past the original deadline
-    // only the seeded failure and the ingest exist — no scheduled fetch
-    // fired.
+    // the wait to the full hour; the sleep below outlasts the retry deadline
+    // the collector started with, so only the seeded failure and the ingest
+    // exist — no scheduled fetch fired.
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let resp = reqwest::Client::new()
         .post(format!("{base}/api/ingest"))
@@ -318,7 +328,7 @@ retry_interval = "2s"
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     let rows = db.logs(Some("flaky"), 10).await.unwrap();
     assert_eq!(
         rows.len(),
