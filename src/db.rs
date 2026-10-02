@@ -28,9 +28,11 @@ use tokio::sync::{mpsc, oneshot};
 /// insert/purge, and one reader task holding a second persistent connection
 /// for every read — a page render across dozens of sources means dozens of
 /// reads, and reopening a connection per read is the cost that showed up in
-/// practice reopening-per-op was deferred on. Both tasks still take the
-/// advisory lock per-operation, not for the connection's whole lifetime, so
-/// two in-process callers still interleave between either.
+/// practice reopening-per-op was deferred on. The writer task still takes the
+/// advisory lock per operation, not for the connection's whole lifetime, so
+/// two in-process writers still interleave; the reader task takes it not at
+/// all, since its connection is a clone of the writer's own and every query
+/// runs inside that one `DuckDB` instance (see [`ReadCmd::run`]).
 ///
 /// Across processes, though, resident connections mean the daemon holds the
 /// file's `DuckDB` lock for its whole lifetime — so while it runs, another
@@ -434,17 +436,25 @@ impl HealthInputs {
 
 impl ReadCmd {
     /// Executes this command against the reader's persistent connection,
-    /// taking the advisory lock only for this one query — same rationale as
-    /// [`WriteCmd::run`], and the same underlying query as the direct-mode
-    /// fallback each `Db` method falls back to (the `query_*` free
-    /// functions below are shared by both paths).
-    fn run(self, db: &Db, conn: &Connection) {
+    /// with the same underlying query as the direct-mode fallback each `Db`
+    /// method uses (the `query_*` free functions below are shared by both
+    /// paths).
+    ///
+    /// Deliberately without the advisory lock [`WriteCmd::run`] takes: this
+    /// connection is a clone of the writer's own (spec: data-storage —
+    /// resident reader connection), so the query runs inside the daemon's own
+    /// `DuckDB` instance, which serializes it, and while the daemon holds the
+    /// file no other process can open it read-write at all. Locking here only
+    /// put every queued read in contention with the writer's writes, where it
+    /// could be starved past [`Db::acquire`]'s 50 × 100 ms budget and fail
+    /// outright (spec: data-storage — concurrent access safety).
+    fn run(self, conn: &Connection) {
         match self {
             ReadCmd::LastHealth { source, reply } => {
-                let _ = reply.send(db.with_lock(|| query_last_health(conn, &source)));
+                let _ = reply.send(query_last_health(conn, &source));
             }
             ReadCmd::LatestValues { reply } => {
-                let _ = reply.send(db.with_lock(|| query_latest_values(conn)));
+                let _ = reply.send(query_latest_values(conn));
             }
             ReadCmd::History {
                 source,
@@ -453,14 +463,14 @@ impl ReadCmd {
                 limit,
                 reply,
             } => {
-                let _ = reply.send(db.with_lock(|| query_history(conn, &source, from, to, limit)));
+                let _ = reply.send(query_history(conn, &source, from, to, limit));
             }
             ReadCmd::Logs {
                 sources,
                 limit,
                 reply,
             } => {
-                let _ = reply.send(db.with_lock(|| query_logs(conn, &sources, limit)));
+                let _ = reply.send(query_logs(conn, &sources, limit));
             }
             ReadCmd::LogsFiltered {
                 sources,
@@ -469,22 +479,25 @@ impl ReadCmd {
                 errors_only,
                 reply,
             } => {
-                let _ =
-                    reply.send(db.with_lock(|| {
-                        query_logs_filtered(conn, &sources, limit, offset, errors_only)
-                    }));
+                let _ = reply.send(query_logs_filtered(
+                    conn,
+                    &sources,
+                    limit,
+                    offset,
+                    errors_only,
+                ));
             }
             ReadCmd::LastSuccess { source, reply } => {
-                let _ = reply.send(db.with_lock(|| query_last_success(conn, &source)));
+                let _ = reply.send(query_last_success(conn, &source));
             }
             ReadCmd::LastAttempt { source, reply } => {
-                let _ = reply.send(db.with_lock(|| query_last_attempt(conn, &source)));
+                let _ = reply.send(query_last_attempt(conn, &source));
             }
             ReadCmd::HealthInputs { per_source, reply } => {
-                let _ = reply.send(db.with_lock(|| HealthInputs::read(conn, per_source)));
+                let _ = reply.send(HealthInputs::read(conn, per_source));
             }
             ReadCmd::RecentReadings { per_source, reply } => {
-                let _ = reply.send(db.with_lock(|| query_recent_readings_all(conn, per_source)));
+                let _ = reply.send(query_recent_readings_all(conn, per_source));
             }
         }
     }
@@ -799,22 +812,10 @@ fn clone_writer_conn(
 /// handling, but reconnects via a fresh clone rather than a fresh
 /// independent open — see [`WriteCmd::CloneConnection`] for why the two
 /// aren't interchangeable.
-fn spawn_reader(
-    path: PathBuf,
-    writer: mpsc::UnboundedSender<WriteCmd>,
-) -> mpsc::UnboundedSender<ReadCmd> {
+fn spawn_reader(writer: mpsc::UnboundedSender<WriteCmd>) -> mpsc::UnboundedSender<ReadCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ReadCmd>();
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        let db = Db {
-            path,
-            ro: true,
-            writer: None,
-            reader: None,
-            session_bands: SessionBands::default(),
-            polling: PollingSet::default(),
-            refresh: RefreshSignal::default(),
-        };
         let mut conn = match clone_writer_conn(&handle, &writer) {
             Ok(conn) => conn,
             Err(e) => {
@@ -827,7 +828,7 @@ fn spawn_reader(
         };
         while let Some(cmd) = rx.blocking_recv() {
             if let Err(panic) =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.run(&db, &conn)))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.run(&conn)))
             {
                 tracing::error!(
                     "db reader: read command panicked: {}",
@@ -1159,7 +1160,7 @@ impl Db {
     pub fn open_rw_daemon(path: &Path) -> Result<Self> {
         let mut db = Self::open_rw(path)?;
         let writer = spawn_writer(db.path.clone());
-        db.reader = Some(spawn_reader(db.path.clone(), writer.clone()));
+        db.reader = Some(spawn_reader(writer.clone()));
         db.writer = Some(writer);
         Ok(db)
     }
@@ -1878,6 +1879,44 @@ mod tests {
             db.history("cpu", None, None, None).await.unwrap().len(),
             100
         );
+    }
+
+    /// Regression test: a read served by the daemon's resident reader
+    /// connection must not take the cross-process advisory lock.
+    ///
+    /// [`ReadCmd::run`] used to wrap every query in `Db::with_lock`, which
+    /// queued each read behind the writer's own writes on the same lockfile.
+    /// Under load that starved a read past [`Db::acquire`]'s 50 × 100 ms
+    /// budget and failed it outright — the intermittent CI failure in
+    /// `concurrent_reads_and_writes_via_daemon_handles_survive_without_corruption`.
+    /// Holding the lock from this test rather than from a second process
+    /// makes that deterministic: on the old path the read spent five seconds
+    /// and then errored, while the resident path answers immediately because
+    /// the query runs inside the daemon's own `DuckDB` instance.
+    #[tokio::test]
+    async fn daemon_reads_do_not_take_the_cross_process_advisory_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.duckdb");
+        let db = Db::open_rw_daemon(&path).unwrap();
+        db.insert_reading("cpu", "42", None, None, None, None)
+            .await
+            .unwrap();
+
+        // Stand in for a short-lived second process mid-operation. The
+        // writer task releases the lock between operations (`Db::acquire` is
+        // scoped to one command), so this takes it cleanly and the daemon
+        // keeps serving reads with it held.
+        let (lock_path, _) = db.lock_file().unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.try_lock().unwrap();
+
+        assert_eq!(db.latest_values().await.unwrap().len(), 1);
+        assert_eq!(db.history("cpu", None, None, None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

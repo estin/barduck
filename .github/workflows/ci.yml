@@ -29,6 +29,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `Swatinem/rust-cache` scrubs `target/` before it saves: any directory
+      # that isn't a cargo profile dir gets emptied file by file, which takes
+      # `target/duckdb-download/` with it, and `target/debug/deps/libduckdb.so`
+      # goes too (its name matches no package, unlike `libduckdb-<hash>.rlib`).
+      # The build script's own `target/debug/build/libduckdb-sys-*/output`
+      # survives, so a restored cache claims a finished build and points `-L`
+      # at a directory that is gone — the next `cargo` then fails to link
+      # `-lduckdb`. Dropping the unit makes cargo re-run the build script,
+      # which re-downloads the prebuilt library. `cargo clean -p` rather than
+      # `rm -rf` so the step needs no shell of its own on the Windows matrix.
+      - run: cargo clean -p libduckdb-sys
+
       # `just` runs the `ci` recipe below; `cargo-nextest` is what it runs.
       - name: Install just and cargo-nextest
         uses: taiki-e/install-action@v2
@@ -78,6 +90,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+
+      # See the `ci` job: `Swatinem/rust-cache` strips the downloaded
+      # libduckdb out of `target/` but keeps the build script that points the
+      # linker at it, so a restored cache can no longer resolve `-lduckdb`.
+      - run: cargo clean -p libduckdb-sys
+
       # The `cfg(windows)`/`cfg(unix)` halves of the tree only exist on this
       # matrix, so without clippy here they would ship with zero lint
       # coverage — the `ci` job's clippy run never compiles them.
