@@ -36,6 +36,23 @@ for a runnable tour.
   debug counterpart that writes nothing
 - Planning artifacts and specs: [`openspec/`](openspec/)
 
+## Screenshots
+
+### Web UI
+
+![barduck web UI](docs/screenshots/webui.png)
+
+Live dashboard served by `barduck daemon` — panels re-render as values arrive,
+with per-source health colors and history bars.
+
+### TUI
+
+![barduck TUI](docs/screenshots/tui.png)
+
+Terminal dashboard (`barduck tui`, ratatui) showing the same sources with
+health states — healthy, stale, and failing.
+
+
 ## When should I use barduck?
 
 barduck is a good fit if you:
