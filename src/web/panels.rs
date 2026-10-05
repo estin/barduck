@@ -486,46 +486,56 @@ fn build_panel(
 /// them working after the panel shard replaces the grid's DOM on its next
 /// tick.
 ///
-/// `polling` — true while a fetch for this source, scheduled or forced,
-/// from any viewer, is actually running (spec: web-ui — poll-in-progress is
-/// visible) — swaps the control for a plain "polling…" marker with no
-/// `data-bd-poll`, so it can't be clicked into starting a second fetch and
-/// needs no separate progress popup: every viewer sees the same state,
-/// live, on the panel itself.
+/// One markup serves both states. While a fetch for this source — scheduled
+/// or forced, from any viewer — is actually running (spec: web-ui —
+/// poll-in-progress is visible), the same control renders in its busy state:
+/// `disabled`, `aria-busy`, and a spinning icon (`bd-spin`, animated by
+/// `page_chrome`'s stylesheet), with `data-bd-poll` dropped so it cannot be
+/// clicked into starting a second fetch. The control itself is the
+/// indication rather than a text marker swapping in beside it: the footer is
+/// built from `text-xs` caption text, where a textual "polling…" label read
+/// as a stray fragment of the time-ago caption next to it. The state is the
+/// server-rendered live one, so every viewer sees the same busy control on
+/// their next refresh and it clears on the same refresh path once the fetch
+/// finishes — no separate timer, no popup.
 #[component]
 pub(super) async fn poll_button(source: String, polling: bool) -> Result<impl View> {
-    if polling {
-        Ok(view! {
-            <span
-                aria-live="polite"
-                class="normal-case opacity-60 italic"
+    let label = format!("Fetch {source} now");
+    Ok(view! {
+        <button
+            type="button"
+            // No `data-bd-poll` while a fetch runs: the delegated listener
+            // keys off it, so the control cannot start a second fetch.
+            data-bd-poll=(if polling { None } else { Some(source.clone()) })
+            title=(label.clone())
+            aria-label=(label)
+            disabled=(polling)
+            aria-busy=(if polling { Some("true") } else { None })
+            class="normal-case opacity-60 hover:opacity-100 hover:underline cursor-pointer disabled:opacity-30 disabled:cursor-default bg-transparent border-0 p-0 font-inherit text-inherit focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current"
+        >
+            // Refresh glyph in the header theme toggle's icon language
+            // (`viewBox="0 0 24 24"`, `stroke="currentColor"`); sized to
+            // the caption text instead of the `button` component's icon
+            // size, which would tower over it.
+            <svg
+                class=(if polling { "size-3.5 align-[-0.125em] bd-spin" } else { "size-3.5 align-[-0.125em]" })
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
             >
-                "polling…"
-            </span>
-        }
-        .boxed())
-    } else {
-        Ok(view! {
-             <button
-                 type="button"
-                 data-bd-poll=(source.clone())
-                 title=(format!("Fetch {source} now"))
-                 aria-label=(format!("Fetch {source} now"))
-                 class="normal-case opacity-60 hover:opacity-100 hover:underline cursor-pointer disabled:opacity-30 disabled:cursor-default bg-transparent border-0 p-0 font-inherit text-inherit focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current"
-             >
-                // Refresh glyph in the header theme toggle's icon language
-                // (`viewBox="0 0 24 24"`, `stroke="currentColor"`); sized to
-                // the caption text instead of the `button` component's icon
-                // size, which would tower over it.
-                <svg class="size-3.5 align-[-0.125em]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-                    <path d="M21 3v5h-5"></path>
-                    <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
-                    <path d="M8 16H3v5"></path>
-                </svg>
-             </button>
-         }.boxed())
+                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+                <path d="M21 3v5h-5"></path>
+                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+                <path d="M8 16H3v5"></path>
+            </svg>
+        </button>
     }
+    .boxed())
 }
 
 /// One cell's built panel data and card metadata: `(main, secondary, table,

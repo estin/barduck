@@ -24,14 +24,18 @@ dense panel footer.
   adjacent time-ago caption instead of towering over it — the reason the control
   never used the `button` component's `ButtonSize::Icon`.
 - `POLL_SCRIPT` stops rewriting the control's `textContent` on click. That swap
-  exists only to echo the "polling…" state optimistically; with an inline `<svg>`
+  exists only to echo the polling state optimistically; with an inline `<svg>`
   it would destroy the icon and then restore it as escaped markup. The script now
   marks the button busy (disabled + `aria-busy` + a spin class on the icon) and
-  leaves the authoritative state to the existing server-side "polling…" re-render.
+  leaves the authoritative state to the server-rendered busy control on its next
+  re-render — the same disabled/spinning/`aria-busy` button, minus
+  `data-bd-poll` so it cannot start a second fetch while one is in flight.
 - An icon-only control gains an explicit visible keyboard focus indicator, since
   it no longer has a text label to make it obviously interactive.
-- The in-flight "polling…" marker stays textual — it is a state, not an action,
-  and it remains the server-rendered source of truth for the live polling state.
+- The in-flight indication is the control itself in its busy state — no text
+  marker anywhere. It is a state, not an action, and it remains the
+  server-rendered source of truth for the live polling state, visible to every
+  viewer on their next refresh.
 
 ## Capabilities
 
@@ -46,8 +50,9 @@ dense panel footer.
   visible text label, carries an accessible name naming the source, keeps a
   visible keyboard focus indicator, and reflects an in-progress poll
   non-destructively (never replacing the icon with text). "Poll-in-progress is
-  visible" is clarified so the textual "polling…" marker, not the icon, is what
-  replaces the control while a fetch runs.
+  visible" is clarified so the control's own busy state (disabled, `aria-busy`,
+  spinning icon, no `data-bd-poll`) — not a textual "polling…" marker — is the
+  in-flight indication.
 
 ## Impact
 
@@ -59,8 +64,9 @@ dense panel footer.
   delegated `data-bd-poll` click path and the three `poll_button` call sites
   are untouched.
 - The existing integration tests assert on the `data-bd-poll` attribute, not on
-  the "poll now" wording, and the in-flight test's `">polling…<"` marker is
-  unchanged — so no test asserts the old presentation.
+  the "poll now" wording. The in-flight test asserts the busy control (spinning
+  icon, `aria-busy`, no `data-bd-poll`) and that no visible "polling" text
+  renders — so no test pins the old text-marker presentation.
 - Assumed icon: a two-arrow circular "refresh" glyph, chosen because the action
   is "re-fetch this source now" and because it is drawn in the same
   `viewBox="0 0 24 24"` / `stroke="currentColor"` style as the theme toggle.

@@ -8,5 +8,6 @@
 
 ## 2. Verification
 
-- [x] 2.1 Run the full gate (`just ci`) and verify no regressions: formatting, clippy, and the whole test suite pass, including the unchanged `">polling…<"` in-flight marker assertions
-- [x] 2.2 Smoke the change end to end via `just demo`: load the dashboard, confirm the icon aligns with the adjacent time-ago caption, confirm hover shows the tooltip and keyboard tab shows the focus ring, click the control and confirm the icon spins then yields to the textual polling marker, and confirm the spin class is actually emitted (if not, move it into markup-side classes)
+- [x] 2.1 Run the full gate (`just ci`) and verify no regressions: formatting, clippy, and the whole test suite pass, including the revised busy-control in-flight assertions (spinning icon, `aria-busy`, no `data-bd-poll`, no visible "polling" text)
+- [x] 2.2 Smoke the change end to end via `just demo`: load the dashboard, confirm the icon aligns with the adjacent time-ago caption, confirm hover shows the tooltip and keyboard tab shows the focus ring, click the control and confirm the icon spins (no text marker) while the fetch runs, and confirm the spin class is actually emitted (if not, move it into markup-side classes)
+- [ ] 2.3 Re-verify after replacing the textual "polling…" marker with the control's own busy state (`src/web/panels.rs` `poll_button`, `svg.bd-spin` spin rule in `src/web/routes.rs`): click the control on a slow source and confirm the icon alone spins (no text) while the fetch runs and the actionable control returns when it finishes; run `just ci`

@@ -18,10 +18,11 @@ See `proposal.md` (Why) for motivation. Current state:
   `var label = btn.textContent; btn.disabled = true;
   btn.textContent = 'polling…'; … btn.textContent = label;` — it saves,
   replaces, and restores the control's text.
-- The mid-fetch state is server-rendered: the component swaps the button for
-  `<span aria-live="polite">…polling…</span>`, which the shard re-renders on
-  the next tick, and the integration suite pins `">polling…<"` and the
-  `data-bd-poll` attribute — never the "poll now" wording.
+- The mid-fetch state is server-rendered: the component renders the same control
+  in its busy state (`disabled`, `aria-busy="true"`, `bd-spin` on the icon, no
+  `data-bd-poll` so it cannot start a second fetch), which the shard re-renders
+  on the next tick; the integration suite pins the busy control and the absence
+  of any visible "polling" text — never a text marker.
 - The header's theme toggle (`routes.rs:310-324`) is the established inline-SVG
   icon-control pattern: `<svg viewBox="0 0 24 24" stroke="currentColor"
   stroke-width="2">`, decorated by `aria-label`/`title` on the surrounding
@@ -40,16 +41,15 @@ escaped plain text.
   `data-bd-poll`, `title`, `aria-label`, disabled styling, and the no-navigate
   / no-log-link behavior.
 - Click feedback stays immediate (the 5 s shard tick is too slow for that) but
-  becomes non-destructive to the icon.
-- The server-rendered "polling…" marker keeps working byte-for-byte, so the
-  in-flight test's `">polling…<"` assertion and the live cross-viewer state
-  are untouched.
+  becomes non-destructive to the icon, matching the server-rendered busy
+  control that lands on the next tick.
 
 **Non-Goals:**
 
 - No change to the `button` component, `ButtonSize::Icon`, the tick cadence,
   the `/api/sources/<name>/poll` endpoint, or any collector/polling semantics.
-- The "polling…" marker itself stays text; it is a state, not an action.
+- The in-flight indication is the control's own busy state; no text marker, it
+  is a state, not an action.
 - No new dependencies, asset files, routes, or config.
 
 ## Decisions
@@ -75,10 +75,8 @@ escaped plain text.
   `inFlight` set stays keyed by source name, so duplicate-click protection
   survives the shard replacing the button's DOM between click and `finally`,
   and disabling a detached node is a harmless no-op. The shard's
-  server-rendered "polling…" span remains the authoritative mid-fetch state.
-- **Accessible name unchanged, icon decorative.** `title` and `aria-label`
-  stay `Fetch {source} now`; the `<svg>` gets `aria-hidden="true"`. No wording
-  change means no doc/screenshot updates.
+  server-rendered busy control (same classes, minus `data-bd-poll`) is the
+  authoritative mid-fetch state on the next tick.
 - **Focus indicator explicit.** The button gains an explicit `focus-visible`
   ring consistent with the shell's other controls, since an icon with no text
   label must still read as interactive to keyboard users.
@@ -95,7 +93,6 @@ escaped plain text.
 - **Minor responsive-visual risk.** An icon in a `text-xs` footer can look
   oversized or misaligned next to the time-ago caption; this is a one-class
   fix, verified visually rather than tested.
-- **Optimistic feedback is weaker than text.** A spinning icon cannot say
-  "polling…"; users learn the outcome from the server-rendered marker on the
-  next tick, exactly as today — the script's old text swap was only ever a
-  stopgap until that re-render.
+- **Feedback is the icon, not text.** A spinning icon cannot say
+  "polling…"; users learn the outcome from the refreshed panel on the
+  next tick — the script's old text swap was only ever a stopgap until that

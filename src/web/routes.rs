@@ -331,7 +331,7 @@ pub(super) async fn page_chrome(
                 topcoat::font::link(font: GEIST)
                 <link rel="stylesheet" href=(tailwind::stylesheet!())>
                 <style>
-                    "[data-bd-poll] svg.bd-spin { animation: bd-spin 1s linear infinite; } @keyframes bd-spin { to { transform: rotate(360deg); } }
+                    "svg.bd-spin { animation: bd-spin 1s linear infinite; } @keyframes bd-spin { to { transform: rotate(360deg); } }
                     /* Below phone width, the grid's dynamic per-layout inline
                        styles (a fixed column count and each cell's explicit
                        grid-row/grid-column) can't vary by viewport on their

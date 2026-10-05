@@ -1432,9 +1432,10 @@ rows = [["cpu"]]
 }
 
 /// While a source's fetch (here, a forced poll) is actually running, the
-/// dashboard's own panel shows it — no separate popup needed, since every
-/// viewer's page re-reads the same live state (spec: web-ui —
-/// poll-in-progress is visible).
+/// dashboard's own panel shows it as the control's busy state — no separate
+/// popup, no text label, since every viewer's page re-reads the same live
+/// state (spec: web-ui — poll-in-progress is visible). The busy control
+/// carries no `data-bd-poll`, so it cannot be clicked into a second fetch.
 #[tokio::test]
 async fn web_ui_panel_shows_polling_state_while_a_fetch_is_in_flight() {
     let dir = tempfile::tempdir().unwrap();
@@ -1477,11 +1478,6 @@ rows = [["slow"]]
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { topcoat::serve(listener, router).await });
 
-    // Bounded by angle brackets so this only matches the rendered span's
-    // text content, not the client script's own `'polling…'` string
-    // literal (single-quoted) that's on every page regardless of state.
-    let polling_marker = ">polling…<";
-
     let before = reqwest::get(format!("{base}/"))
         .await
         .unwrap()
@@ -1491,10 +1487,6 @@ rows = [["slow"]]
     assert!(
         before.contains(r#"data-bd-poll="slow""#),
         "control expected before polling"
-    );
-    assert!(
-        !before.contains(polling_marker),
-        "not polling yet:\n{before}"
     );
 
     // The endpoint itself blocks until the fetch finishes, so the request
@@ -1513,7 +1505,16 @@ rows = [["slow"]]
                 .text()
                 .await
                 .unwrap();
-            if html.contains(polling_marker) && !html.contains(r#"data-bd-poll="slow""#) {
+            // Busy control, not a text marker: spinning icon, non-interactive
+            // (`data-bd-poll` absent so it cannot start a second fetch), and
+            // no visible label anywhere on the page — the page's only
+            // `polling`-mentioning script is the client-side listener's own
+            // string literal, which never renders.
+            let busy = html.contains(r#"aria-busy="true""#)
+                && html.contains("bd-spin")
+                && !html.contains(r#"data-bd-poll="slow""#)
+                && !visible_text(&html).contains("polling");
+            if busy {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1536,7 +1537,9 @@ rows = [["slow"]]
         .await
         .unwrap();
     assert!(
-        after.contains(r#"data-bd-poll="slow""#) && !after.contains(polling_marker),
+        after.contains(r#"data-bd-poll="slow""#)
+            && !after.contains(r#"aria-busy="true""#)
+            && !visible_text(&after).contains("polling"),
         "the control should be back once the fetch finished:\n{after}"
     );
 
