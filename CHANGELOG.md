@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.5 (2026-10-06)
+
+### Bug Fixes
+
+- Don't lock db on read operations, ci fixes
+- **tests:** Sleep 10s as workaround for overloaded ci runner
+- Mid-fetch icon
+
+### Maintenance
+
+- **nix:** Pin barduck-bin to v0.1.4
+- **docs:** Add screenshots
+
 ## v0.1.4 (2026-10-01)
 
 ### CI
