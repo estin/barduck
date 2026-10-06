@@ -198,6 +198,20 @@ impl Slot {
             .map(|p| p.source.as_str())
     }
 
+    /// DOM id of the element showing `source`'s value inside this slot's
+    /// card, and the `#fragment` its chip links to. Scoped by the card's own
+    /// [`Self::anchor`] when the two differ, so a source placed in more than
+    /// one cell (for example a composite child that also has its own panel)
+    /// gets a distinct, addressable value element per placement — unlike the
+    /// card id, which is shared by every member of a group (spec: web-ui —
+    /// source summary strip).
+    fn value_id(&self, source: &str) -> String {
+        match self.anchor() {
+            Some(anchor) if anchor != source => format!("value-{anchor}-{source}"),
+            _ => format!("value-{source}"),
+        }
+    }
+
     /// A generalized pane card's own border — no background — is the worst
     /// color across every member in `main`, `secondary`, and `table`
     /// combined (spec: web-ui — group panes card border reflects the worst
@@ -755,23 +769,23 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
         }
     };
     // Same panels, same order, as a flat list for the summary strip
-    // (spec: web-ui — source summary strip). A group's members all point at
-    // their shared card's anchor, not their own. Owned data (`name`,
-    // `anchor`) because the view body moves its inputs in (topcoat 0.7+),
-    // so borrows of `grids` can't be captured in it.
+    // (spec: web-ui — source summary strip). Each chip points at its own
+    // source's value element, not the card the source shares with its group
+    // (see [`Slot::value_id`]), so a click lands on that source and
+    // highlights exactly its value. Owned data (`name`, `value_id`) because
+    // the view body moves its inputs in (topcoat 0.7+), so borrows of
+    // `grids` can't be captured in it.
     let mut chips: Vec<(Level, String, String, &'static str)> = Vec::new();
     for grid in &grids {
         for row in &grid.rows {
             for slot in row {
-                if let Some(anchor) = slot.anchor() {
-                    for p in slot.main.iter().chain(&slot.secondary).chain(&slot.table) {
-                        chips.push((
-                            p.level_color(),
-                            p.name.clone(),
-                            anchor.to_string(),
-                            p.chip_style(),
-                        ));
-                    }
+                for p in slot.main.iter().chain(&slot.secondary).chain(&slot.table) {
+                    chips.push((
+                        p.level_color(),
+                        p.name.clone(),
+                        slot.value_id(&p.source),
+                        p.chip_style(),
+                    ));
                 }
             }
         }
@@ -787,8 +801,8 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
         <span id="bd-status" data-status=(worst.as_str().to_owned()) data-tick=(tick.to_string()) style="display:none"></span>
         if !chips.is_empty() {
             <div class="flex flex-wrap gap-1.5 mb-4">
-                for (_, name, anchor, style) in chips {
-                    <a href=(format!("#panel-{}", anchor))
+                for (_, name, target, style) in chips {
+                    <a href=(format!("#{target}"))
                         class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium leading-none hover:opacity-90"
                         style=(style)
                     >
@@ -846,7 +860,13 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
                                         (slot.group_title.clone().unwrap_or_else(|| main.name.clone()))
                                     </span>
                                     card_content(
-                                        formatted_content(format: main.format, value: main.value.clone(), unit: main.unit.clone())
+                                        // The wrapper carries the id (and `bd-value` class) the
+                                        // chip above links to, so a click scrolls here and
+                                        // `:target` highlights the value itself (spec: web-ui —
+                                        // source summary strip).
+                                        <div id=(slot.value_id(&main.source)) class="bd-value">
+                                            formatted_content(format: main.format, value: main.value.clone(), unit: main.unit.clone())
+                                        </div>
                                         if !main.history.is_empty() {
                                             <div class="mt-1.5 flex h-1">
                                                 for seg in &main.history {
@@ -895,7 +915,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
                                 card_content(
                                     if let Some(main) = &slot.main {
                                         <div class="mb-1.5">
-                                            <div class="text-xl font-semibold" style=(main.group_row_style())>(main.value_and_unit())</div>
+                                            <div id=(slot.value_id(&main.source)) class="bd-value text-xl font-semibold" style=(main.group_row_style())>(main.value_and_unit())</div>
                                             <div class="flex items-center gap-1.5 text-xs mt-0.5">
                                                 if let Some(label) = main.plain_label() {
                                                     <span class="opacity-60">(label)</span>
@@ -923,8 +943,9 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
                                         <div class="flex flex-wrap items-center gap-2.5 mb-1.5">
                                             for p in &slot.secondary {
                                                 <a
+                                                    id=(slot.value_id(&p.source))
                                                     href=(format!("/logs/{}", p.source))
-                                                    class="text-sm font-semibold hover:underline"
+                                                    class="bd-value text-sm font-semibold hover:underline"
                                                     style=(p.group_row_style())
                                                 >
                                                     (p.secondary_text())
@@ -945,7 +966,7 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
                                                     if let Some(label) = p.plain_label() {
                                                         <span class="text-xs normal-case opacity-60">(label)</span>
                                                     }
-                                                    <span class="text-sm font-semibold" style=(p.group_row_style())>(p.value_and_unit())</span>
+                                                    <span id=(slot.value_id(&p.source)) class="bd-value text-sm font-semibold" style=(p.group_row_style())>(p.value_and_unit())</span>
                                                 </span>
                                             </div>
                                             if !p.history.is_empty() {

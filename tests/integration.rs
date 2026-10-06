@@ -2010,6 +2010,31 @@ async fn web_ui_composite_root_renders_as_a_table_of_its_children() {
         html.contains(r#"id="panel-load::5m""#),
         "load::5m's own single-source panel expected: {html}"
     );
+    // Each placement gets its own value element and chip anchor: the
+    // composite card's rows are scoped by its first child, while the
+    // standalone panel keeps the unscoped id (spec: web-ui — source summary
+    // strip). Without this, both 5m values would share one id and one chip
+    // click could only ever reach the first.
+    assert!(
+        html.contains(r#"id="value-load::1m""#),
+        "1m's value inside the composite card expected"
+    );
+    assert!(
+        html.contains(r#"id="value-load::1m-load::5m""#),
+        "5m's value inside the composite card expected"
+    );
+    assert!(
+        html.contains(r#"id="value-load::5m""#),
+        "5m's own standalone value expected"
+    );
+    assert!(
+        html.contains(r##"href="#value-load::1m-load::5m""##),
+        "the composite's 5m chip should target the composite's 5m value"
+    );
+    assert!(
+        html.contains(r##"href="#value-load::5m""##),
+        "the standalone 5m chip should target the standalone 5m value"
+    );
 }
 
 /// A generalized pane whose `main` names a composite root: it must render
@@ -2539,9 +2564,14 @@ async fn web_ui_group_row_unbanded_member_colors_red_with_plain_label() {
     // That member's own row now also renders red text (health-derived, since
     // it has no bands), with the plain label alongside it, not instead of it.
     // (Not the summary-strip chip link, which also renders the text "flaky" —
-    // scope to the row's own `/logs/<source>` link.)
+    // scope to the row's own `/logs/<source>` link, up to the first closing
+    // `</div>`: a fixed-width window would break whenever the value element
+    // gains attributes, e.g. the id/class its chip links to.)
     let row_idx = html.find(r#"href="/logs/flaky""#).expect("flaky row label");
-    let row_slice = &html[row_idx..(row_idx + 300).min(html.len())];
+    let row_end = html[row_idx..]
+        .find("</div>")
+        .map_or(html.len(), |e| row_idx + e);
+    let row_slice = &html[row_idx..row_end];
     assert!(
         row_slice.contains("color:var(--status-red-text)"),
         "unbanded failing row should render red text: {row_slice}"
@@ -2857,8 +2887,12 @@ async fn web_ui_hides_a_tui_only_source_but_keeps_the_unrestricted_one() {
         "unrestricted source's card expected"
     );
     assert!(
-        page.contains(r##"href="#panel-visible""##),
+        page.contains(r##"href="#value-visible""##),
         "unrestricted source's chip expected"
+    );
+    assert!(
+        page.contains(r#"id="panel-visible""#),
+        "unrestricted source's card expected"
     );
     // The TUI-only source gets no card and no chip at all.
     assert!(
@@ -3862,17 +3896,18 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
     let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
 
     // Layout order: echo, Balance (source "balance"), then dead.
-    let i_echo = page.find("#panel-echo").expect("echo chip link");
-    let i_balance = page.find("#panel-balance").expect("balance chip link");
-    let i_dead = page.find("#panel-dead").expect("dead chip link");
+    let i_echo = page.find("#value-echo").expect("echo chip link");
+    let i_balance = page.find("#value-balance").expect("balance chip link");
+    let i_dead = page.find("#value-dead").expect("dead chip link");
     assert!(
         i_echo < i_balance && i_balance < i_dead,
         "chips should follow layout order"
     );
 
-    // "gated" isn't placed in any layout, so it must not get a chip.
+    // "gated" isn't placed in any layout, so it must not get a chip or a
+    // value element.
     assert!(
-        !page.contains("panel-gated"),
+        !page.contains("panel-gated") && !page.contains("value-gated"),
         "unplaced source should not get a chip"
     );
 
@@ -3893,7 +3928,7 @@ async fn web_ui_summary_strip_lists_chips_in_layout_order_with_matching_colors()
 
 /// (spec: web-ui — source summary strip)
 #[tokio::test]
-async fn web_ui_summary_chip_href_matches_panel_id() {
+async fn web_ui_summary_chip_href_matches_value_id() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("t.duckdb");
     let cfg = test_config(&db_path, &dir.path().join("marker.absent"));
@@ -3915,13 +3950,69 @@ async fn web_ui_summary_chip_href_matches_panel_id() {
 
     let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
     assert!(
-        page.contains(r##"href="#panel-balance""##),
-        "chip href should target the panel's id"
+        page.contains(r##"href="#value-balance""##),
+        "chip href should target the source's own value element"
     );
     assert!(
-        page.contains(r#"id="panel-balance""#),
-        "panel should carry the matching id"
+        page.contains(r#"id="value-balance""#),
+        "the value element should carry the matching id"
     );
+    assert!(
+        page.contains(".bd-value:target"),
+        "the `:target` highlight for a clicked chip's value expected"
+    );
+}
+
+/// Each summary-strip chip links to the value element for its own source, so
+/// a click lands on that value rather than only the card a group's members
+/// share, and the target is highlighted (spec: web-ui — clicking a chip
+/// focuses its panel).
+#[tokio::test]
+async fn web_ui_chip_links_each_group_member_to_its_own_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.duckdb");
+    let cfg = group_pane_config(&db_path);
+
+    let db = Db::open_rw(&db_path).unwrap();
+    collect_once(&db, &cfg).await;
+
+    let state = AppState {
+        db: db.clone(),
+        cfg: Arc::new(cfg.clone()),
+        controls: std::collections::HashMap::default(),
+        refresh: barduck::RefreshHub::new(),
+        user_scripts: Vec::new(),
+    };
+    let router = build_router_with_bundle(state, Some(test_asset_bundle()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { topcoat::serve(listener, router).await });
+
+    let page = reqwest::get(&url).await.unwrap().text().await.unwrap();
+    // `days-left` is the group's first member (its card anchor), so it keeps
+    // the unscoped value id; the other members are scoped by that anchor.
+    for id in [
+        "value-days-left",
+        "value-days-left-balance",
+        "value-days-left-note",
+    ] {
+        assert!(
+            page.contains(&format!(r##"href="#{id}""##)),
+            "chip should link to {id}"
+        );
+        assert!(
+            page.contains(&format!(r#"id="{id}""#)),
+            "value element {id} expected"
+        );
+    }
+    // The shared card keeps its own anchor, so a chip still scrolls the grid
+    // the whole group lives in.
+    assert!(
+        page.contains(r#"id="panel-days-left""#),
+        "group card expected"
+    );
+    // The highlight the anchor relies on.
+    assert!(page.contains(".bd-value:target"), "highlight rule expected");
 }
 
 #[tokio::test]

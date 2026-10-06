@@ -332,6 +332,17 @@ pub(super) async fn page_chrome(
                 <link rel="stylesheet" href=(tailwind::stylesheet!())>
                 <style>
                     "svg.bd-spin { animation: bd-spin 1s linear infinite; } @keyframes bd-spin { to { transform: rotate(360deg); } }
+                    /* A summary-strip chip links to its source's own value
+                       element (see `Slot::value_id`), so clicking one scrolls
+                       there and `:target` highlights that value.
+                       `scroll-margin-top` clears the sticky header, which
+                       would otherwise cover the jumped-to element. The `:has`
+                       rule extends the highlight to the value's whole card;
+                       it is a separate rule so a browser without `:has` still
+                       highlights the value itself (spec: web-ui — source
+                       summary strip: clicking a chip focuses its source). */
+                    .bd-value:target { outline: 2px solid var(--ring); outline-offset: 3px; border-radius: 0.25rem; scroll-margin-top: 7rem; }
+                    .bd-panel-cell:has(.bd-value:target) { outline: 2px solid var(--ring); outline-offset: 2px; }
                     /* Below phone width, the grid's dynamic per-layout inline
                        styles (a fixed column count and each cell's explicit
                        grid-row/grid-column) can't vary by viewport on their
