@@ -151,3 +151,17 @@ config.toml ──► sources (query / stream / ingest) ──► scheduler (tok
 - Layouts are config too: `[[layouts]]` lists source names per panel; TUI and
   web render the same definition.
 - One binary, four surfaces. Planning docs live in `openspec/`.
+
+## Regenerating the screenshots
+
+The README's screenshots come from this config. The TUI pair (dark
+`tui.png` and light `tui-light.png`) regenerates headlessly from the same
+tmux/ANSI capture:
+
+```sh
+nix develop .#screenshots -c demo/screenshot-tui.sh   # needs a running demo daemon
+```
+
+The web UI shots are captured live from the running daemon (dark via the
+browser, light via a static render of the served page with the connection
+banner suppressed).

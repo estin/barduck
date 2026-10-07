@@ -40,18 +40,27 @@ for a runnable tour.
 
 ### Web UI
 
-![barduck web UI](docs/screenshots/webui.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/webui.png">
+  <img src="docs/screenshots/webui-light.png" alt="barduck web UI (light theme)">
+</picture>
 
 Live dashboard served by `barduck daemon` — panels re-render as values arrive,
-with per-source health colors and history bars.
+with per-source health colors and history bars. Both dark and light theme
+screenshots are included; GitHub picks one automatically based on your
+`prefers-color-scheme` system setting.
 
 ### TUI
 
-![barduck TUI](docs/screenshots/tui.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/tui.png">
+  <img src="docs/screenshots/tui-light.png" alt="barduck TUI (light theme)">
+</picture>
 
 Terminal dashboard (`barduck tui`, ratatui) showing the same sources with
-health states — healthy, stale, and failing.
-
+health states — healthy, stale, and failing. Screenshots are regenerated
+with `nix develop .#screenshots -c demo/screenshot-tui.sh` (TUI) and a live
+capture of the running daemon (web UI).
 
 ## When should I use barduck?
 
