@@ -1403,20 +1403,22 @@ mod tests {
         // red band entirely (health takes priority over a threshold
         // reading, since a stale fetch means that reading is no longer
         // trustworthy) (spec: tui — threshold band coloring).
+        // Scans only the member lines inside the panel, skipping the
+        // header: at v0.1.5 the chrome reads "barduck v0.1.5", and a
+        // whole-screen search for "5" matched the version's trailing digit
+        // (Black) before ever reaching the value it meant to check.
         let find_fg = |needle: &str| -> Option<Color> {
-            for y in 0..buf.area().height {
-                for x in 0..buf.area().width {
-                    if buf[(x, y)].symbol() == &needle[..1] {
-                        let row: String = (x..buf.area().width)
-                            .map(|xi| buf[(xi, y)].symbol())
-                            .collect();
-                        if row.starts_with(needle) {
-                            return Some(buf[(x, y)].fg);
-                        }
-                    }
-                }
-            }
-            None
+            let wanted: Vec<char> = needle.chars().collect();
+            rows.iter()
+                .enumerate()
+                .filter(|(_, r)| r.starts_with(" │"))
+                .find_map(|(y, r)| {
+                    let chars: Vec<char> = r.chars().collect();
+                    chars
+                        .windows(wanted.len())
+                        .position(|w| w == wanted.as_slice())
+                        .map(|x| buf[(x as u16, y as u16)].fg)
+                })
         };
         assert_eq!(
             find_fg("5"),
