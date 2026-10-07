@@ -4011,8 +4011,13 @@ async fn web_ui_chip_links_each_group_member_to_its_own_value() {
         page.contains(r#"id="panel-days-left""#),
         "group card expected"
     );
-    // The highlight the anchor relies on.
+    // The highlight the anchor relies on: value only — the card around it
+    // must not gain its own outline (spec: web-ui — source summary strip).
     assert!(page.contains(".bd-value:target"), "highlight rule expected");
+    assert!(
+        !page.contains(":has(.bd-value:target)"),
+        "card-wide highlight must stay out: {page}"
+    );
 }
 
 #[tokio::test]
