@@ -248,5 +248,20 @@
             };
           };
         };
+
+      # Tools for regenerating docs/screenshots/tui.png via
+      # demo/screenshot-tui.sh (see the script's header). tmux runs the TUI,
+      # aha converts its ANSI capture to HTML, chromium renders that to PNG.
+      devShells = forAllSystems (
+        pkgs: {
+          screenshots = pkgs.mkShell {
+            packages = [
+              pkgs.tmux
+              pkgs.aha
+              pkgs.chromium
+            ];
+          };
+        }
+      );
     };
 }

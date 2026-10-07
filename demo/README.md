@@ -4,6 +4,9 @@ A runnable demo of the dashboard: one Rust binary that collects values from
 config-defined shell commands on a schedule (or continuously), stores them in
 DuckDB, and shows them via web UI (live-updating), CLI, TUI, and a JSON HTTP API.
 
+The demo config mirrors a real self-hosted dashboard (see the layout, source
+and pane shapes below) while keeping every command harmless.
+
 ## Run it
 
 Build from the repository root; once built, the daemon can be launched with
@@ -42,72 +45,73 @@ Then:
 |---|---|
 | Web UI (live) | http://127.0.0.1:18420/ |
 | Latest values | `barduck --config demo/config.toml latest` |
-| Filter by source | append `-s bank-balance -s disk-root` to `latest`/`logs` |
+| Filter by source | append `-s load-averages -s disk-root` to `latest`/`logs` |
 | Source fetch logs | click any panel's "updated …" text → `/logs/<source>` |
-| Debug-fetch one source | `... fetch --source bank-balance` (no database writes) |
+| Debug-fetch one source | `... fetch --source cloud-balance` (no database writes) |
 | Fetch logs | `... logs --limit 10` |
 | JSON output | add `--json` to `latest`/`logs`/`fetch`/`reset` |
 | TUI | `... tui` (`q` quits) |
 | Query via daemon instead of the DB file | add `--daemon` |
+| Push an ingest value | `curl -X POST localhost:18420/api/ingest -d '{"source":"webhook-events","value":"7"}'` |
 
 ## What to watch
 
-- **Live web values** — panels update every few seconds without a page reload
-  (topcoat shard re-rendering server-side; `disk-root` and `load-average`
-  vary naturally, the rest re-fetch on schedule).
-- **JSONL rows** — `bank-balance-thresholds` is a `query` source whose command
-  prints a `jsonl` row carrying both the value and replacement threshold
-  bands; watch the panel take the row's bands instead of its declared ones.
+- **Layouts mirror real use** — three pages: "Host" (monospace, host-health
+  pane with a `main` value, `secondary` values, and a `table` row), "Cloud &
+  sites" (money + site + state demos), "Reports & misc" (markdown panes,
+  generalized and composite sources).
+- **Live web values** — panels update without a page reload (topcoat shard
+  re-rendering server-side; `load-averages` and `cpu-temp` vary naturally,
+  the rest re-fetch on their own schedules).
+- **Composite sources** — one command, many panels. `load-averages` parses
+  `uptime` and fans out to three children (1m/5m/15m), each independently
+  displayed and healthed; `memory` does the same for `free -b` (mem/swap).
+  Address one child as `load-averages::5m`; the bare name renders a table
+  of all three (see "Reports & misc").
+- **Generalized panes** — the "This host" pane combines three sections in
+  one: `load-averages::5m` as `main` (large text, its own color, its own
+  history bar), `memory::mem`/`memory::swap` as `secondary` (compact colored
+  values, no bars), and `disk-home` as a `table` row labeled "home". The
+  pane's border tracks the worst member across all three.
 - **Threshold colors** — `disk-root` goes green → yellow → red as `/` fills;
-  `bank-balance-thresholds` uses the opposite direction (more USD is greener).
-- **Grid layouts** — two layouts with multiple rows, a spacer, a colspan-2 gap
-  and a custom pane title ("Balance bands"); see `config.toml`.
-- **Generalized panes** — "Server" combines three sections in one pane:
-  `disk-root` as `main` (large text, colored by its own status, its own
-  history-bar preview, always-shown "updated ago"), `domain-expiry` as
-  `secondary` (a plain colored value+unit, linked to its own `/logs/<source>`
-  view — multiple `secondary` members render side by side in one row), and
-  `disk-home` as a `table` row labeled "home" (independently colored value,
-  "updated ago" only once it falls stale). The pane's own border tracks the
-  worst member across all three sections (red > yellow > green) — its
-  background stays neutral. (A pane with only `main` set and nothing else
-  renders exactly like a plain single-source panel instead, with its own
-  colored border and background — see `bank-balance-thresholds` below.)
-- **Source titles** — `disk-root` declares `title = "Root filesystem"`; its
-  bare-id `main` entry in the "Server" pane shows that title instead of the
-  raw id `disk-root`.
-- **History bar opt-out** — `disk-home` (in the pane's `table` section) is
-  threshold-banded but declares `show_history = false`, so its table row
-  shows no bar; compare it against `disk-root` in `main`, which is banded the
-  same way and does show one. `domain-expiry` in `secondary` shows no bar
-  either, but for a different reason — `secondary` never renders one,
-  regardless of thresholds, since it only ever shows a plain colored value.
-- **Value formats** — `weekly-report` renders markdown (headings, bold, lists).
-  `status-json` is also `format = "markdown"`, so its raw JSON payload is
-  displayed exactly as the command printed it — one line, verbatim. Nothing
-  pretty-prints or reformats it, and the web UI has no JSON renderer.
-- **Static-text panels** — "Quick Links" (next to `weekly-report`) is a
-  standalone `{ text = "..." }` layout cell, not a source: no `[[sources]]`
-  entry, no schedule, no health, no log view, no summary-strip chip. Its
-  markdown renders as HTML in the web UI, same as any markdown-format
-  source's value; the TUI shows it as-is.
+  `cloud-balance` uses the opposite direction (more USD is greener).
+- **JSONL row bands** — `cloud-usage` is a `query` source whose command
+  prints a `jsonl` row carrying both the value and replacement threshold
+  bands; the row's bands win over the declared ones.
+- **Source titles** — `disk-root` declares `title = "Root filesystem"`; the
+  bare-id `main` entry in "Reports & misc" would show that title; child
+  titles like `load-5m` come from the child's own `title`.
+- **History bar opt-out** — `disk-home` is threshold-banded but declares
+  `show_history = false`, so its table row shows no bar; compare with
+  `disk-root` in `main`, which is banded the same way and does show one.
+  `memory::mem` in `secondary` shows no bar either — `secondary` never
+  renders one.
+- **Markdown values** — the "Weekly report" and "Status note" panels render
+  markdown as HTML (headings, bold, task lists).
+- **Static-text panels** — the "Quick Links" pane is a standalone
+  `{ text = "..." }` layout cell, not a source: no `[[sources]]` entry, no
+  schedule, no health, no log view, no summary-strip chip.
+- **Per-view visibility** — `dead-service` declares `show_in = "tui"`: it
+  shows in the TUI (troubleshooting) but not on the web dashboard.
+  `public-status-note` does the opposite (`show_in = "web"`). Both are
+  still fetched on schedule; `show_in` only controls display.
 - **Failing source** — `dead-service` runs `exit 1`; after 2
   consecutive failures its panel turns red and `health` reports `failing`,
   with a plain "failing" label alongside the color even though it declares no
   threshold bands. Other sources keep collecting on schedule.
-- **Per-view visibility** — `dead-service` also declares `show_in = "tui"`:
-  it shows up in the TUI (useful during troubleshooting) but not on the web
-  dashboard, from the very same layout. It's still fetched on schedule either
-  way — `show_in` only controls display placement.
 - **Setup commands** — `tunneled-service` has a setup command that fails until
   you run `touch /tmp/bd-tunnel-up`; watch it retry on its schedule, then turn
-  healthy and start fetching without a daemon restart.
-- **Config-relative commands** — `load-average` runs `scripts/load-average.sh`
-  via a relative path; it resolves against `demo/` (this config file's
-  directory) no matter where the daemon was launched from.
+  healthy and start fetching without a daemon restart. `bank-balance`'s setup
+  always succeeds; remove the file it checks for and restart to see a failing
+  setup recover.
+- **Config-relative commands** — `load-averages`, `memory` (and the rest)
+  run scripts via relative paths; they resolve against `demo/` (this
+  config file's directory) no matter where the daemon was launched from.
 - **Stale stream** — `quiet-stream` emits a single value, then stays silent;
   it turns amber (`stale`) once silence exceeds its `expected_interval`
   (`"20s"`), while its process keeps running.
+- **Ingest source** — `webhook-events` has no command at all; push values
+  with the `curl` above and watch staleness governed by `expected_interval`.
 - **Restart persistence** — Ctrl-C the daemon, restart it: history is still
   there.
 
@@ -119,7 +123,7 @@ DuckDB client while the daemon is stopped — or use the daemon's API:
 ```sh
 duckdb demo/dashboard.duckdb \
   "SELECT source, value, ts FROM readings ORDER BY ts_epoch DESC LIMIT 5"
-curl -s localhost:18420/api/sources/bank-balance/history | head
+curl -s localhost:18420/api/sources/cloud-balance/history | head
 ```
 
 Tables: `readings`, `fetch_logs`, `health_events`, `source_thresholds`.
@@ -127,21 +131,23 @@ Tables: `readings`, `fetch_logs`, `health_events`, `source_thresholds`.
 ## How it fits together
 
 ```
-config.toml ──► sources (query / stream) ──► scheduler (tokio, per-source tasks)
-                     │                          │
-                     │                          ▼
-                     │                 fetch_logs / readings / health_events
-                     │                          │
-                     ▼                          ▼
-              topcoat web UI ◄────────── DuckDB (single file)
-              JSON API (/api/…)                ▲
-                     │                         │ direct read-only
-             CLI / TUI ────────────────────────┘   (--daemon routes over the API)
+config.toml ──► sources (query / stream / ingest) ──► scheduler (tokio, per-source tasks)
+                     │                                   │
+                     │                                   ▼
+                     │                  fetch_logs / readings / health_events
+                     │                                   │
+                     ▼                                   ▼
+              topcoat web UI ◄──────────────────── DuckDB (single file)
+              JSON API (/api/…)                          ▲
+                     │                                   │ direct read-only
+             CLI / TUI ──────────────────────────────────┘
+                    (--daemon routes over the API)
 ```
 
 - Sources are declared in TOML — `query` (an oneshot shell command per
-  schedule tick, plain or `jsonl` stdout) and `stream` (a long-running shell
-  command emitting one `jsonl` row per line) types; no code changes to add a data point.
+  schedule tick, plain or `jsonl` stdout), `stream` (a long-running shell
+  command emitting one `jsonl` row per line), and `ingest` (no command;
+  values arrive via HTTP push) types; no code changes to add a data point.
 - Layouts are config too: `[[layouts]]` lists source names per panel; TUI and
   web render the same definition.
 - One binary, four surfaces. Planning docs live in `openspec/`.

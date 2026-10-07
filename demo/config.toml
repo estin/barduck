@@ -3,6 +3,11 @@
 # this file's directory. Build once from the repo root, then run from anywhere:
 #   cargo build --release
 #   ./target/release/barduck --config demo/config.toml daemon
+#
+# Structured to mirror a real self-hosted dashboard: the same composite
+# children, slow intervals, show_in/show_history flags, and generalized panes
+# (main + secondary + table) the real-world config uses — backed by harmless
+# shell commands instead of whois/curl/API calls.
 
 database_path = "dashboard.duckdb"
 listen = "127.0.0.1:18420"
@@ -11,43 +16,183 @@ listen = "127.0.0.1:18420"
 # "stale" once it has missed its second expected call on its own schedule.
 failure_threshold = 2
 
+# ── Host health ──────────────────────────────────────────────────────────────
+
+# Composite: one `uptime` parse fans out to three children, each displayed and
+# healthed independently. Bare "load-averages" in a layout renders a table of
+# all three; "load-averages::5m" addresses one child.
+[[sources]]
+name = "load-averages"
+type = "query"
+command = "sh scripts/load-averages.sh"
+interval = "10s"
+
+[[sources.children]]
+name = "1m"
+title = "load 1m"
+unit = "avg"
+thresholds = [
+    { bound = 2.0, level = "green" },
+    { bound = 4.0, level = "yellow" },
+    { bound = 8.0, level = "red" },
+]
+
+[[sources.children]]
+name = "5m"
+title = "load-5m"
+unit = "avg"
+thresholds = [
+    { bound = 2.0, level = "green" },
+    { bound = 4.0, level = "yellow" },
+    { bound = 8.0, level = "red" },
+]
+
+[[sources.children]]
+name = "15m"
+title = "load-15m"
+unit = "avg"
+thresholds = [
+    { bound = 2.0, level = "green" },
+    { bound = 4.0, level = "yellow" },
+    { bound = 8.0, level = "red" },
+]
+
+# Root disk fills slowly; thresholds are green → yellow → red with a history
+# bar (default for banded sources).
 [[sources]]
 name = "disk-root"
 title = "Root filesystem"
 type = "query"
 command = "df / --output=pcent | tail -1 | tr -d ' %'"
 unit = "%"
-interval = "5s"
-# green -> yellow -> red as the disk fills up
+interval = "1h"  # hourly — cheap local check, like the real config's `disk`
 thresholds = [
-    { bound = 60.0, level = "green" },
-    { bound = 85.0, level = "yellow" },
+    { bound = 85.0, level = "green" },
+    { bound = 95.0, level = "yellow" },
     { bound = 100.0, level = "red" },
 ]
 
+# /home disk: same composite pattern, but opts out of the history bar even
+# though it's banded — daily-slow sources have little history to show.
 [[sources]]
 name = "disk-home"
 type = "query"
 command = "df /home --output=pcent | tail -1 | tr -d ' %'"
 unit = "%"
-interval = "5s"
-# green -> yellow -> red as the disk fills up
+interval = "1h"
+show_history = false
 thresholds = [
-    { bound = 60.0, level = "green" },
+    { bound = 85.0, level = "green" },
+    { bound = 95.0, level = "yellow" },
+    { bound = 100.0, level = "red" },
+]
+
+# Simulated CPU temperature: a random value in a plausible range. History bar
+# makes the variation visible; the real config checks hwmon sensors instead.
+[[sources]]
+name = "cpu-temp"
+type = "query"
+command = "awk 'BEGIN{srand(); printf \"%.1f\", 55 + rand()*10}'"
+unit = "°C"
+interval = "30s"
+thresholds = [
+    { bound = 70.0, level = "green" },
     { bound = 85.0, level = "yellow" },
     { bound = 100.0, level = "red" },
 ]
-# Opts out of the history bar even though it's banded; contrast with
-# disk-root's bar in the same "Disks" group.
-show_history = false
 
+# Composite: one `free -b` parse covers both memory and swap, like the real
+# config's `memory` source.
 [[sources]]
-name = "domain-expiry"
+name = "memory"
 type = "query"
-# Days until a fixed date — stand-in for `whois` parsing.
-command = "echo $(( ($(date -d 2027-05-01 +%s) - $(date +%s)) / 86400 ))"
-unit = "days"
+command = "sh scripts/mem-usage.sh"
 interval = "30s"
+
+[[sources.children]]
+name = "mem"
+title = "mem used"
+unit = "%"
+thresholds = [
+    { bound = 80.0, level = "green" },
+    { bound = 95.0, level = "yellow" },
+    { bound = 100.0, level = "red" },
+]
+
+[[sources.children]]
+name = "swap"
+title = "swap used"
+unit = "%"
+thresholds = [
+    { bound = 50.0, level = "green" },
+    { bound = 80.0, level = "yellow" },
+    { bound = 100.0, level = "red" },
+]
+
+# ── Money and quotas ─────────────────────────────────────────────────────────
+
+# Plain single value; the "Cloud balance" pane groups it with usage below.
+[[sources]]
+name = "cloud-balance"
+title = "Cloud API balance"
+type = "query"
+command = "echo 1480.42"
+unit = "USD"
+interval = "5m"
+thresholds = [
+    { bound = 0.5, level = "red" },
+    { bound = 1.0, level = "yellow" },
+    { bound = 100000.0, level = "green" },
+]
+
+# Same value but banded in the opposite direction (more is greener) AND
+# carrying replacement bands in its own jsonl row — the row wins over the
+# declared thresholds. Watch the panel take the row's bands.
+[[sources]]
+name = "cloud-usage"
+title = "Cloud usage today"
+type = "query"
+command = "echo '{\"value\":\"1.24\",\"threshold\":[{\"bound\":1.0,\"level\":\"green\"},{\"bound\":3.0,\"level\":\"yellow\"},{\"bound\":100000.0,\"level\":\"red\"}]}'"
+unit = "USD"
+interval = "5m"
+thresholds = [
+    { bound = 1.0, level = "green" },
+    { bound = 3.0, level = "yellow" },
+    { bound = 100000.0, level = "red" },
+]
+
+# ── Sites ────────────────────────────────────────────────────────────────────
+
+# Composite over one command: HTTP status + TLS cert days remaining, the way
+# site checks really pair up. A stable value here so the pane reads green.
+[[sources]]
+name = "site-status"
+title = "status"
+type = "query"
+command = "echo '[{\"source\":\"site-status::code\",\"value\":\"200\"},{\"source\":\"site-status::cert-days\",\"value\":\"214\"}]'"
+interval = "10m"
+timeout = "30s"
+
+[[sources.children]]
+name = "code"
+unit = "code"
+thresholds = [
+    { bound = 299, level = "green" },
+    { bound = 399, level = "yellow" },
+    { bound = 599, level = "red" },
+]
+
+[[sources.children]]
+name = "cert-days"
+unit = "days"
+show_history = false
+thresholds = [
+    { bound = 13, level = "red" },
+    { bound = 29, level = "yellow" },
+    { bound = 3650, level = "green" },
+]
+
+# ── Deliberate demo states ───────────────────────────────────────────────────
 
 # Setup commands run once before the first fetch. This one always succeeds;
 # remove the file it checks for and restart to see a failing setup recover.
@@ -57,79 +202,7 @@ type = "query"
 setup = "test -f dashboard.duckdb"
 command = "echo 1480.42"
 unit = "USD"
-interval = "5s"
-
-[[sources]]
-name = "bank-balance-thresholds"
-type = "query"
-# A `jsonl` row: the value plus replacement threshold bands (more money is
-# greener — the opposite direction from the disk bands above).
-command = "echo '{\"value\":\"1480.42\",\"threshold\":[{\"bound\":1000.0,\"level\":\"red\"},{\"bound\":1480.0,\"level\":\"yellow\"},{\"bound\":100000.0,\"level\":\"green\"}]}'"
-unit = "USD"
-interval = "5s"
-thresholds = [
-    { bound = 1000.0, level = "red" },
-    { bound = 1480.0, level = "yellow" },
-    { bound = 100000.0, level = "green" },
-]
-
-[[sources]]
-name = "weekly-report"
-type = "query"
-command = "printf '# Weekly report\\n\\nHours logged: **%.1f h**\\n\\n- [x] incident review\\n- [ ] on-call handover\\n' 36.5"
-format = "markdown"
-interval = "30s"
-
-[[sources]]
-name = "load-average"
-type = "query"
-# Relative to this config file's directory (demo/), not the launch directory.
-command = "sh scripts/load-average.sh"
-interval = "10s"
-
-# A composite source (spec: source-configuration — Composite source
-# children): one command run parses `uptime`'s three load averages and
-# fans them out to three independently-displayed, independently-healthed
-# children instead of needing three separate `[[sources]]` entries. Each
-# child is addressed as `load-averages::1m`, `load-averages::5m`,
-# `load-averages::15m`; referencing the root's bare name in a layout (see
-# below) auto-renders a table of all three.
-[[sources]]
-name = "load-averages"
-type = "query"
-command = "sh scripts/load-averages.sh"
-interval = "10s"
-
-[[sources.children]]
-name = "1m"
-unit = "avg"
-
-[[sources.children]]
-name = "5m"
-unit = "avg"
-
-[[sources.children]]
-name = "15m"
-unit = "avg"
-thresholds = [
-    { bound = 2.0, level = "green" },
-    { bound = 4.0, level = "yellow" },
-    { bound = 8.0, level = "red" },
-]
-
-[[sources]]
-name = "status-json"
-type = "query"
-command = "echo '{\"load\": 0.42, \"cores\": 8}'"
-format = "markdown"
-interval = "30s"
-
-[[sources]]
-name = "work-hours"
-type = "query"
-command = "echo 36.5"
-unit = "h"
-interval = "10s"
+interval = "5m"
 
 # Deliberately unreachable: demonstrates the failing health state.
 # `show_in = "tui"` keeps this noisy debug source out of the web dashboard
@@ -142,6 +215,17 @@ command = "sh -c 'exit 1'"
 interval = "5s"
 show_in = "tui"
 
+# The web-only counterpart: fetched and visible only in the web UI, never in
+# the TUI — e.g. a quick-links panel other people should see.
+[[sources]]
+name = "public-status-note"
+title = "Status note"
+type = "query"
+command = "printf 'All systems nominal. Maintenance window: **none scheduled**.'"
+format = "markdown"
+interval = "1h"
+show_in = "web"
+
 # Setup fails until you run:  touch /tmp/bd-tunnel-up
 # Demonstrates automatic recovery without restarting the daemon.
 [[sources]]
@@ -150,7 +234,7 @@ type = "query"
 setup = "test -f /tmp/bd-tunnel-up"
 command = "echo 1480.42"
 unit = "USD"
-interval = "5s"
+interval = "30s"
 
 # A stream source: a long-running command emitting one `jsonl` row per line.
 # Emits a single value, then stays silent for 5 minutes — watch it turn
@@ -170,6 +254,7 @@ type = "ingest"
 expected_interval = "1m"
 unit = "events"
 
+# ── Layouts ──────────────────────────────────────────────────────────────────
 # Grid layouts: each row is a list of cells. A panel's title defaults to its
 # source's `title` (see `disk-root` above), or its raw name if it declares
 # none.
@@ -217,25 +302,51 @@ unit = "events"
 # Supported CSS properties: any property-value pair (e.g., font_family,
 # font_size, background_color, gap). Values are strings passed through
 # as-is in the inline style attribute.
-#
-# Existing layouts without `style` fields are unaffected.
 
 [[layouts]]
-title = "Overview"
+title = "Host"
 style = { font_family = "monospace" }
 rows = [
     [
-        { title = "Server", main = "disk-root", secondary = ["domain-expiry"], table = [{ id = "disk-home", label = "home" }] },
-        "bank-balance",
+        { title = "This host", main = "load-averages::5m", secondary = ["memory::mem", "memory::swap"], table = [{ id = "disk-home", label = "home" }] },
+        { title = "Root filesystem", main = "disk-root" },
+        { title = "CPU temperature", main = "cpu-temp" },
     ],
-    [{ id = "bank-balance-thresholds", title = "Balance bands" }, { kind = "space" }, "work-hours"],
+]
+
+[[layouts]]
+title = "Cloud & sites"
+rows = [
+    [
+        { main = "cloud-balance", secondary = ["cloud-usage"], title = "Cloud API" },
+        { main = "site-status::code", secondary = ["site-status::cert-days"], title = "demo site" },
+        "tunneled-service",
+        "quiet-stream",
+        "webhook-events",
+    ],
+    [
+        { main = "public-status-note" },
+    ],
 ]
 
 [[layouts]]
 title = "Reports & misc"
 rows = [
     [
-        "weekly-report",
+        { title = "Server", main = "load-averages::1m", secondary = ["cloud-balance"], table = [{ id = "disk-home", label = "home" }] },
+        "bank-balance",
+    ],
+    [{ id = "load-averages", title = "All load averages" }, { kind = "space" }, { id = "cloud-usage", title = "Balance bands" }],
+    [
+        { title = "Weekly report", format = "markdown", text = """
+## Weekly report
+
+Hours logged: **36.5 h** — incidents: **0**
+
+- [x] incident review
+- [x] on-call handover
+- [ ] rotate log archive keys
+""" },
         # TOML multi-line basic strings (`"""..."""`) work fine inside an
         # inline table; the newline right after the opening `"""` is
         # trimmed, so the content starts cleanly on the next line.
@@ -245,7 +356,6 @@ rows = [
 - [On-call](https://wiki.example.com/oncall)
 """ },
     ],
-    ["status-json", "load-average", "quiet-stream", "dead-service"],
     # The bare "load-averages" reference auto-renders as a table of its
     # three children (1m/5m/15m) — no need to list them out.
     ["load-averages"],
