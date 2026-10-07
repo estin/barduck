@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.6 (2026-10-07)
+
+### Bug Fixes
+
+- Anchor chips pinned to values
+- **tests:** Scope group-panel color lookup to panel body lines
+- Highlight is value only
+
+### Maintenance
+
+- **nix:** Pin barduck-bin to v0.1.5
+
 ## v0.1.5 (2026-10-06)
 
 ### Bug Fixes
