@@ -49,7 +49,7 @@ where
 /// `stream` source types). An unknown `type` value (including the removed
 /// `http` and `script`) is rejected at deserialization time, not by a
 /// separate runtime membership check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceType {
     Query,
@@ -101,7 +101,7 @@ impl Level {
 /// unchanged; `bigint`/`double`/`json` additionally populate the matching
 /// typed column on `readings` alongside the existing string value.
 /// Orthogonal to `format`, which only controls UI rendering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ValueType {
     #[default]
@@ -113,7 +113,7 @@ pub enum ValueType {
 
 /// Which UI(s) a source may display in (spec: source-configuration —
 /// per-source view visibility).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum View {
     All,
@@ -128,7 +128,7 @@ pub enum View {
 /// `setup`, and `retry_interval` — those stay on the parent, so declaring one
 /// here is a parse-time "unknown field" error via `deny_unknown_fields`
 /// rather than a runtime check.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildDecl {
     pub name: String,
@@ -263,7 +263,11 @@ pub fn worst_color(colors: impl IntoIterator<Item = Level>) -> Level {
 /// on a query, `url` anywhere) fails at parse time naming the source and
 /// field. An unknown `type` value (including the removed `http` and
 /// `script`) is rejected the same way.
-#[derive(Debug, Clone, Deserialize)]
+// `Serialize` exists only for the bonfig/figment load path: the loader
+// round-trips the built-in defaults through `Serialized::defaults`, which
+// needs the whole tree serializable. Behavior must mirror `Deserialize`
+// exactly (same field names, same skip rules).
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum SourceCfg {
     /// Oneshot shell command run per schedule tick (`interval` or `cron`).
@@ -899,7 +903,7 @@ pub fn source_visible_in(cfg: &Config, name: &str, view: View) -> bool {
 /// One member of a [`super::Cell::Group`]'s `main`/`secondary`/`table`
 /// sections. Untagged so a bare source-id string is accepted (label
 /// defaults to the id) alongside `{ id, label }` for an overridden label.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GroupItem {
     Id(String),

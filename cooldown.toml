@@ -22,6 +22,16 @@ global-min-publish-age = "14 days"
 # crate = "tokio"
 # min-publish-age = "1 hour"
 
+# bonfig is the project's chosen config plane; accepted deliberately while
+# it is still inside the global 14-day window.
+[[allow.package]]
+crate = "bonfig"
+min-publish-age = "0"
+
+[[allow.package]]
+crate = "bonfig-macros"
+min-publish-age = "0"
+
 # [[allow.package]]
 # crate = "openssl"
 # min-publish-age = "0"

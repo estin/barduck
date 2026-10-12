@@ -3,7 +3,7 @@
 
 use super::GroupItem;
 use anyhow::{Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Widest a `space` cell's `colspan` may be. The value feeds
@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 pub(crate) const MAX_COLSPAN: usize = 12;
 pub const VALUE_FORMATS: &[&str] = &["text", "markdown"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ValueFormat {
     #[default]
@@ -38,7 +38,7 @@ impl ValueFormat {
 /// TUI content width: `"auto"` (scale to content, capped at the terminal) or
 /// a fixed number of columns (also capped at the terminal) (spec: tui —
 /// configurable TUI content width).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TuiWidth {
     Named(String),
@@ -63,7 +63,7 @@ pub enum TuiWidth {
 /// then-rejected `Group` instead. `Text` is placed here for exactly that
 /// reason: its `text` field is required, so a cell without one falls through
 /// to `Group` exactly as before.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Cell {
     Source(String),
@@ -139,7 +139,7 @@ impl Cell {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutCfg {
     pub title: String,

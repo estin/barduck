@@ -116,21 +116,25 @@ config file, and every one is optional. Durations use humantime format
 
 | Key | Default | Environment override | Description |
 |-----|---------|----------------------|-------------|
-| `database_path` | `"dashboard.duckdb"` | `BARDUCK_DATABASE_PATH` | The DuckDB file. Resolved against the config file's own directory, not the directory the daemon was launched from. |
-| `listen` | `"127.0.0.1:8420"` | `BARDUCK_LISTEN` | The daemon's HTTP bind address. |
-| `interval` | `"5m"` | `BARDUCK_INTERVAL` | Staleness fallback for a source that has no config entry. A declared source's own `interval`/`cron` is unaffected by it. |
-| `failure_threshold` | `3` | `BARDUCK_FAILURE_THRESHOLD` | Consecutive failed attempts before a source reports `failing`. |
-| `history_points` | `30` | `BARDUCK_HISTORY_POINTS` | Default readings in a banded source's web history bar; a source's own `history_points` wins. |
-| `logs_per_page` | `50` | `BARDUCK_LOGS_PER_PAGE` | Rows per page in the web log view (`/logs/<source>`). |
+| `database_path` | `"dashboard.duckdb"` | `BARDUCK__DATABASE_PATH` | The DuckDB file. Resolved against the config file's own directory, not the directory the daemon was launched from. |
+| `listen` | `"127.0.0.1:8420"` | `BARDUCK__LISTEN` | The daemon's HTTP bind address. |
+| `interval` | `"5m"` | `BARDUCK__INTERVAL` | Staleness fallback for a source that has no config entry. A declared source's own `interval`/`cron` is unaffected by it. |
+| `failure_threshold` | `3` | `BARDUCK__FAILURE_THRESHOLD` | Consecutive failed attempts before a source reports `failing`. |
+| `history_points` | `30` | `BARDUCK__HISTORY_POINTS` | Default readings in a banded source's web history bar; a source's own `history_points` wins. |
+| `logs_per_page` | `50` | `BARDUCK__LOGS_PER_PAGE` | Rows per page in the web log view (`/logs/<source>`). |
 | `retention` | unset — keep everything forever | — | How long collected data is kept before the daemon prunes it, e.g. `"30d"`. |
-| `tui_width` | `"auto"` | `BARDUCK_TUI_WIDTH` | TUI content width: `"auto"` or a fixed column count. |
+| `tui_width` | `"auto"` | `BARDUCK__TUI_WIDTH` | TUI content width: `"auto"` or a fixed column count. |
 | `web_content_width` | `"narrow"` | — | Default web UI content width: `"narrow"` (centered capped column) or `"wide"` (panels span the full viewport). Each browser can override it with the header width toggle (persisted in a cookie). |
 
 An environment override wins over both the config file's value and the
-built-in default, and its value is taken verbatim. The structural keys
-(`sources`, `layouts`) have no environment override. `BARDUCK_DATABASE_PATH`
-is the one exception to "verbatim": like `database_path` itself, it is
-resolved against the config file's directory.
+built-in default, and lives in a `BARDUCK__<FIELD>` variable (bonfig
+layers, e.g. `BARDUCK__LISTEN`). Its value is parsed with TOML scalar
+rules: numbers and bools are bare, and a string that looks like one is
+quoted (`BARDUCK__LISTEN='"0.0.0.0:9000"'`, though a bind address itself
+is fine bare because it is not a number). The structural keys
+(`sources`, `layouts`) have no environment override. Relative
+`database_path` (from file or env) is resolved against the config file's
+directory.
 
 Log verbosity comes from `RUST_LOG` (standard `tracing-subscriber`
 `EnvFilter` syntax, e.g. `RUST_LOG=debug` or `RUST_LOG=barduck=trace`) and

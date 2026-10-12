@@ -81,7 +81,7 @@ unbounded nor a negative value can force a full-table scan.
 ### Requirement: Configurable default log page size
 
 The daemon SHALL support a top-level config field `logs_per_page` (a positive
-integer, default `50`) with a `BARDUCK_LOGS_PER_PAGE` environment-variable
+integer, default `50`) with a `BARDUCK__LOGS_PER_PAGE` environment-variable
 override, used as the default page size for log retrieval. Validation SHALL
 reject a non-positive value (spec: source-configuration — config validation).
 
@@ -90,7 +90,7 @@ reject a non-positive value (spec: source-configuration — config validation).
 - **THEN** the default page size is 50
 
 #### Scenario: Environment variable overrides the config default
-- **WHEN** `BARDUCK_LOGS_PER_PAGE` is set to a valid positive integer
+- **WHEN** `BARDUCK__LOGS_PER_PAGE` is set to a valid positive integer
 - **THEN** that value is used as the default page size
 
 #### Scenario: Non-positive page size is rejected

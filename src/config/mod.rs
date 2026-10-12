@@ -2,7 +2,7 @@
 //!
 //! Split by concern: [`source`] (source declarations + threshold/health
 //! color model), [`layout`] (grid cells and value-rendering format),
-//! [`defaults`] (built-in defaults + `BARDUCK_*` env overrides), and
+//! [`defaults`] (built-in defaults), and
 //! [`validation`] (the actual field-by-field checks `validate` runs).
 //! Everything is re-exported here so callers keep using `config::Whatever`
 //! regardless of which submodule it actually lives in.
@@ -20,22 +20,31 @@ pub use source::{
 };
 
 use defaults::{
-    apply_env_overrides_from, default_config_dir, default_db_path, default_history_points,
-    default_interval, default_listen, default_logs_per_page, default_threshold, default_tui_width,
-    default_user_js, default_web_content_width, default_web_refresh_interval,
+    default_config_dir, default_db_path, default_history_points, default_interval, default_listen,
+    default_logs_per_page, default_threshold, default_tui_width, default_user_js,
+    default_web_content_width, default_web_refresh_interval,
 };
 use validation::{validate_cell, validate_source};
 
-use anyhow::{Context as _, Result, bail};
-use serde::Deserialize;
+use anyhow::{Result, bail};
+use bonfig::figment::{Figment, providers::Format as _, providers::Toml};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// App version shown in web UI, TUI, and CLI output.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Note: `Serialize`/`Deserialize` come from plain serde derive; the
+// bonfig/figment load path below merges file + env layers over
+// `Config::default()` before extracting, so field-level `#[serde(default ...)]`
+// attributes only matter for `toml::from_str` in tests.
+fn default_config() -> Config {
+    Config::default()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default = "default_config")]
 pub struct Config {
     #[serde(default = "default_db_path")]
     pub database_path: PathBuf,
@@ -117,20 +126,22 @@ impl Default for Config {
     }
 }
 
+/// Loads the named config file over the built-in defaults, applying
+/// `BARDUCK__<FIELD>` environment overrides on top (spec:
+/// source-configuration — environment variables override top-level
+/// settings). The env layer uses bonfig-double-underscore names (e.g.
+/// `BARDUCK__LISTEN`, `BARDUCK__WEB_REFRESH_INTERVAL`). `sources` and
+/// `layouts` stay file-only: as lists they are *replaced* whole by any env
+/// set, which is never a useful override, and they cannot be set
+/// atomically through env anyway.
 pub fn load(path: &Path) -> Result<Config> {
-    load_from(path, |name| std::env::var(name).ok())
+    load_from(path, env_overrides())
 }
 
-/// Same as [`load`], but reads `BARDUCK_*` overrides through `lookup`
-/// instead of the real process environment — lets tests exercise the
-/// override-then-resolve interaction without mutating global process state
-/// (`std::env::set_var` is `unsafe` as of the 2024 edition, and this
-/// project denies `unsafe_code`).
-fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Config> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config {}", path.display()))?;
-    let mut cfg: Config =
-        toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
+/// Shared tail of every load path: extract [`Config`], stamp `config_dir`
+/// from the file's own directory, resolve relative paths against it, expand
+/// composites, then validate.
+fn finalize(mut cfg: Config, path: &Path) -> Result<Config> {
     // `Path::parent` yields `Some("")` for a bare relative path like
     // `config.toml` — treat that as `.` so `config_dir.join(...)` and
     // `Command::current_dir(config_dir)` resolve against the launch
@@ -139,18 +150,39 @@ fn load_from(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> Result<Con
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    // Env overrides apply before the relative-path resolution below, so a
-    // `BARDUCK_DATABASE_PATH` override is resolved against the config file's
-    // own directory exactly like a TOML-declared one — not the process's
-    // current directory (spec: source-configuration — config-relative
-    // working directory) — `main()` never has to `chdir` the whole process.
-    apply_env_overrides_from(&mut cfg, lookup)?;
     if cfg.database_path.is_relative() {
         cfg.database_path = cfg.config_dir.join(&cfg.database_path);
     }
     source::expand_composites(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
+}
+
+fn figment_error(e: bonfig::Error, path: &Path) -> anyhow::Error {
+    anyhow::Error::new(e).context(format!("loading config {}", path.display()))
+}
+
+/// Same as [`load`], but reads `BARDUCK__*` overrides through `provider`
+/// instead of the real process environment — lets tests exercise the
+/// override interaction without mutating global process state
+/// (`std::env::set_var` is `unsafe` as of the 2024 edition, and this
+/// project denies `unsafe_code`). Tests pass a figment provider such as
+/// `bonfig::FromSource::from_toml`-style maps or
+/// `bonfig::figment::providers::Env::prefixed("BARDUCK__")`.
+fn load_from(path: &Path, provider: impl bonfig::figment::Provider) -> Result<Config> {
+    let file = Toml::file_exact(path);
+    let base = bonfig::figment::providers::Serialized::defaults(Config::default());
+    let fig = Figment::from(base).merge(file).merge(provider);
+    let cfg: Config = fig
+        .extract()
+        .map_err(|e| figment_error(Box::new(e), path))?;
+    finalize(cfg, path)
+}
+
+/// The live env override layer: `BARDUCK__A__B` for the key `a.b`, parsed
+/// with TOML scalar rules (quote a string value that looks like a number).
+fn env_overrides() -> impl bonfig::figment::Provider {
+    bonfig::figment::providers::Env::prefixed("BARDUCK__").split("__")
 }
 
 /// One user JavaScript file resolved from [`Config::web_user_js`]: `name`
@@ -339,13 +371,36 @@ pub fn validate(cfg: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
     use crate::health::Health;
-    use defaults::{apply_env_overrides_from, default_interval, default_retry_interval};
+    use defaults::{default_interval, default_retry_interval};
+
+    /// An injectable env-override layer for tests: a TOML-shaped figment
+    /// provider standing in for the live `Env::prefixed("BARDUCK__")` layer
+    /// (`std::env::set_var` is `unsafe` as of the 2024 edition, and this
+    /// project denies `unsafe_code`). Keys are bare lowercase field names,
+    /// the same shape figment's env layer yields after split/unprefix.
+    fn env_from(pairs: &[(&str, &str)]) -> impl bonfig::figment::Provider {
+        let body: String = pairs
+            .iter()
+            .map(|(k, v)| format!("{k} = {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bonfig::figment::providers::Toml::string(&body)
+    }
 
     fn source_toml(extra: &str) -> String {
         format!("[[sources]]\nname = \"cpu\"\ntype = \"query\"\ncommand = \"echo 0\"\n{extra}\n")
+    }
+
+    fn env_tmp_config() -> std::path::PathBuf {
+        let file = tempfile::Builder::new()
+            .prefix("barduck-env-test-")
+            .suffix(".toml")
+            .tempfile_in(".")
+            .unwrap();
+        file.keep().unwrap().1
     }
 
     #[test]
@@ -837,59 +892,50 @@ mod tests {
         );
     }
 
-    fn lookup_from(
-        pairs: &'static [(&'static str, &'static str)],
-    ) -> impl Fn(&str) -> Option<String> {
-        move |name| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| (*v).to_string())
-        }
-    }
-
     #[test]
     fn env_var_overrides_config_file_value() {
-        let mut cfg: Config = toml::from_str("listen = \"127.0.0.1:8420\"").unwrap();
-        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_LISTEN", "0.0.0.0:9000")]))
-            .unwrap();
+        let path = env_tmp_config();
+        std::fs::write(&path, "listen = \"127.0.0.1:8420\"\n").unwrap();
+        let cfg = load_from(&path, env_from(&[("listen", "\"0.0.0.0:9000\"")])).unwrap();
+        std::fs::remove_file(&path).unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:9000");
     }
 
     #[test]
     fn env_var_overrides_default() {
-        let mut cfg = Config::default();
-        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_HISTORY_POINTS", "100")]))
-            .unwrap();
+        let path = env_tmp_config();
+        std::fs::write(&path, "").unwrap();
+        let cfg = load_from(&path, env_from(&[("history_points", "100")])).unwrap();
+        std::fs::remove_file(&path).unwrap();
         assert_eq!(cfg.history_points, 100);
     }
 
-    /// `BARDUCK_TUI_WIDTH` is trimmed like every other env value before it's
-    /// compared, so `" auto "` is accepted rather than rejected with a
-    /// confusing parse error (spec: source-configuration — environment
-    /// variables override top-level settings).
+    /// The bonfig env layer parses values with scalar rules: a bare
+    /// unquoted `12` is a number, so a fixed `tui_width` override works
+    /// without quotes; the named `"auto"` form applies quoted (spec:
+    /// source-configuration — environment variables override top-level
+    /// settings).
     #[test]
-    fn env_tui_width_accepts_surrounding_whitespace() {
-        for (raw, expect_named) in [(" auto ", true), ("auto", true), (" 12 ", false)] {
-            let mut cfg = Config::default();
-            apply_env_overrides_from(&mut cfg, |name| {
-                (name == "BARDUCK_TUI_WIDTH").then(|| raw.to_string())
-            })
-            .unwrap();
-            match cfg.tui_width {
-                TuiWidth::Named(s) => assert!(expect_named, "`{raw}` parsed as a name: {s}"),
-                TuiWidth::Fixed(n) => assert!(!expect_named, "`{raw}` parsed as fixed: {n}"),
-            }
-        }
+    fn env_tui_width_accepts_named_and_fixed() {
+        let path = env_tmp_config();
+        std::fs::write(&path, "").unwrap();
+        let named = load_from(&path, env_from(&[("tui_width", "\"auto\"")])).unwrap();
+        assert!(matches!(named.tui_width, TuiWidth::Named(ref s) if s == "auto"));
+        let fixed = load_from(&path, env_from(&[("tui_width", "12")])).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(fixed.tui_width, TuiWidth::Fixed(12)));
     }
 
     #[test]
     fn logs_per_page_defaults_to_50_and_env_can_override_it() {
         assert_eq!(Config::default().logs_per_page, 50);
-        let mut cfg: Config = toml::from_str("").unwrap();
+        let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.logs_per_page, 50);
-        apply_env_overrides_from(&mut cfg, lookup_from(&[("BARDUCK_LOGS_PER_PAGE", "20")]))
-            .unwrap();
+        validate(&cfg).unwrap();
+        let path = env_tmp_config();
+        std::fs::write(&path, "").unwrap();
+        let cfg = load_from(&path, env_from(&[("logs_per_page", "20")])).unwrap();
+        std::fs::remove_file(&path).unwrap();
         assert_eq!(cfg.logs_per_page, 20);
         validate(&cfg).unwrap();
     }
@@ -927,23 +973,24 @@ mod tests {
 
     #[test]
     fn no_env_var_leaves_config_value_unchanged() {
-        let mut cfg: Config = toml::from_str("failure_threshold = 5").unwrap();
-        apply_env_overrides_from(&mut cfg, lookup_from(&[])).unwrap();
+        let cfg: Config = toml::from_str("failure_threshold = 5").unwrap();
         assert_eq!(cfg.failure_threshold, 5);
     }
 
+    /// A value that cannot be deserialized into the field fails startup
+    /// naming the key (spec: source-configuration — environment variables
+    /// override top-level settings).
     #[test]
     fn unparseable_env_override_rejected() {
-        let mut cfg = Config::default();
-        let err = apply_env_overrides_from(
-            &mut cfg,
-            lookup_from(&[("BARDUCK_INTERVAL", "not-a-duration")]),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("BARDUCK_INTERVAL"),
-            "error should name the variable: {err}"
-        );
+        let path = env_tmp_config();
+        std::fs::write(&path, "").unwrap();
+        let Err(err) = load_from(&path, env_from(&[("interval", "not-a-duration")])) else {
+            panic!("override should fail");
+        };
+        std::fs::remove_file(&path).unwrap();
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("interval"), "error should name the key: {msg}");
     }
 
     #[test]
@@ -1302,7 +1349,7 @@ mod tests {
         std::fs::write(file.path(), "listen = \"127.0.0.1:0\"\n").unwrap();
         let name = file.path().file_name().unwrap().to_str().unwrap();
 
-        let cfg = load_from(Path::new(name), lookup_from(&[])).unwrap();
+        let cfg = load_from(Path::new(name), env_from(&[])).unwrap();
 
         assert_eq!(cfg.config_dir, Path::new("."));
         assert_eq!(cfg.database_path, Path::new("./dashboard.duckdb"));
@@ -1322,7 +1369,7 @@ mod tests {
 
         let cfg = load_from(
             &config_path,
-            lookup_from(&[("BARDUCK_DATABASE_PATH", "override.duckdb")]),
+            env_from(&[("database_path", "\"override.duckdb\"")]),
         )
         .unwrap();
 
@@ -1419,7 +1466,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("scripts")).unwrap();
         std::fs::write(dir.path().join("scripts/x.js"), "x").unwrap();
 
-        let cfg = load_from(&config_path, lookup_from(&[])).unwrap();
+        let cfg = load_from(&config_path, env_from(&[])).unwrap();
 
         assert_eq!(cfg.web_user_js, vec![PathBuf::from("scripts/x.js")]);
         let resolved = resolve_user_js(&cfg.web_user_js, &cfg.config_dir);

@@ -16,23 +16,23 @@ The system SHALL read all source definitions from a single user config file at s
 - **WHEN** a source definition is missing required fields or has an unknown type or duplicate name
 - **THEN** startup fails with an error naming the offending source and field
 ### Requirement: Environment variables override top-level settings
-Each top-level `Config` scalar setting — `database_path`, `listen`, `interval`, `failure_threshold`, `history_points`, `tui_width` — MAY be overridden at startup by an environment variable named `BARDUCK_<FIELD>` (the field name upper-cased, e.g. `BARDUCK_LISTEN`, `BARDUCK_HISTORY_POINTS`). When such a variable is set (including to an empty string), its value SHALL be parsed using the same rules as the field's TOML representation (e.g. humantime for `interval`, integer for `history_points`/`failure_threshold`, `"auto"` or an integer for `tui_width`) and SHALL take precedence over both the config file's value for that field and the field's built-in default. A value that fails to parse MUST cause startup to fail with an error naming the environment variable and the parse failure. This override applies only to these top-level scalar fields, not to `sources` or `layouts`.
+Each top-level `Config` scalar setting — `database_path`, `listen`, `interval`, `failure_threshold`, `history_points`, `logs_per_page`, `web_refresh_interval`, `tui_width` — MAY be overridden at startup by an environment variable named `BARDUCK__<FIELD>` (bonfig double-underscore form, e.g. `BARDUCK__LISTEN`, `BARDUCK__HISTORY_POINTS`; lowercase key after stripping the `BARDUCK__` prefix). Values are parsed with figment's TOML-scalar rules: a bare number or bool parses as one, and a string field's value that looks like a number or bool MUST be quoted. When a variable is set, its value SHALL take precedence over both the config file's value for that field and the field's built-in default, merging over the defaults before extraction. A value that fails to deserialize into the field MUST cause startup to fail with an error naming the key. This override applies only to these top-level scalar fields, not to `sources` or `layouts` (which, as lists, would be replaced whole by any env value).
 
 #### Scenario: Environment variable overrides config file value
-- **WHEN** the config file sets `listen = "127.0.0.1:8420"` and `BARDUCK_LISTEN=0.0.0.0:9000` is set in the environment
+- **WHEN** the config file sets `listen = "127.0.0.1:8420"` and `BARDUCK__LISTEN=0.0.0.0:9000` is set in the environment
 - **THEN** the daemon binds to `0.0.0.0:9000`
 
 #### Scenario: Environment variable overrides the built-in default
-- **WHEN** the config file does not set `history_points` and `BARDUCK_HISTORY_POINTS=100` is set in the environment
+- **WHEN** the config file does not set `history_points` and `BARDUCK__HISTORY_POINTS=100` is set in the environment
 - **THEN** the effective `history_points` is `100`
 
 #### Scenario: No environment variable leaves the config file value in effect
-- **WHEN** the config file sets `failure_threshold = 5` and no `BARDUCK_FAILURE_THRESHOLD` variable is set
+- **WHEN** the config file sets `failure_threshold = 5` and no `BARDUCK__FAILURE_THRESHOLD` variable is set
 - **THEN** the effective `failure_threshold` is `5`
 
 #### Scenario: Unparseable override rejected
-- **WHEN** `BARDUCK_FAILURE_THRESHOLD=not-a-number` is set in the environment
-- **THEN** startup fails with an error naming `BARDUCK_FAILURE_THRESHOLD` and the parse failure
+- **WHEN** `BARDUCK__FAILURE_THRESHOLD=not-a-number` is set in the environment
+- **THEN** startup fails with an error naming the `failure_threshold` key
 ### Requirement: Generic query source type
 The system SHALL support sources of type `query` that run a local shell command oneshot per schedule tick and take its stdout as the value. Plain (non-JSON) stdout is stored as the value exactly as before. When the stdout parses as a `jsonl` row (spec: source-configuration — JSONL row schema), it is applied structurally: the row's `value`, `ts`, and `threshold` take effect instead of the raw text.
 
