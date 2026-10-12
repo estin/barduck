@@ -6,7 +6,8 @@ use std::io::{IsTerminal as _, Write as _};
 #[derive(Parser)]
 #[command(name = "barduck", version, about = "Single-binary home dashboard")]
 struct Cli {
-    /// Path to the TOML config file. When omitted, resolution order is:
+    /// Path to the TOML config file; its name must end in `.toml`. When
+    /// omitted, resolution order is:
     /// `BARDUCK_CONFIG`, then `barduck/config.toml` under `XDG_CONFIG_HOME`
     /// (or `~/.config`), then `./config.toml` in the working directory.
     #[arg(long, short, global = true)]

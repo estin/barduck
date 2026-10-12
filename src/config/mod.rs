@@ -134,15 +134,9 @@ impl Default for Config {
 /// set, which is never a useful override, and they cannot be set
 /// atomically through env anyway.
 pub fn load(path: &Path) -> Result<Config> {
-    // An empty extra provider: the Loader's own env layer (BARDUCK__) does
-    // the real work; the hook exists for tests.
-    load_from(
-        path,
-        bonfig::figment::providers::Serialized::defaults(serde_json::Map::<
-            String,
-            serde_json::Value,
-        >::new()),
-    )
+    // An empty extra layer: the Loader's own `BARDUCK__` env layer does the
+    // real work; the hook exists for tests.
+    load_from(path, bonfig::figment::Figment::new())
 }
 
 /// Shared tail of every load path: stamp `config_dir` from the file's own
@@ -169,12 +163,13 @@ fn figment_error(e: bonfig::Error, path: &Path) -> anyhow::Error {
     anyhow::Error::new(e).context(format!("loading config {}", path.display()))
 }
 
-/// Same as [`load`], but reads `BARDUCK__*` overrides through `provider`
-/// instead of the real process environment — lets tests exercise the
-/// override interaction without mutating global process state
-/// (`std::env::set_var` is `unsafe` as of the 2024 edition, and this
-/// project denies `unsafe_code`). Tests pass a figment provider such as a
-/// `Toml::string` body or a jail-free map.
+/// Same as [`load`], plus `provider` merged on top of the real `BARDUCK__*`
+/// env layer — lets tests exercise the override interaction without
+/// mutating global process state (`std::env::set_var` is `unsafe` as of the
+/// 2024 edition, and this project denies `unsafe_code`). The real env layer
+/// is still read, so a `BARDUCK__*` var set in the shell reaches tests too.
+/// The file must end in `.toml`: the Loader picks the format from the
+/// extension and rejects anything else.
 fn load_from(path: &Path, provider: impl bonfig::figment::Provider) -> Result<Config> {
     // bonfig's own Loader provides the layering: struct defaults, the named
     // config file, then `BARDUCK__` env vars. The extra `provider` merge on
@@ -385,13 +380,13 @@ mod tests {
     use crate::health::Health;
     use defaults::{default_interval, default_retry_interval};
 
+    use bonfig::figment::providers::Format as _;
+
     /// An injectable env-override layer for tests: a TOML-shaped figment
     /// provider standing in for the live `Env::prefixed("BARDUCK__")` layer
     /// (`std::env::set_var` is `unsafe` as of the 2024 edition, and this
     /// project denies `unsafe_code`). Keys are bare lowercase field names,
     /// the same shape figment's env layer yields after split/unprefix.
-    use bonfig::figment::providers::Format as _;
-
     fn env_from(pairs: &[(&str, &str)]) -> impl bonfig::figment::Provider {
         let body: String = pairs
             .iter()
@@ -1002,6 +997,21 @@ mod tests {
         let msg = format!("{err:#}");
 
         assert!(msg.contains("interval"), "error should name the key: {msg}");
+    }
+
+    /// The Loader picks the format from the extension, so a config file
+    /// without `.toml` fails with a clear error instead of loading.
+    #[test]
+    fn non_toml_extension_rejected() {
+        let file = tempfile::Builder::new()
+            .prefix("barduck-ext-test-")
+            .suffix(".conf")
+            .tempfile_in(".")
+            .unwrap();
+        std::fs::write(file.path(), source_toml("")).unwrap();
+        let msg = format!("{:#}", load(file.path()).unwrap_err());
+
+        assert!(msg.contains("unsupported configuration file"), "{msg}");
     }
 
     #[test]
