@@ -27,7 +27,6 @@ use defaults::{
 use validation::{validate_cell, validate_source};
 
 use anyhow::{Result, bail};
-use bonfig::figment::{Figment, providers::Format as _, providers::Toml};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -135,12 +134,20 @@ impl Default for Config {
 /// set, which is never a useful override, and they cannot be set
 /// atomically through env anyway.
 pub fn load(path: &Path) -> Result<Config> {
-    load_from(path, env_overrides())
+    // An empty extra provider: the Loader's own env layer (BARDUCK__) does
+    // the real work; the hook exists for tests.
+    load_from(
+        path,
+        bonfig::figment::providers::Serialized::defaults(serde_json::Map::<
+            String,
+            serde_json::Value,
+        >::new()),
+    )
 }
 
-/// Shared tail of every load path: extract [`Config`], stamp `config_dir`
-/// from the file's own directory, resolve relative paths against it, expand
-/// composites, then validate.
+/// Shared tail of every load path: stamp `config_dir` from the file's own
+/// directory, resolve relative paths against it, expand composites, then
+/// validate. `cfg` arrives already extracted with its defaults merged.
 fn finalize(mut cfg: Config, path: &Path) -> Result<Config> {
     // `Path::parent` yields `Some("")` for a bare relative path like
     // `config.toml` — treat that as `.` so `config_dir.join(...)` and
@@ -166,23 +173,25 @@ fn figment_error(e: bonfig::Error, path: &Path) -> anyhow::Error {
 /// instead of the real process environment — lets tests exercise the
 /// override interaction without mutating global process state
 /// (`std::env::set_var` is `unsafe` as of the 2024 edition, and this
-/// project denies `unsafe_code`). Tests pass a figment provider such as
-/// `bonfig::FromSource::from_toml`-style maps or
-/// `bonfig::figment::providers::Env::prefixed("BARDUCK__")`.
+/// project denies `unsafe_code`). Tests pass a figment provider such as a
+/// `Toml::string` body or a jail-free map.
 fn load_from(path: &Path, provider: impl bonfig::figment::Provider) -> Result<Config> {
-    let file = Toml::file_exact(path);
-    let base = bonfig::figment::providers::Serialized::defaults(Config::default());
-    let fig = Figment::from(base).merge(file).merge(provider);
+    // bonfig's own Loader provides the layering: struct defaults, the named
+    // config file, then `BARDUCK__` env vars. The extra `provider` merge on
+    // top is the test hook (an env-shaped stand-in), which ranks above the
+    // real env layer exactly like an outermost override.
+    let loader = bonfig::Loader::builder()
+        .env_prefix("BARDUCK")
+        .config_path(path)
+        .build();
+    let fig = loader
+        .figment(&Config::default())
+        .map_err(|e| figment_error(e, path))?
+        .merge(provider);
     let cfg: Config = fig
         .extract()
         .map_err(|e| figment_error(Box::new(e), path))?;
     finalize(cfg, path)
-}
-
-/// The live env override layer: `BARDUCK__A__B` for the key `a.b`, parsed
-/// with TOML scalar rules (quote a string value that looks like a number).
-fn env_overrides() -> impl bonfig::figment::Provider {
-    bonfig::figment::providers::Env::prefixed("BARDUCK__").split("__")
 }
 
 /// One user JavaScript file resolved from [`Config::web_user_js`]: `name`
@@ -381,6 +390,8 @@ mod tests {
     /// (`std::env::set_var` is `unsafe` as of the 2024 edition, and this
     /// project denies `unsafe_code`). Keys are bare lowercase field names,
     /// the same shape figment's env layer yields after split/unprefix.
+    use bonfig::figment::providers::Format as _;
+
     fn env_from(pairs: &[(&str, &str)]) -> impl bonfig::figment::Provider {
         let body: String = pairs
             .iter()
