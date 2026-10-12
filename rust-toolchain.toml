@@ -1,0 +1,8 @@
+# Pinned so a new stable release (and its new clippy lints) cannot break
+# CI without a change in this repo. CI and release jobs follow this file:
+# rustup picks it over the `stable` they install. Bump it on purpose.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+# The release job builds a static musl binary (see release.yml).
+targets = ["x86_64-unknown-linux-musl"]

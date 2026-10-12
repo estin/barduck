@@ -1104,7 +1104,10 @@ mod tests {
     fn visible_items_empty_when_all_members_hidden() {
         let cfg: Config = toml::from_str(&source_toml("show_in = \"web\"")).unwrap();
         let items = vec![GroupItem::Id("cpu".into())];
-        assert!(visible_items(&cfg, &items, View::Tui).is_empty());
+        assert_eq!(
+            visible_items(&cfg, &items, View::Tui),
+            Vec::<&GroupItem>::new()
+        );
     }
 
     fn stream_toml(extra: &str) -> String {
