@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.7 (2026-10-12)
+
+### Bug Fixes
+
+- Require .toml config files and clean up the Loader hook
+
+### CI
+
+- Pin Rust 1.99.0 and satisfy its assert_is_empty lint
+
+### Maintenance
+
+- **nix:** Pin barduck-bin to v0.1.6
+- **docs:** Add light mode screenshots
+
+### Other
+
+- Mirror real-world usage; regenerate both screenshots
+- Move the config plane onto estin/bonfig
+
+Load Config through figment layers over the built-in defaults: the named
+TOML file, then a BARDUCK__ env layer. The hand-rolled
+apply_env_overrides_from machinery is gone; env values now follow
+figment's TOML-scalar rules (a string that looks like a number needs
+quotes). Structural keys (sources, layouts) stay file-only: any env
+value would replace the whole list.
+- Route config loading through bonfig's Loader
+
+Delegate the layering (defaults, named config file, BARDUCK__ env vars)
+to Loader itself instead of hand-assembling figment providers, so
+barduck tracks bonfig's layering semantics going forward. The extra
+provider merge stays as the test hook.
+
 ## v0.1.6 (2026-10-07)
 
 ### Bug Fixes
