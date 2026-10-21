@@ -179,6 +179,7 @@ defaults to `info`.
 **Query-only fields:**
 
 | Field | Required | Description |
+|-------|----------|-------------|
 | `interval` or `cron` | No | Schedule (mutually exclusive). With neither declared, the source falls back to the built-in `5m` interval. |
 | `history_points` | No | Override web UI history point count |
 | `children` | No | Declares this a composite source (see [Composite Sources](#composite-sources)); each `[[sources.children]]` entry takes `name` plus a child's own `title`/`unit`/`format`/`thresholds`/`history_points`/`show_history`/`show_in`/`value_type` |
