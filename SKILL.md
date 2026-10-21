@@ -122,13 +122,14 @@ config file, and every one is optional. Durations use humantime format
 | `failure_threshold` | `3` | `BARDUCK__FAILURE_THRESHOLD` | Consecutive failed attempts before a source reports `failing`. |
 | `history_points` | `30` | `BARDUCK__HISTORY_POINTS` | Default readings in a banded source's web history bar; a source's own `history_points` wins. |
 | `logs_per_page` | `50` | `BARDUCK__LOGS_PER_PAGE` | Rows per page in the web log view (`/logs/<source>`). |
+| `web_refresh_interval` | `"5s"` | `BARDUCK__WEB_REFRESH_INTERVAL` | Fallback browser refresh interval when no refresh event arrives over the SSE stream, e.g. `"5s"`. |
 | `retention` | unset — keep everything forever | — | How long collected data is kept before the daemon prunes it, e.g. `"30d"`. |
 | `tui_width` | `"auto"` | `BARDUCK__TUI_WIDTH` | TUI content width: `"auto"` or a fixed column count. |
 | `web_content_width` | `"narrow"` | — | Default web UI content width: `"narrow"` (centered capped column) or `"wide"` (panels span the full viewport). Each browser can override it with the header width toggle (persisted in a cookie). |
 
 An environment override wins over both the config file's value and the
-built-in default, and lives in a `BARDUCK__<FIELD>` variable (bonfig
-layers, e.g. `BARDUCK__LISTEN`). Its value is parsed with TOML scalar
+built-in default, and lives in a `BARDUCK__<FIELD>` variable (the env layer
+above the config file, e.g. `BARDUCK__LISTEN`). Its value is parsed with TOML scalar
 rules: numbers and bools are bare, and a string that looks like one is
 quoted (`BARDUCK__LISTEN='"0.0.0.0:9000"'`, though a bind address itself
 is fine bare because it is not a number). The structural keys
@@ -253,6 +254,7 @@ rows = [
   - `{ main = "src", secondary = ["other"], title = "Label" }` — named group with secondary sources
   - `{ kind = "space", colspan = 2 }` — empty spacer cell spanning 2 columns
 - Referencing a [composite source](#composite-sources)'s own name (bare, or as a cell's `main`) auto-renders a table of its children — no need to list them out with `table = [...]`; its children remain individually referenceable too
+
 ### Web UI Style Overrides
 
 Layouts and cells can have a `style` field with CSS property overrides rendered as inline styles in the web dashboard.
@@ -272,7 +274,6 @@ rows = [
 - Any CSS property-value pair is supported (e.g., `font_family`, `font_size`, `background_color`, `gap`)
 
 ### Visibility
-
 
 Each source has a `show_in` field controlling which UI surfaces display it:
 - `show_in = "all"` (default) — Visible in both TUI and web UI
