@@ -863,8 +863,10 @@ pub(super) async fn panels_grid(cx: &Cx, tick: f64) -> Result<impl View> {
                                         // The wrapper carries the id (and `bd-value` class) the
                                         // chip above links to, so a click scrolls here and
                                         // `:target` highlights the value itself (spec: web-ui —
-                                        // source summary strip).
-                                        <div id=(slot.value_id(&main.source)) class="bd-value">
+                                        // source summary strip). The value takes its band's text
+                                        // color like a group row does: a green card's `fg` is the
+                                        // neutral foreground, so the value alone would look uncolored.
+                                        <div id=(slot.value_id(&main.source)) class="bd-value" style=(main.group_row_style())>
                                             formatted_content(format: main.format, value: main.value.clone(), unit: main.unit.clone())
                                         </div>
                                         if !main.history.is_empty() {

@@ -116,6 +116,10 @@ When a source declares threshold bands and its latest value falls in a band, the
 - **WHEN** a healthy source has bands 60→green, 85→yellow, 100→red and reports `92`
 - **THEN** its panel renders with the red style
 
+#### Scenario: Single-source value text carries the band color
+- **WHEN** a healthy source in a plain single-source panel reports a value in its green band
+- **THEN** the value text renders in the green text color, the same as a group pane row, not in the neutral foreground
+
 ### Requirement: Per-source log view linked from panels
 Each web panel's time-ago text SHALL be a link to `/logs/<source>`. The link SHALL open in the current tab, not a new tab. The daemon SHALL serve that page showing the source's recent fetch log entries as a table with columns, in this order: TIME, DURATION, SOURCE, VALUE. The SOURCE column SHALL show the attempt's origin (`push` for HTTP-ingested values, `poll` for scheduled fetches; spec: data-collection — Fetch attempts logged). The VALUE column SHALL show the gathered value rendered together with the source's unit (when the source declares one); for an entry that recorded an error, the VALUE cell SHALL instead show that error's text, wrapped, in place of a value — there is no separate error column. The page SHALL include a link back to the dashboard. Requests for unknown sources MUST return a client error naming the unknown source.
 

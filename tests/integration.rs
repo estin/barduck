@@ -2347,6 +2347,11 @@ async fn web_ui_history_bar_reflects_recent_readings() {
         i_green < i_yellow && i_yellow < i_red,
         "segments should read green, yellow, red left to right"
     );
+    // The value itself carries its accent as text color, like a group row.
+    assert!(
+        cpu.contains(r#"class="bd-value" style="color:var(--status-"#),
+        "banded panel value should carry its status text color: {cpu}"
+    );
 
     // plain: no thresholds -> no history bar at all.
     let plain = panel_slice(&page, "plain", Some("sparse"));
