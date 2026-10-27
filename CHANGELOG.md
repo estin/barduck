@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.8 (2026-10-27)
+
+### Bug Fixes
+
+- Skill update
+- SKILL.md query-only fields table
+- Color the value text of a single-source panel
+
+### Maintenance
+
+- **nix:** Pin barduck-bin to v0.1.7
+
 ## v0.1.7 (2026-10-12)
 
 ### Bug Fixes
