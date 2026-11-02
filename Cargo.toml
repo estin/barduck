@@ -23,7 +23,7 @@ futures-core = "0.3"
 serde_urlencoded = "0.7"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "signal", "net", "process", "io-util"] }
 toml = "1.1"
-topcoat = { version = "0.9", features = ["font-fontsource", "sse", "tailwind", "ui"] }
+topcoat = { version = "0.11", features = ["font-fontsource", "sse", "tailwind", "ui"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -36,7 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 duckdb = { version = "1.10505", features = ["bundled", "json"] }
 
 [build-dependencies]
-topcoat = { version = "0.9", default-features = false, features = ["tailwind"] }
+topcoat = { version = "0.11", default-features = false, features = ["tailwind"] }
 
 [dev-dependencies]
 tempfile = "3.27"
@@ -44,7 +44,7 @@ tempfile = "3.27"
 # it's enabled here directly: the page-rendering tests build their own asset
 # bundle in-process (see `test_asset_bundle`), which needs it. Dev-only, so the
 # shipped binary never links the bundler.
-topcoat-asset = { version = "0.9", features = ["bundler"] }
+topcoat-asset = { version = "0.11", features = ["bundler"] }
 
 [features]
 bundled = ["duckdb/bundled"]

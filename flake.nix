@@ -16,7 +16,7 @@
 
       # The Tailwind CLI release `topcoat-tailwind` downloads by default at
       # build time (see topcoat_tailwind::build::DEFAULT_VERSION, currently
-      # pinned to this version by the `topcoat = "0.9"` dependency).
+      # pinned to this version by the `topcoat = "0.11"` dependency).
       # Pre-fetched here as a fixed-output derivation so the actual `cargo
       # build` stays network-free inside Nix's build sandbox.
       tailwindVersion = "4.3.2";
