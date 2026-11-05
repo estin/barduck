@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## v0.1.9 (2026-11-05)
+
+### Bug Fixes
+
+- **deps:** Update topcoat
+- Add duration and elapsed formats
+
+### Maintenance
+
+- **nix:** Pin barduck-bin to v0.1.8
+
 ## v0.1.8 (2026-10-27)
 
 ### Bug Fixes
