@@ -28,6 +28,34 @@ fn is_text_source(cfg: &Config, name: &str) -> bool {
         == Some(crate::config::ValueFormat::Markdown)
 }
 
+/// The value shown in the `latest` table, formatted per the source declaration.
+fn display_value(cfg: &Config, name: &str, value: &str) -> String {
+    match cfg
+        .sources
+        .iter()
+        .find(|s| s.name() == name)
+        .and_then(crate::config::SourceCfg::format)
+    {
+        Some(crate::config::ValueFormat::Duration) => crate::age::format_duration(value),
+        Some(crate::config::ValueFormat::Elapsed) => crate::age::elapsed_since_now(value),
+        _ => value.to_string(),
+    }
+}
+
+fn display_unit<'a>(cfg: &Config, name: &str, unit: Option<&'a str>) -> &'a str {
+    if matches!(
+        cfg.sources
+            .iter()
+            .find(|s| s.name() == name)
+            .and_then(crate::config::SourceCfg::format),
+        Some(crate::config::ValueFormat::Duration | crate::config::ValueFormat::Elapsed)
+    ) {
+        ""
+    } else {
+        unit.unwrap_or_default()
+    }
+}
+
 trait Named {
     fn name(&self) -> &str;
 }
@@ -79,7 +107,9 @@ pub async fn print_latest(
         width = LATEST_VALUE_WIDTH
     );
     for r in values {
-        println!("{}", latest_table_row(&r));
+        let value = display_value(cfg, &r.source, &r.value);
+        let unit = display_unit(cfg, &r.source, r.unit.as_deref());
+        println!("{}", latest_table_row(&r, &value, unit));
     }
     if !text.is_empty() {
         println!();
@@ -177,12 +207,12 @@ const POLL_VALUE_WIDTH: usize = 60;
 /// than being printed raw: a `text`-format source's stored value is its
 /// command's whole trimmed stdout, newlines and all, which would tear this
 /// fixed-width table apart and push UNIT/TIMESTAMP out of alignment.
-fn latest_table_row(r: &ReadingRow) -> String {
+fn latest_table_row(r: &ReadingRow, value: &str, unit: &str) -> String {
     format!(
         "{:<24} {:>width$}  {:<6} {}",
         r.source,
-        short_value_n(&r.value, LATEST_VALUE_WIDTH),
-        r.unit.as_deref().unwrap_or_default(),
+        short_value_n(value, LATEST_VALUE_WIDTH),
+        unit,
         r.ts,
         width = LATEST_VALUE_WIDTH
     )
@@ -387,7 +417,7 @@ mod tests {
             ts_epoch: 0.0,
             ts: "2026-01-02 03:04:05".into(),
         };
-        let line = latest_table_row(&row);
+        let line = latest_table_row(&row, &row.value, row.unit.as_deref().unwrap_or_default());
         assert_eq!(line.lines().count(), 1, "one row, one line:\n{line}");
         assert!(
             line.contains("42 7.5 ok"),
@@ -401,13 +431,49 @@ mod tests {
             value: "x".repeat(80),
             ..row
         };
-        let line = latest_table_row(&long);
+        let line = latest_table_row(&long, &long.value, long.unit.as_deref().unwrap_or_default());
         assert_eq!(line.lines().count(), 1, "one row, one line:\n{line}");
         assert!(
             line.contains(&format!("{}…", "x".repeat(13))),
             "cut to the column width: {line}"
         );
         assert!(line.ends_with("2026-01-02 03:04:05"), "{line}");
+    }
+
+    /// `elapsed` renders timestamps in `latest` and omits configured units.
+    #[test]
+    fn duration_format_source_shows_relative_value() {
+        let cfg: Config = toml::from_str(
+            "[[sources]]
+name = \"upd\"\ntype = \"query\"\ncommand = \"echo x\"\nformat = \"elapsed\"\ninterval = \"1h\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            display_value(&cfg, "upd", "2099-01-01T00:00:00Z"),
+            "just now"
+        );
+        assert_eq!(
+            display_value(&cfg, "upd", "not-a-timestamp"),
+            "not-a-timestamp"
+        );
+        let row = ReadingRow {
+            source: "upd".into(),
+            value: "2099-01-01T00:00:00Z".into(),
+            unit: None,
+            ts_epoch: 0.0,
+            ts: "2026-01-02 03:04:05".into(),
+        };
+        let value = display_value(&cfg, &row.source, &row.value);
+        let line = latest_table_row(&row, &value, display_unit(&cfg, "upd", Some("days")));
+        assert!(line.contains("just now"), "elapsed rendered: {line}");
+        assert!(!line.contains("days"), "elapsed omits source units: {line}");
+        assert!(line.ends_with("2026-01-02 03:04:05"), "{line}");
+        let duration_cfg: Config = toml::from_str(
+            "[[sources]]\nname = \"seconds\"\ntype = \"query\"\ncommand = \"echo 3600\"\nformat = \"duration\"\nunit = \"seconds\"\ninterval = \"1h\"\n",
+        )
+        .unwrap();
+        assert_eq!(display_value(&duration_cfg, "seconds", "3600"), "1h");
+        assert_eq!(display_unit(&duration_cfg, "seconds", Some("seconds")), "");
     }
 
     fn poll_config(db_path: &std::path::Path) -> Config {

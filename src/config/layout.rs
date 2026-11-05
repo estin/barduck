@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 /// bounded rather than trusted; a dashboard column wider than this is not a
 /// real layout.
 pub(crate) const MAX_COLSPAN: usize = 12;
-pub const VALUE_FORMATS: &[&str] = &["text", "markdown"];
+pub const VALUE_FORMATS: &[&str] = &["text", "markdown", "duration", "elapsed"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -20,6 +20,8 @@ pub enum ValueFormat {
     #[default]
     Text,
     Markdown,
+    Duration,
+    Elapsed,
 }
 
 impl ValueFormat {
@@ -27,6 +29,8 @@ impl ValueFormat {
         match s {
             "text" => Ok(Self::Text),
             "markdown" => Ok(Self::Markdown),
+            "duration" => Ok(Self::Duration),
+            "elapsed" => Ok(Self::Elapsed),
             other => bail!(
                 "unknown value format `{other}` (known formats: {})",
                 VALUE_FORMATS.join(", ")
@@ -173,5 +177,30 @@ impl LayoutCfg {
             .flatten()
             .flat_map(Cell::source_names)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+    use crate::config::ChildDecl;
+
+    #[test]
+    fn duration_format_parses() {
+        assert_eq!(
+            ValueFormat::parse("duration").unwrap(),
+            ValueFormat::Duration
+        );
+        assert_eq!(ValueFormat::parse("elapsed").unwrap(), ValueFormat::Elapsed);
+        assert!(ValueFormat::parse("rst").is_err());
+    }
+
+    /// A composite child may declare `format = "duration"` like any other
+    /// format; serde's lowercase rename picks the new variant up.
+    #[test]
+    fn duration_format_deserializes_on_child() {
+        let child: ChildDecl = toml::from_str("name = \"c\"\nformat = \"duration\"\n").unwrap();
+        assert_eq!(child.format, Some(ValueFormat::Duration));
     }
 }

@@ -48,13 +48,16 @@ pub fn ago_precise(now: f64, ts_epoch: f64) -> Option<String> {
     if ts_epoch <= 0.0 {
         return None;
     }
-    let age = (now - ts_epoch).max(0.0);
+    Some(format_seconds((now - ts_epoch).max(0.0)))
+}
+
+fn format_seconds(age: f64) -> String {
     if age < 1.0 {
-        return Some("just now".into());
+        return "just now".into();
     }
     let mut secs = age as u64;
     if secs < 60 {
-        return Some(format!("{secs}s"));
+        return format!("{secs}s");
     }
     let days = secs / 86400;
     secs %= 86400;
@@ -70,16 +73,108 @@ pub fn ago_precise(now: f64, ts_epoch: f64) -> Option<String> {
     } else {
         (minutes, "m", secs, "s")
     };
-    Some(if minor == 0 {
+    if minor == 0 {
         format!("{major}{major_unit}")
     } else {
         format!("{major}{major_unit} {minor}{minor_unit}")
-    })
+    }
+}
+
+/// Formats a non-negative number of seconds ("1d 6h", "45s").
+#[must_use]
+pub fn format_duration(value: &str) -> String {
+    let Ok(seconds) = value.parse::<f64>() else {
+        return value.to_string();
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
+        return value.to_string();
+    }
+    if seconds < 1.0 {
+        return "0s".into();
+    }
+    format_seconds(seconds)
+}
+
+/// Parses an RFC 3339 timestamp and renders the time elapsed from it to `now`.
+#[must_use]
+pub fn elapsed_since(value: &str, now: f64) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) else {
+        return value.to_string();
+    };
+    let ts = dt.timestamp() as f64 + f64::from(dt.timestamp_subsec_nanos()) / 1e9;
+    let age = (now - ts).max(0.0);
+    if age < 1.0 {
+        "just now".into()
+    } else {
+        format_seconds(age)
+    }
+}
+
+/// [`elapsed_since`] against the wall clock.
+#[must_use]
+pub fn elapsed_since_now(value: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    elapsed_since(value, now)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ago, ago_precise};
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    #[test]
+    fn elapsed_since_valid_timestamp() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-11-05T00:33:49Z")
+            .unwrap()
+            .timestamp() as f64;
+        let later = chrono::DateTime::parse_from_rfc3339("2026-11-05T06:33:49Z")
+            .unwrap()
+            .timestamp() as f64;
+        assert_eq!(elapsed_since("2026-11-05T00:33:49Z", later), "6h");
+        assert_eq!(elapsed_since("2026-11-05T00:33:49Z", start + 45.0), "45s");
+    }
+
+    #[test]
+    fn elapsed_since_invalid_returns_raw_value() {
+        assert_eq!(
+            elapsed_since("not-a-timestamp", 1_000_000.0),
+            "not-a-timestamp"
+        );
+    }
+
+    #[test]
+    fn elapsed_since_future_is_just_now() {
+        assert_eq!(
+            elapsed_since("2099-01-01T00:00:00Z", 1_000_000.0),
+            "just now"
+        );
+    }
+
+    /// An offset-bearing RFC 3339 value normalizes to UTC before the
+    /// elapsed time is computed (e.g. restic's "+03:00" snapshot times).
+    #[test]
+    fn elapsed_since_offset_timestamp() {
+        let later = chrono::DateTime::parse_from_rfc3339("2026-11-05T06:33:49Z")
+            .unwrap()
+            .timestamp() as f64;
+        assert_eq!(elapsed_since("2026-11-05T03:33:49+03:00", later), "6h");
+    }
+
+    #[test]
+    fn elapsed_since_handles_epoch_timestamp() {
+        assert_eq!(elapsed_since("1970-01-01T00:00:00Z", 3600.0), "1h");
+    }
+
+    #[test]
+    fn duration_formats_seconds_and_rejects_invalid_values() {
+        assert_eq!(format_duration("93784"), "1d 2h");
+        assert_eq!(format_duration("45"), "45s");
+        assert_eq!(format_duration("0"), "0s");
+        assert_eq!(format_duration("-1"), "-1");
+        assert_eq!(format_duration("NaN"), "NaN");
+    }
+
+    use super::{ago, ago_precise, elapsed_since, format_duration};
 
     #[test]
     fn never_updated() {

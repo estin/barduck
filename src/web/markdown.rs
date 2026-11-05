@@ -114,6 +114,17 @@ fn render_markdown(value: &str) -> String {
     html
 }
 
+/// Plain-text value for non-markdown formats. `duration` reads seconds and
+/// `elapsed` reads an RFC 3339 timestamp. Neither uses a unit suffix.
+fn display_value(format: ValueFormat, value: &str, unit: &str) -> String {
+    match format {
+        ValueFormat::Duration => crate::age::format_duration(value),
+        ValueFormat::Elapsed => crate::age::elapsed_since_now(value),
+        _ if unit.is_empty() => value.to_string(),
+        _ => format!("{value} {unit}"),
+    }
+}
+
 /// Renders `value` (with `unit` appended when non-empty, except for
 /// markdown, which never gets a unit suffix) according to `format`: markdown
 /// as HTML, otherwise plain text. Shared by the single-source panel's
@@ -125,22 +136,36 @@ pub(super) async fn formatted_content(
     value: String,
     unit: String,
 ) -> Result<impl View> {
-    let value_and_unit = if unit.is_empty() {
-        value.clone()
-    } else {
-        format!("{value} {unit}")
-    };
+    let display = display_value(format, &value, &unit);
     Ok(view! {
         if format == ValueFormat::Markdown {
             <div class="prose prose-sm max-w-none">(markdown_to_html(&value))</div>
         } else {
-            <div class="text-2xl font-semibold">(value_and_unit)</div>
+            <div class="text-2xl font-semibold">(display)</div>
         }
     })
 }
 
 #[cfg(test)]
 mod tests {
+    /// `duration` formats seconds and `elapsed` formats timestamps; a
+    /// non-timestamp falls back to the raw value (spec: source-configuration
+    /// — Value formats). A future timestamp always renders "just now", so
+    /// the assertion is deterministic without injecting a clock.
+    #[test]
+    fn duration_format_renders_relative_time() {
+        assert_eq!(
+            display_value(ValueFormat::Elapsed, "2099-01-01T00:00:00Z", ""),
+            "just now"
+        );
+        assert_eq!(
+            display_value(ValueFormat::Elapsed, "not-a-timestamp", "days"),
+            "not-a-timestamp"
+        );
+        assert_eq!(display_value(ValueFormat::Text, "42", "days"), "42 days");
+        assert_eq!(display_value(ValueFormat::Duration, "3600", "hours"), "1h");
+    }
+
     use super::*;
 
     /// A `javascript:` link destination from an untrusted `format =

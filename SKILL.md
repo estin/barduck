@@ -155,7 +155,7 @@ defaults to `info`.
 | `timeout` | No | Command timeout (humantime format); defaults to `30s`. On a `stream` source this bounds the `setup` command only — the stream itself runs until it exits. |
 | `interval` | query only | Schedule interval (`"10s"`, `"1m"`, `"1h"`). Mutually exclusive with `cron`. |
 | `cron` | query only | Cron expression (e.g. `"0 0 3 * * *"`). Mutually exclusive with `interval`. |
-| `format` | No | Rendering format: `text` (default) or `markdown`. Any other value is rejected at parse time. |
+| `format` | No | Rendering format: `text` (default), `markdown`, `duration` (a number of seconds rendered as human time), or `elapsed` (an RFC 3339 timestamp rendered as time since now). Any other value is rejected at parse time. |
 | `thresholds` | No | Color bands: `[{ bound = 60.0, level = "green" }, { bound = 85.0, level = "yellow" }]` |
 | `show_history` | No | Whether to show history bar in web UI (default `true`) |
 | `show_in` | No | Which UI surfaces display this source: `all` (default), `tui`, or `web` |

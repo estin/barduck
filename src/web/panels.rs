@@ -124,6 +124,12 @@ impl Panel {
     }
 
     fn value_and_unit(&self) -> String {
+        if self.format == ValueFormat::Duration {
+            return crate::age::format_duration(&self.value);
+        }
+        if self.format == ValueFormat::Elapsed {
+            return crate::age::elapsed_since_now(&self.value);
+        }
         if self.unit.is_empty() {
             self.value.clone()
         } else {
